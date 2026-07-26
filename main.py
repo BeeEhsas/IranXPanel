@@ -42,6 +42,11 @@ from pydantic import BaseModel
 ADMIN_USERNAME = "admin"
 SECRET_KEY     = os.getenv("SECRET_KEY", secrets.token_hex(32))
 DOMAIN         = os.getenv("DOMAIN", "")
+
+# When the host's own domain is unreachable from some networks, a relay (e.g. a
+# Cloudflare Worker) can sit in front. The panel still runs on DOMAIN, but every config
+# and subscription link it hands out points at RELAY_DOMAIN instead.
+RELAY_DOMAIN   = os.getenv("RELAY_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
 DB_PATH        = os.getenv("DB_PATH", "/tmp/panel.db")
 WS_PATH        = os.getenv("WS_PATH", "ws").strip("/")
 XHTTP_PATH     = os.getenv("XHTTP_PATH", "xh").strip("/")
@@ -744,6 +749,16 @@ async def vless_ws(websocket: WebSocket, path: str):
 # ────────────────────────────── HELPERS ──────────────────────────────
 
 def base_domain(request: Request) -> str:
+    """The host clients should connect to — the relay when there is one."""
+    if RELAY_DOMAIN:
+        return RELAY_DOMAIN
+    if DOMAIN:
+        return DOMAIN.replace("https://", "").replace("http://", "").strip("/")
+    return request.headers.get("host", "localhost")
+
+
+def origin_domain(request: Request) -> str:
+    """The panel's own host, ignoring any relay. Used for links back to the panel."""
     if DOMAIN:
         return DOMAIN.replace("https://", "").replace("http://", "").strip("/")
     return request.headers.get("host", "localhost")
@@ -1224,7 +1239,8 @@ async def stats(_=Depends(require_admin)):
             "series": [dict(r) for r in series],
             "ws_path": WS_PATH, "xhttp_path": XHTTP_PATH,
             "device_window": DEVICE_WINDOW, "live_window": LIVE_WINDOW,
-            "keepalive": KEEPALIVE, "keepalive_mins": KEEPALIVE_MINS}
+            "keepalive": KEEPALIVE, "keepalive_mins": KEEPALIVE_MINS,
+            "relay_domain": RELAY_DOMAIN}
 
 
 @app.get("/api/logs")
@@ -1253,7 +1269,7 @@ async def subscription(token: str, request: Request):
     headers = {
         "profile-title": "base64:" + base64.b64encode(f"⚡ {row['name']}".encode()).decode(),
         "profile-update-interval": "12",
-        "profile-web-page-url": f"https://{d}/",
+        "profile-web-page-url": f"https://{origin_domain(request)}/",
         "subscription-userinfo":
             f"upload=0; download={row['used_bytes']}; "
             f"total={row['quota_bytes']}; expire={row['expire_at']}",
@@ -1368,6 +1384,8 @@ const I18N={
   settings:'تنظیمات',appearance:'ظاهر',theme:'تم',language:'زبان',
   changePw:'تغییر رمز عبور',curPw:'رمز فعلی',newPw:'رمز جدید',pwChanged:'رمز تغییر کرد ✓',
   serverInfo:'اطلاعات سرور',wsPathLbl:'مسیر WebSocket',xhPathLbl:'مسیر XHTTP',
+  relayLbl:'دامنه رله',keepAliveLbl:'جلوگیری از خواب',relayNone:'ندارد',
+  onLbl:'فعال',offLbl:'خاموش',
   devWinLbl:'پنجره شمارش دستگاه',seconds:'ثانیه',
   envNote:'این مقادیر از متغیرهای محیطی خوانده می‌شوند و در Railway قابل تغییرند.',
   logout:'خروج',logs:'رخدادها',noLogs:'رخدادی نیست',
@@ -1413,6 +1431,8 @@ const I18N={
   changePw:'Change password',curPw:'Current password',newPw:'New password',
   pwChanged:'Password changed ✓',
   serverInfo:'Server info',wsPathLbl:'WebSocket path',xhPathLbl:'XHTTP path',
+  relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
+  onLbl:'on',offLbl:'off',
   devWinLbl:'Device counting window',seconds:'seconds',
   envNote:'These come from environment variables and can be changed in Railway.',
   logout:'Sign out',logs:'Events',noLogs:'No events yet',
@@ -1772,6 +1792,8 @@ function renderServer(){
   [T('xhPathLbl'),'/'+(stats.xhttp_path||'—')],
   [T('devWinLbl'),(stats.device_window||'—')+' '+T('seconds')],
   [T('xSessions'),stats.xhttp_sessions??'—'],
+  [T('relayLbl'),stats.relay_domain||T('relayNone')],
+  [T('keepAliveLbl'),stats.keepalive?T('onLbl'):T('offLbl')],
  ].map(([k,v])=>`<div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
    <span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`).join('');
 }

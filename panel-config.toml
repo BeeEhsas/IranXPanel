@@ -17,5 +17,23 @@ XHTTP_PATH = "xh"   # path for VLESS + XHTTP + TLS  (must differ from WS_PATH)
 ADMIN_PASSWORD = ""              # pre-seed the password, skips the setup page
 DB_PATH        = "/tmp/panel.db" # use /data/panel.db with a persistent volume
 DEVICE_WINDOW  = "300"           # seconds an IP counts as an active device
+LIVE_WINDOW    = "60"            # seconds an IP shows as "connected right now"
 SESSION_IDLE   = "90"            # seconds before an idle XHTTP session is dropped
 PANEL_TITLE    = "IranX Panel"
+
+[relay]
+# If the host's own domain is unreachable from some networks, put a relay in front
+# (e.g. a Cloudflare Worker that proxies to this panel). The panel keeps running on
+# DOMAIN, but every config and subscription link it hands out points at RELAY_DOMAIN.
+# Leave empty when there is no relay.
+RELAY_DOMAIN = ""
+
+[keepalive]
+# Only for hosts that idle a service out — Render's free plan sleeps after ~15 minutes.
+# The service pings its own public /healthz so the platform sees inbound traffic.
+# READ THIS FIRST: it burns your free instance hours (24/7 is ~730 of Render's 750 per
+# month) and it does NOT protect the database — a redeploy or a platform restart still
+# wipes /tmp. For anything real, use Railway with a volume instead.
+# Requires DOMAIN to be set correctly.
+KEEPALIVE         = "0"    # "1" to enable
+KEEPALIVE_MINUTES = "10"   # ping interval; must be under the host's idle timeout
