@@ -1,0 +1,21 @@
+# ─────────────────────────────────────────────
+#  IranX Panel — environment variable reference
+#  Set these in Railway → Variables tab
+# ─────────────────────────────────────────────
+# The panel username is always "admin" and is never asked for.
+# The password is chosen on your first visit to the panel.
+
+[required]
+SECRET_KEY = "long_random_string_here"  # signs the JWT session cookie
+DOMAIN     = "your-app.up.railway.app"  # public domain, no https://
+
+[transports]
+WS_PATH    = "ws"   # path for VLESS + WebSocket + TLS
+XHTTP_PATH = "xh"   # path for VLESS + XHTTP + TLS  (must differ from WS_PATH)
+
+[optional]
+ADMIN_PASSWORD = ""              # pre-seed the password, skips the setup page
+DB_PATH        = "/tmp/panel.db" # use /data/panel.db with a persistent volume
+DEVICE_WINDOW  = "300"           # seconds an IP counts as an active device
+SESSION_IDLE   = "90"            # seconds before an idle XHTTP session is dropped
+PANEL_TITLE    = "IranX Panel"

@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: iranx-panel
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT --timeout 0
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DOMAIN
+        sync: false
+      - key: WS_PATH
+        value: ws
+      - key: XHTTP_PATH
+        value: xh
+      - key: DB_PATH
+        value: /tmp/panel.db
