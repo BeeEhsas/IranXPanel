@@ -35,11 +35,27 @@ Most panels want a VPS, a domain, a certificate and an Xray binary. This one wan
 free PaaS account. The platform terminates TLS for you, so `main.py` implements the VLESS
 inbounds in pure Python and relays TCP — nothing to install, nothing to renew.
 
+```mermaid
+flowchart LR
+    A["Client<br/>v2rayNG · Hiddify"]
+    B["Cloudflare relay<br/>optional"]
+    C["IranX Panel<br/>Railway · Render"]
+    D["Destination"]
+
+    A -->|"wss:// or https://"| B
+    A -.->|"direct"| C
+    B -->|"HTTPS"| C
+    C -->|"TCP"| D
+
+    style A fill:#7C5CFF,stroke:#9B81FF,color:#fff
+    style B fill:#F38020,stroke:#FFA257,color:#fff
+    style C fill:#2F83F6,stroke:#57A5FF,color:#fff
+    style D fill:#22c58c,stroke:#43E0A8,color:#fff
 ```
-┌──────────┐   wss:// or https://   ┌─────────────┐   TCP   ┌────────────┐
-│  client  │ ─────────────────────▶ │  IranX Panel│ ──────▶ │ destination│
-└──────────┘   TLS ends at the PaaS └─────────────┘         └────────────┘
-```
+
+TLS terminates at the platform's edge, so `main.py` only ever speaks plain VLESS over an
+already-encrypted stream. The relay is optional — add it when the host's own domain is
+unreachable from your network.
 
 ---
 

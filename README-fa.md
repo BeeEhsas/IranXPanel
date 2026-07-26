@@ -35,11 +35,27 @@
 PaaS می‌خواهد. TLS را خودِ پلتفرم انجام می‌دهد، پس `main.py` هر دو inbound را با پایتون
 خالص پیاده کرده و TCP را رله می‌کند — چیزی نصب نمی‌کنی، چیزی هم تمدید نمی‌کنی.
 
+```mermaid
+flowchart LR
+    A["کلاینت<br/>v2rayNG · Hiddify"]
+    B["رله Cloudflare<br/>اختیاری"]
+    C["IranX Panel<br/>Railway · Render"]
+    D["مقصد"]
+
+    A -->|"wss:// یا https://"| B
+    A -.->|"مستقیم"| C
+    B -->|"HTTPS"| C
+    C -->|"TCP"| D
+
+    style A fill:#7C5CFF,stroke:#9B81FF,color:#fff
+    style B fill:#F38020,stroke:#FFA257,color:#fff
+    style C fill:#2F83F6,stroke:#57A5FF,color:#fff
+    style D fill:#22c58c,stroke:#43E0A8,color:#fff
 ```
-┌──────────┐   wss:// یا https://   ┌─────────────┐   TCP   ┌────────────┐
-│  کلاینت  │ ─────────────────────▶ │ IranX Panel │ ──────▶ │   مقصد     │
-└──────────┘   TLS در PaaS تمام می‌شود └─────────────┘        └────────────┘
-```
+
+TLS در لبه پلتفرم تمام می‌شود، پس `main.py` فقط VLESS خالص را روی یک جریان
+از قبل رمزشده می‌خواند. رله اختیاری است — وقتی دامنه هاست از شبکه‌ات در دسترس
+نیست اضافه‌اش کن.
 
 ---
 
