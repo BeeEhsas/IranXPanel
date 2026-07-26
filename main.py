@@ -48,7 +48,8 @@ XHTTP_PATH     = os.getenv("XHTTP_PATH", "xh").strip("/")
 PANEL_TITLE    = os.getenv("PANEL_TITLE", "IranX Panel")
 BOOTSTRAP_PASS = os.getenv("ADMIN_PASSWORD", "")
 
-DEVICE_WINDOW  = int(os.getenv("DEVICE_WINDOW", "300"))
+DEVICE_WINDOW  = int(os.getenv("DEVICE_WINDOW", "300"))   # counts toward the device limit
+LIVE_WINDOW    = int(os.getenv("LIVE_WINDOW", "60"))      # shown as "connected right now"
 SESSION_IDLE   = int(os.getenv("SESSION_IDLE", "90"))     # xhttp session reaper
 
 JWT_ALG, JWT_TTL, GB = "HS256", 60 * 60 * 12, 1024 ** 3
@@ -292,11 +293,17 @@ def user_status(row) -> tuple[bool, str]:
     return True, "ok"
 
 
-def active_devices(uid: int) -> int:
+def active_devices(uid: int, window: Optional[int] = None) -> int:
+    """Distinct IPs seen inside a window. Defaults to the enforcement window."""
+    w = DEVICE_WINDOW if window is None else window
     with db() as c:
         r = c.execute("SELECT COUNT(*) n FROM user_ips WHERE user_id=? AND last_seen>?",
-                      (uid, now() - DEVICE_WINDOW)).fetchone()
+                      (uid, now() - w)).fetchone()
     return r["n"] if r else 0
+
+
+def live_devices(uid: int) -> int:
+    return active_devices(uid, LIVE_WINDOW)
 
 
 def touch_ip(uid: int, ip: str, proto: str):
@@ -784,6 +791,7 @@ def build_info_lines(row, host: str) -> list[str]:
 def row_out(r) -> dict:
     d = dict(r)
     d["devices_now"] = active_devices(r["id"])
+    d["devices_live"] = live_devices(r["id"])
     ok, reason = user_status(r)
     d["active"], d["status"] = ok, reason
     return d
@@ -1006,13 +1014,34 @@ async def clear_ips(uid: int, _=Depends(require_admin)):
 
 
 @app.get("/api/users/{uid}/ips")
-async def user_ips(uid: int, _=Depends(require_admin)):
+async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
+    """Live view by default: only IPs still connected. history=1 returns everything."""
+    live_cut = now() - LIVE_WINDOW
+    count_cut = now() - DEVICE_WINDOW
     with db() as c:
-        rows = c.execute("""SELECT ip,proto,first_seen,last_seen,hits FROM user_ips
-                            WHERE user_id=? ORDER BY last_seen DESC LIMIT 200""",
-                         (uid,)).fetchall()
-    cut = now() - DEVICE_WINDOW
-    return [{**dict(r), "online": r["last_seen"] > cut} for r in rows]
+        if history:
+            rows = c.execute("""SELECT ip,proto,first_seen,last_seen,hits FROM user_ips
+                                WHERE user_id=? ORDER BY last_seen DESC LIMIT 200""",
+                             (uid,)).fetchall()
+        else:
+            rows = c.execute("""SELECT ip,proto,first_seen,last_seen,hits FROM user_ips
+                                WHERE user_id=? AND last_seen>?
+                                ORDER BY last_seen DESC""", (uid, live_cut)).fetchall()
+        total = c.execute("SELECT COUNT(*) n FROM user_ips WHERE user_id=?",
+                          (uid,)).fetchone()["n"]
+    return {
+        "live": live_devices(uid),
+        "counted": active_devices(uid),
+        "total_seen": total,
+        "live_window": LIVE_WINDOW,
+        "device_window": DEVICE_WINDOW,
+        "history": bool(history),
+        "rows": [
+            {**dict(r), "online": r["last_seen"] > live_cut,
+             "counted": r["last_seen"] > count_cut}
+            for r in rows
+        ],
+    }
 
 
 @app.get("/api/users/{uid}/config")
@@ -1132,6 +1161,10 @@ async def stats(_=Depends(require_admin)):
                         (now() - DEVICE_WINDOW,)).fetchone()
         dev = c.execute("SELECT COUNT(*) n FROM user_ips WHERE last_seen>?",
                         (now() - DEVICE_WINDOW,)).fetchone()
+        liv = c.execute("SELECT COUNT(*) n FROM user_ips WHERE last_seen>?",
+                        (now() - LIVE_WINDOW,)).fetchone()
+        lu = c.execute("SELECT COUNT(DISTINCT user_id) n FROM user_ips WHERE last_seen>?",
+                       (now() - LIVE_WINDOW,)).fetchone()
         cip = c.execute("SELECT COUNT(*) n FROM clean_ips WHERE enabled=1").fetchone()
         byp = c.execute("SELECT proto, COUNT(*) n FROM user_ips WHERE last_seen>? "
                         "GROUP BY proto", (now() - DEVICE_WINDOW,)).fetchall()
@@ -1139,12 +1172,13 @@ async def stats(_=Depends(require_admin)):
                               FROM traffic_log WHERE ts>? GROUP BY h ORDER BY h""",
                            (now() - 86400,)).fetchall()
     return {"users": tot["n"], "active_users": act["n"], "online_users": onl["n"],
-            "online_devices": dev["n"], "total_bytes": tot["b"], "clean_ips": cip["n"],
+            "live_users": lu["n"], "online_devices": dev["n"], "live_devices": liv["n"],
+            "total_bytes": tot["b"], "clean_ips": cip["n"],
             "by_proto": {r["proto"]: r["n"] for r in byp},
             "xhttp_sessions": len(SESSIONS),
             "series": [dict(r) for r in series],
             "ws_path": WS_PATH, "xhttp_path": XHTTP_PATH,
-            "device_window": DEVICE_WINDOW}
+            "device_window": DEVICE_WINDOW, "live_window": LIVE_WINDOW}
 
 
 @app.get("/api/logs")
@@ -1268,8 +1302,13 @@ const I18N={
   used:'مصرف',expiry:'انقضا',never:'بی‌نهایت',
   subLink:'لینک اشتراک (Subscription)',copySub:'کپی لینک اشتراک',
   singleCfg:'کانفیگ‌های تکی',copy:'کپی',copied:'کپی شد ✓',
-  devTitle:'دستگاه‌های متصل (بر اساس IP)',noConn:'هنوز اتصالی ثبت نشده',
+  devTitle:'دستگاه‌های متصل',noConn:'هنوز اتصالی ثبت نشده',
   clearIps:'پاک کردن لیست IP',
+  liveNow:'الان متصل',noneNow:'همین الان هیچ دستگاهی متصل نیست',
+  countedFor:'شمرده‌شده برای محدودیت',totalSeen:'کل IP های دیده‌شده',
+  showHistory:'نمایش تاریخچه',showLive:'نمایش فقط متصل‌ها',
+  inLast:'در %s ثانیه اخیر',refresh:'به‌روزرسانی',
+  liveDevices:'دستگاه‌های فعال الان',
   editUser:'ویرایش',remainDays:'مدت باقی‌مانده (روز)',allowedDev:'تعداد دستگاه مجاز',
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
@@ -1307,8 +1346,13 @@ const I18N={
   used:'Used',expiry:'Expires',never:'Never',
   subLink:'Subscription link',copySub:'Copy subscription link',
   singleCfg:'Individual configs',copy:'Copy',copied:'Copied ✓',
-  devTitle:'Connected devices (by IP)',noConn:'No connections recorded yet',
+  devTitle:'Connected devices',noConn:'No connections recorded yet',
   clearIps:'Clear IP list',
+  liveNow:'Connected now',noneNow:'No device connected right now',
+  countedFor:'Counted toward the limit',totalSeen:'Total IPs ever seen',
+  showHistory:'Show history',showLive:'Show only connected',
+  inLast:'in the last %ss',refresh:'Refresh',
+  liveDevices:'Devices live now',
   editUser:'Edit',remainDays:'Days remaining',allowedDev:'Allowed devices',
   active:'Enabled',saveBtn:'Save',resetTraffic:'Reset traffic',newUuid:'New UUID',
   customUuid:'Custom UUID',del:'Delete',
@@ -1467,9 +1511,10 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
 
  <!-- ══ DASHBOARD ══ -->
  <section data-pg="dash" class="space-y-4">
-  <div class="grid grid-cols-2 lg:grid-cols-3 gap-3">
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
    <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="totalUsers"></p><p id="sUsers" class="text-2xl font-extrabold mt-1">—</p></div>
    <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="online"></p><p id="sOnline" class="text-2xl font-extrabold mt-1" style="color:var(--ok)">—</p></div>
+   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="liveDevices"></p><p id="sLive" class="text-2xl font-extrabold mt-1" style="color:var(--ok)">—</p></div>
    <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="devices"></p><p id="sDev" class="text-2xl font-extrabold mt-1" style="color:var(--info)">—</p></div>
    <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="traffic"></p><p id="sBytes" class="text-2xl font-extrabold mt-1" style="color:var(--a2)">—</p></div>
    <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="cleanIps"></p><p id="sCip" class="text-2xl font-extrabold mt-1" style="color:var(--a1)">—</p></div>
@@ -1688,7 +1733,8 @@ function renderServer(){
 async function loadStats(){
  stats=await api('/api/stats');
  sUsers.textContent=stats.users; sOnline.textContent=stats.online_users;
- sDev.textContent=stats.online_devices; sBytes.textContent=fmt(stats.total_bytes);
+ sDev.textContent=stats.online_devices; sLive.textContent=stats.live_devices;
+ sBytes.textContent=fmt(stats.total_bytes);
  sCip.textContent=stats.clean_ips; sXs.textContent=stats.xhttp_sessions;
  pill.textContent='/'+stats.ws_path+' · /'+stats.xhttp_path;
  paintChart(); renderProto();
@@ -1706,12 +1752,13 @@ function renderUsers(){
    ?`<span class="text-[10px] px-2 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)">${T('active')}</span>`
    :`<span class="text-[10px] px-2 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${statusTxt(u.status)}</span>`;
   const dev=u.device_limit?`${u.devices_now}/${u.device_limit}`:`${u.devices_now}/♾️`;
+  const liveTag=u.devices_live?`<span class="text-[10px] px-1.5 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)">● ${u.devices_live}</span>`:'';
   const devCol=u.device_limit&&u.devices_now>=u.device_limit?'var(--bad)':'var(--info)';
   return `<div class="p-4 border-b" style="border-color:var(--line)">
    <div class="flex items-center gap-2 flex-wrap">
     <p class="font-bold">${u.name}</p>${badge}
     <span class="text-[10px] px-2 py-0.5 rounded-full soft">${trTxt(u.transport)}</span>
-    <span class="text-[11px]" style="color:${devCol}">📱 ${dev}</span>
+    <span class="text-[11px]" style="color:${devCol}">📱 ${dev}</span>${liveTag}
     <div class="flex-1"></div>
     <button onclick="showConfig(${u.id})" class="text-[11px] px-2 py-1 rounded-lg" style="background:color-mix(in srgb,var(--a1) 22%,transparent)">${T('config')}</button>
     <button onclick="showIps(${u.id})" class="text-[11px] px-2 py-1 rounded-lg" style="background:color-mix(in srgb,var(--info) 20%,transparent)">${T('ipsBtn')}</button>
@@ -1780,7 +1827,8 @@ async function clearCips(){if(confirm(T('clearAll')+'?')){await api('/api/clean-
 
 function openModal(t,h){mTitle.textContent=t;mBody.innerHTML=h;
  modal.classList.remove('hidden');modal.classList.add('flex')}
-function closeModal(){modal.classList.add('hidden');modal.classList.remove('flex')}
+function closeModal(){modal.classList.add('hidden');modal.classList.remove('flex');
+ clearInterval(ipTimer);ipTimer=null;ipUid=null}
 
 async function showConfig(id){
  const c=await api('/api/users/'+id+'/config');
@@ -1801,19 +1849,54 @@ async function showConfig(id){
  new QRCode(document.getElementById('qr'),{text:c.sub_link,width:180,height:180});
 }
 
+let ipTimer=null, ipUid=null, ipHistory=false;
+
 async function showIps(id){
- const list=await api('/api/users/'+id+'/ips');
- const body=list.length?list.map(x=>`
+ ipUid=id; ipHistory=false;
+ await paintIps();
+ clearInterval(ipTimer);
+ ipTimer=setInterval(()=>{ if(!modal.classList.contains('hidden')&&ipUid) paintIps(true); },5000);
+}
+
+async function paintIps(quiet){
+ let d;
+ try{ d=await api('/api/users/'+ipUid+'/ips'+(ipHistory?'?history=1':'')); }
+ catch(e){ if(!quiet) openModal(T('devTitle'),'<p class="text-xs" style="color:var(--bad)">'+e.message+'</p>'); return }
+
+ const rows=d.rows.length ? d.rows.map(x=>`
   <div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
-   <span class="h-2 w-2 rounded-full" style="background:${x.online?'var(--ok)':'var(--dim)'}"></span>
+   <span class="h-2 w-2 rounded-full" style="background:${x.online?'var(--ok)':(x.counted?'var(--info)':'var(--dim)')}"></span>
    <span class="mono text-[11px]">${x.ip}</span>
    <span class="text-[9px] px-1.5 py-0.5 rounded soft">${x.proto||'ws'}</span>
    <span class="ms-auto text-[10px] dim">${dt(x.last_seen)}</span>
-  </div>`).join(''):`<p class="text-xs dim">${T('noConn')}</p>`;
- openModal(T('devTitle'),body+
-  `<button onclick="clearIps(${id})" class="w-full rounded-xl py-2 text-xs mt-2" style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${T('clearIps')}</button>`);
+  </div>`).join('')
+  : `<p class="text-xs dim py-2">${ipHistory?T('noConn'):T('noneNow')}</p>`;
+
+ const body=`
+  <div class="rounded-2xl p-4 text-center soft">
+   <p class="text-[11px] dim">${T('liveNow')}</p>
+   <p class="text-4xl font-extrabold mt-1" style="color:${d.live?'var(--ok)':'var(--dim)'}">${d.live}</p>
+   <p class="text-[10px] dim mt-1">${T('inLast').replace('%s',d.live_window)}</p>
+  </div>
+  <div class="grid grid-cols-2 gap-2 text-[11px]">
+   <div class="rounded-xl soft px-3 py-2"><span class="dim">${T('countedFor')}</span>
+    <span class="float-end font-bold" style="color:var(--info)">${d.counted}</span></div>
+   <div class="rounded-xl soft px-3 py-2"><span class="dim">${T('totalSeen')}</span>
+    <span class="float-end font-bold">${d.total_seen}</span></div>
+  </div>
+  <div class="space-y-1">${rows}</div>
+  <button onclick="toggleIpHistory()" class="w-full rounded-xl soft py-2 text-xs">
+   ${ipHistory?T('showLive'):T('showHistory')}</button>
+  <button onclick="clearIps(${ipUid})" class="w-full rounded-xl py-2 text-xs"
+   style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${T('clearIps')}</button>`;
+
+ if(quiet){ const b=document.getElementById('mBody'); if(b) b.innerHTML=body; }
+ else openModal(T('devTitle'),body);
 }
-async function clearIps(id){await api('/api/users/'+id+'/clear-ips',{method:'POST'});closeModal();loadUsers()}
+
+function toggleIpHistory(){ ipHistory=!ipHistory; paintIps(); }
+
+async function clearIps(id){await api('/api/users/'+id+'/clear-ips',{method:'POST'});closeModal();loadUsers();loadStats()}
 
 function showEdit(id){
  const u=users.find(x=>x.id===id);
