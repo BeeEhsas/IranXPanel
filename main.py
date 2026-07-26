@@ -52,6 +52,11 @@ DEVICE_WINDOW  = int(os.getenv("DEVICE_WINDOW", "300"))   # counts toward the de
 LIVE_WINDOW    = int(os.getenv("LIVE_WINDOW", "60"))      # shown as "connected right now"
 SESSION_IDLE   = int(os.getenv("SESSION_IDLE", "90"))     # xhttp session reaper
 
+# Self-ping, for hosts that idle a service out (Render's free plan does after ~15 min).
+# Read the caveats in the README before switching this on.
+KEEPALIVE       = os.getenv("KEEPALIVE", "").strip().lower() in ("1", "true", "yes", "on")
+KEEPALIVE_MINS  = max(1, int(os.getenv("KEEPALIVE_MINUTES", "10")))
+
 JWT_ALG, JWT_TTL, GB = "HS256", 60 * 60 * 12, 1024 ** 3
 TRANSPORTS = ("ws", "xhttp", "both")
 
@@ -259,6 +264,42 @@ async def bump(uid: int, up: int, down: int):
         cur = _pending.setdefault(uid, [0, 0])
         cur[0] += up
         cur[1] += down
+
+
+async def keepalive():
+    """Hit our own PUBLIC url so a host with an idle timeout keeps the service running.
+
+    It must travel through the public hostname: a request to localhost never reaches the
+    platform's router, so it does not register as inbound traffic and the service still
+    gets put to sleep. Uses urllib on a worker thread to avoid adding an HTTP dependency.
+    """
+    if not KEEPALIVE:
+        return
+
+    host = DOMAIN.replace("https://", "").replace("http://", "").strip("/")
+    if not host:
+        print("keepalive: DOMAIN is unset, staying off")
+        return
+
+    import urllib.request
+
+    url = f"https://{host}/healthz"
+
+    def hit():
+        try:
+            req = urllib.request.Request(url, headers={"user-agent": "iranx-keepalive"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status
+        except Exception as e:
+            return f"error: {e}"
+
+    loop = asyncio.get_running_loop()
+    print(f"keepalive: on, every {KEEPALIVE_MINS} min -> {url}")
+    while True:
+        await asyncio.sleep(KEEPALIVE_MINS * 60)
+        result = await loop.run_in_executor(None, hit)
+        if result != 200:                      # stay quiet unless something is wrong
+            print("keepalive:", result)
 
 
 async def flusher():
@@ -618,7 +659,11 @@ NOBUF_HEADERS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    tasks = [asyncio.create_task(flusher()), asyncio.create_task(reaper())]
+    tasks = [
+        asyncio.create_task(flusher()),
+        asyncio.create_task(reaper()),
+        asyncio.create_task(keepalive()),
+    ]
     yield
     for t in tasks:
         t.cancel()
@@ -1178,7 +1223,8 @@ async def stats(_=Depends(require_admin)):
             "xhttp_sessions": len(SESSIONS),
             "series": [dict(r) for r in series],
             "ws_path": WS_PATH, "xhttp_path": XHTTP_PATH,
-            "device_window": DEVICE_WINDOW, "live_window": LIVE_WINDOW}
+            "device_window": DEVICE_WINDOW, "live_window": LIVE_WINDOW,
+            "keepalive": KEEPALIVE, "keepalive_mins": KEEPALIVE_MINS}
 
 
 @app.get("/api/logs")
