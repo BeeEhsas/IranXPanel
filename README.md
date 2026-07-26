@@ -1,118 +1,218 @@
 <div align="center">
 
-# ⚡ IranX Panel
+<img src="https://em-content.zobj.net/source/microsoft-teams/363/high-voltage_26a1.png" width="88" alt="IranX Panel" />
 
-**Single-file subscription panel — VLESS + WS + TLS and VLESS + XHTTP + TLS**
+# IranX Panel
 
-FastAPI + SQLite · No Docker · Railway / Render
+### A single-file VLESS subscription panel that runs anywhere
 
-[فارسی](README-fa.md) · **English**
+Manage users, quotas and subscription links from one Python file.
+Two transports, six themes, bilingual UI — no Xray core, no Docker, no VPS.
+
+<p>
+  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite" />
+  <img src="https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge" alt="MIT" />
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/Railway-ready-0B0D0E?style=flat-square&logo=railway&logoColor=white" alt="Railway" />
+  <img src="https://img.shields.io/badge/Render-ready-46E3B7?style=flat-square&logo=render&logoColor=black" alt="Render" />
+  <img src="https://img.shields.io/badge/VLESS-WS%20%2B%20TLS-6366f1?style=flat-square" alt="WS+TLS" />
+  <img src="https://img.shields.io/badge/VLESS-XHTTP%20%2B%20TLS-d946ef?style=flat-square" alt="XHTTP+TLS" />
+</p>
+
+**English** · [فارسی](README-fa.md)
 
 </div>
 
 ---
 
-## ✨ Features
+## Why this exists
 
-- 🔑 **Password-only login** — the username is always `admin` and is never asked for
-- 🆕 Password is chosen by you on the **first visit** (PBKDF2-SHA256, 200k rounds)
-- ☰ **Hamburger drawer** with five separate sections
-- 🔀 **Per-user transport**: WS + TLS, XHTTP + TLS, or both
-- 👥 Full user CRUD with GB quota, expiry in days, enable/disable
-- 📱 Device limit based on **distinct active source IPs**
-- 🔄 UUID rotation (random or manual) to kill a leaked config
-- 🧊 Clean IP manager — single and bulk add
-- 🔗 Subscription link with an **info entry** showing username, remaining quota and days
-- 🌗 Six themes · 🌐 Bilingual FA / EN
-- 📊 24-hour traffic chart, transport split, event log
+Most panels want a VPS, a domain, a certificate and an Xray binary. This one wants a
+free PaaS account. The platform terminates TLS for you, so `main.py` implements the VLESS
+inbounds in pure Python and relays TCP — nothing to install, nothing to renew.
+
+```
+┌──────────┐   wss:// or https://   ┌─────────────┐   TCP   ┌────────────┐
+│  client  │ ─────────────────────▶ │  IranX Panel│ ──────▶ │ destination│
+└──────────┘   TLS ends at the PaaS └─────────────┘         └────────────┘
+```
 
 ---
 
-## ☰ Panel sections
+## Features
 
-| Section | Contents |
-|---|---|
-| 📊 **Dashboard** | Totals, 24h chart, WS/XHTTP split, live XHTTP session count |
-| 👥 **Users** | Create, list, edit, configs, per-user IP list |
-| 🧊 **Clean IP** | Single & bulk add, enable/disable, delete |
-| ⚙️ **Panel settings** | Theme, language, change password, server info |
-| 📜 **Events** | Login attempts, rejected connections, UUID rotations |
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**Access & security**
+- Password-only login — the username is always `admin`
+- You choose the password on **first visit**
+- PBKDF2-SHA256, 200 000 rounds
+- Rate-limited login, JWT session cookie
+- Event log: logins, rejections, UUID rotations
+
+</td>
+<td width="50%" valign="top">
+
+**Users**
+- Create, edit, enable/disable, delete
+- GB quota per user (`0` = unlimited)
+- Expiry in days
+- Device limit from **distinct active IPs**
+- UUID rotation to kill a leaked config
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**Transports**
+- `VLESS + WS + TLS`
+- `VLESS + XHTTP + TLS` *(packet-up)*
+- Chosen per user: one, the other, or both
+- Wrong transport for a user is refused
+
+</td>
+<td valign="top">
+
+**Interface**
+- Hamburger drawer, five sections
+- Six themes, remembered per browser
+- Bilingual FA / EN, RTL aware
+- 24-hour traffic chart, transport split
+- QR code for every subscription
+
+</td>
+</tr>
+</table>
 
 ---
 
-## 🔀 Two transports
+## Quick start
 
-Each user is set to one of three modes:
+<details open>
+<summary><b>Deploy on Railway</b></summary>
 
-| Mode | Result in the subscription |
-|---|---|
-| 🔌 **WS + TLS** | only `type=ws` configs |
-| 🚀 **XHTTP + TLS** | only `type=xhttp` configs (`mode=packet-up`) |
-| 🔀 **Both** | both kinds, including one of each per Clean IP |
+<br>
 
-If a user is set to `ws` and connects with an XHTTP config, the connection is rejected (and vice versa).
+**1.** Fork this repository, or upload these files to a repo of your own.
 
-**Paths**
+**2.** [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo** → pick it.
 
-- WebSocket → `wss://<domain>/<WS_PATH>` (default `/ws`)
-- XHTTP → `https://<domain>/<XHTTP_PATH>/...` (default `/xh`)
+**3.** Open the **Variables** tab:
 
-The two must differ.
-
-> ⚠️ **XHTTP is experimental.** It is implemented in `packet-up` mode: numbered POST
-> requests for the uplink, one streamed GET for the downlink. If a proxy or CDN in the
-> path buffers responses, the downlink will stall. WS is the more reliable route — if you
-> hit trouble, switch the user to WS.
-
----
-
-## 🚀 Deploy on Railway
-
-1. Put these files in a GitHub repository.
-2. railway.app → **New Project** → **Deploy from GitHub repo** → pick your repo.
-3. Open the **Variables** tab and add:
-
-| Variable | Example | Required |
+| Variable | Example | |
 |---|---|---|
-| `SECRET_KEY` | a long random string | ✅ |
-| `DOMAIN` | `myapp.up.railway.app` | ✅ |
+| `SECRET_KEY` | a long random string | **required** |
+| `DOMAIN` | `myapp.up.railway.app` | **required** |
 | `WS_PATH` | `ws` | optional |
 | `XHTTP_PATH` | `xh` | optional |
 | `DEVICE_WINDOW` | `300` | optional |
 | `SESSION_IDLE` | `90` | optional |
 | `DB_PATH` | `/tmp/panel.db` | optional |
-| `ADMIN_PASSWORD` | — | optional (skips the setup page) |
+| `ADMIN_PASSWORD` | — | optional, skips the setup page |
 
-4. **Settings → Networking → Generate Domain**, put that value in `DOMAIN`, then redeploy.
-5. Open `https://your-domain/` — the setup page appears, choose a password, done.
+**4.** **Settings → Networking → Generate Domain**, put that value in `DOMAIN`, redeploy.
 
-Start command (all platforms):
+**5.** Open `https://your-domain/` — the setup page appears. Choose a password. Done.
 
-```
+> [!TIP]
+> On a Trial plan the first build can sit in `QUEUED` for ten minutes before it even
+> starts. That is normal — wait it out before assuming something broke.
+
+</details>
+
+<details>
+<summary><b>Deploy on Render</b></summary>
+
+<br>
+
+Render reads `render.yaml` automatically. Create a **Web Service**, connect the repo,
+then add `SECRET_KEY` and `DOMAIN` under Environment.
+
+</details>
+
+<details>
+<summary><b>Any other ASGI host</b></summary>
+
+<br>
+
+```bash
+pip install -r requirements.txt
 gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT --timeout 0
 ```
 
+Anything that terminates TLS and forwards WebSocket upgrades will work.
+
+</details>
+
 ---
 
-## 🧊 Clean IP
+## The panel
 
-**Single:** address + label → Add
+| Section | What's in it |
+|:--|:--|
+| **Dashboard** | Totals, 24-hour chart, WS/XHTTP split, live XHTTP session count |
+| **Users** | Create, list, edit, per-user configs and IP list |
+| **Clean IP** | Single and bulk add, enable/disable, delete |
+| **Panel settings** | Theme, language, change password, server info |
+| **Events** | Login attempts, refused connections, UUID rotations |
 
-**Bulk:** one per line, label after `#`:
+---
+
+## Transports
+
+Each user is set to one mode:
+
+| Mode | What lands in their subscription |
+|:--|:--|
+| `WS + TLS` | only `type=ws` configs |
+| `XHTTP + TLS` | only `type=xhttp` configs, `mode=packet-up` |
+| **Both** | both kinds, plus one of each per Clean IP |
 
 ```
-104.16.132.229 # Irancell
-172.67.72.14   # MCI
+WebSocket   wss://<domain>/<WS_PATH>          default /ws
+XHTTP       https://<domain>/<XHTTP_PATH>/…   default /xh
+```
+
+The two paths must differ.
+
+> [!WARNING]
+> **XHTTP is experimental.** It is implemented as `packet-up`: numbered `POST` requests
+> for the uplink, one streamed `GET` for the downlink, with a reorder buffer for
+> out-of-order chunks. If any proxy or CDN in the path buffers responses, the downlink
+> stalls. **WS is the reliable route** — if a user has trouble, switch them to WS.
+
+---
+
+## Clean IP
+
+Add clean addresses once; they are appended to **every** user's subscription as extra
+configs. The connection address becomes the clean IP while `sni` and `host` stay on your
+real domain.
+
+Bulk input takes one entry per line, label after `#`:
+
+```
+104.16.132.229  # Irancell
+172.67.72.14    # MCI
 cdn.example.com # Backup
 188.114.97.3
 ```
 
-Every enabled Clean IP is appended to all subscriptions as an extra config — the
-connection address becomes the Clean IP while `sni` and `host` stay on your real domain.
+Use ⏸ to disable an address without deleting it.
 
 ---
 
-## 🔗 Subscription output
+## Subscription output
+
+The first entry is an **info config** — non-functional, present only so the client
+displays the account state at the top of the list:
 
 ```
 📊 ali_home | 20.50GB | 22Days
@@ -122,69 +222,63 @@ connection address becomes the Clean IP while `sni` and `host` stay on your real
 ⚡ ali_home · Irancell · XHTTP
 ```
 
-The first line is an **info entry**: a non-functional config whose name carries the
-username, remaining quota and days left. It points at port 80 with `security=none` on a
-path both inbounds ignore, so it can never actually be dialled — it only ever renders as a
-label at the top of the user's config list.
-
-The `subscription-userinfo` header is also set, so clients like Hiddify and Streisand show
+It points at port 80 with `security=none` on a path both inbounds ignore, so it can never
+be dialled. The `subscription-userinfo` header is also set, so Hiddify and Streisand show
 quota and expiry in their own UI as well.
 
 ---
 
-## 🔄 Killing a leaked config
+## Killing a leaked config
 
-Users → **Edit**:
+**Users → Edit:**
 
-- **New UUID** → fresh random UUID, plus the IP list is cleared
-- or the **Custom UUID** field → any UUID you choose
+- **New UUID** — fresh random UUID, and the IP list is cleared
+- **Custom UUID** — any UUID you choose
 
-Old configs stop working immediately. The subscription link does not change, so the user
-only needs to update their subscription.
-
----
-
-## 📱 How the device limit works
-
-Every source IP is recorded in `user_ips` along with its protocol (ws or xhttp), and counts
-as an active device for `DEVICE_WINDOW` seconds after its last connection. Once the limit is
-reached, connections from a new IP are refused. The **IPs** button shows the exact list with
-online/offline state and protocol per device.
-
-> Several devices behind one home router share a single IP and count as one device — an
-> inherent limitation of IP-based counting.
+Old configs stop working immediately. The subscription link is unchanged, so the user only
+needs to refresh their subscription.
 
 ---
 
-## 📁 Repository structure
+## How the device limit works
 
-| File | Purpose |
-|---|---|
-| `main.py` | Core: FastAPI backend, both inbounds, embedded UI |
-| `requirements.txt` | Pinned Python dependencies |
-| `Procfile` | Start command for Railway / Render / Heroku |
-| `railway.json` | Railway deploy config |
-| `render.yaml` | Render blueprint |
-| `panel-config.toml` | Environment variable reference |
-| `README.md` / `README-fa.md` | Docs |
+Every source IP is recorded with its protocol and counts as an active device for
+`DEVICE_WINDOW` seconds after its last connection. Once the limit is reached, a new IP is
+refused. The **IPs** button shows the exact list with online state and protocol per device.
 
-`ui-preview-*.html` are offline UI previews with mock data. They are not needed to run the panel.
+> [!NOTE]
+> Several devices behind one home router share a single IP and count as one device. That
+> is inherent to IP-based counting, not a bug.
 
 ---
 
-## ⚠️ Notes
+## Repository
 
-- The database on `/tmp` is **ephemeral** and wiped on every redeploy. For persistence,
-  create a Railway volume and set `DB_PATH=/data/panel.db`.
-- Upgrading from an earlier version is safe — new columns (`transport`, `proto`) are added
-  automatically via `ALTER TABLE`.
-- **UDP is not supported** (TCP only). Set DNS to DoH in your client.
-- TLS is terminated by the hosting platform, so no Xray core installation is needed.
-- Your host bills you for the bandwidth your users consume — watch the billing dashboard.
-- Intended for personal and educational use.
+```
+main.py             core — FastAPI, both inbounds, embedded UI
+requirements.txt    pinned dependencies
+Procfile            start command for Railway / Render / Heroku
+railway.json        Railway deploy config
+render.yaml         Render blueprint
+panel-config.toml   environment variable reference
+```
 
 ---
 
-## 📄 License
+## Good to know
 
-MIT
+- **The database on `/tmp` is ephemeral** and wiped on every redeploy. For persistence,
+  attach a volume and set `DB_PATH=/data/panel.db`.
+- **UDP is not supported** — TCP only. Set DNS to DoH in your client.
+- Upgrading from an older version is safe: new columns are added automatically via
+  `ALTER TABLE`.
+- Your host bills you for the bandwidth your users consume. Watch the billing dashboard.
+- Built for personal and educational use.
+
+---
+
+<div align="center">
+
+**MIT** · issues and pull requests welcome
+
+</div>
