@@ -180,26 +180,6 @@ unreachable from your network.
 
 ---
 
-## 🖼️ Screenshots
-
-<div align="center">
-
-<!-- Drop your images in docs/ with these names and the gallery below fills itself in -->
-
-| 📊 Dashboard | 👥 Users |
-|:--:|:--:|
-| <img src="docs/dashboard.png" alt="Dashboard" width="420" /> | <img src="docs/users.png" alt="Users" width="420" /> |
-
-| 🧊 Clean IP | 🎨 Themes |
-|:--:|:--:|
-| <img src="docs/clean-ip.png" alt="Clean IP" width="420" /> | <img src="docs/themes.png" alt="Themes" width="420" /> |
-
-<sub>Six themes, light and dark, FA/EN with full RTL support.</sub>
-
-</div>
-
----
-
 ## 📦 Quick start
 
 <details open>
