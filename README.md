@@ -1,27 +1,36 @@
 <div align="center">
 
-<img src="https://em-content.zobj.net/source/microsoft-teams/363/high-voltage_26a1.png" width="88" alt="IranX Panel" />
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:7C5CFF,50:2F83F6,100:22C58C&height=190&section=header&text=IranX%20Panel&fontSize=54&fontColor=ffffff&fontAlignY=36&desc=One%20Python%20file.%20Zero%20VPS.%20Full%20VLESS%20panel.&descAlignY=58&descSize=17" alt="IranX Panel" width="100%" />
 
-# IranX Panel
-
-### A single-file VLESS subscription panel that runs anywhere
-
-Manage users, quotas and subscription links from one Python file.
-Two transports, six themes, bilingual UI — no Xray core, no Docker, no VPS.
+<h3>⚡ A single-file VLESS subscription panel that runs anywhere</h3>
 
 <p>
-  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
-  <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI" />
-  <img src="https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite" />
-  <img src="https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge" alt="MIT" />
+Manage users, quotas, device limits and subscription links from <b>one</b> Python file.<br/>
+Two transports · six themes · bilingual UI — <b>no Xray core, no Docker, no VPS, no certificates.</b>
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Railway-ready-0B0D0E?style=flat-square&logo=railway&logoColor=white" alt="Railway" />
-  <img src="https://img.shields.io/badge/Render-ready-46E3B7?style=flat-square&logo=render&logoColor=black" alt="Render" />
-  <img src="https://img.shields.io/badge/VLESS-WS%20%2B%20TLS-6366f1?style=flat-square" alt="WS+TLS" />
-  <img src="https://img.shields.io/badge/VLESS-XHTTP%20%2B%20TLS-d946ef?style=flat-square" alt="XHTTP+TLS" />
+<img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
+<img src="https://img.shields.io/badge/FastAPI-ASGI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI" />
+<img src="https://img.shields.io/badge/VLESS-WS%20%2B%20XHTTP-7C5CFF?style=for-the-badge" alt="VLESS" />
+<img src="https://img.shields.io/badge/License-MIT-22C58C?style=for-the-badge" alt="MIT" />
 </p>
+
+<p>
+<img src="https://img.shields.io/badge/Railway-ready-0B0D0E?style=flat-square&logo=railway&logoColor=white" alt="Railway" />
+<img src="https://img.shields.io/badge/Render-ready-46E3B7?style=flat-square&logo=render&logoColor=white" alt="Render" />
+<img src="https://img.shields.io/badge/Cloudflare-relay%20optional-F38020?style=flat-square&logo=cloudflare&logoColor=white" alt="Cloudflare" />
+<img src="https://img.shields.io/github/stars/BeeEhsas/IranXPanel?style=flat-square&color=FFD166" alt="Stars" />
+<img src="https://img.shields.io/github/last-commit/BeeEhsas/IranXPanel?style=flat-square&color=2F83F6" alt="Last commit" />
+</p>
+
+<h3>
+<a href="https://iranxpanel.cvtlwdm.workers.dev/">🚀 One-Click Auto Deployer</a>
+&nbsp;·&nbsp;
+<a href="#-quick-start">📦 Quick start</a>
+&nbsp;·&nbsp;
+<a href="README-fa.md">🇮🇷 فارسی</a>
+</h3>
 
 **English** · [فارسی](README-fa.md)
 
@@ -29,18 +38,78 @@ Two transports, six themes, bilingual UI — no Xray core, no Docker, no VPS.
 
 ---
 
-## Why this exists
+## 🚀 Install it without touching a terminal
 
-Most panels want a VPS, a domain, a certificate and an Xray binary. This one wants a
-free PaaS account. The platform terminates TLS for you, so `main.py` implements the VLESS
-inbounds in pure Python and relays TCP — nothing to install, nothing to renew.
+<div align="center">
+
+### <a href="https://iranxpanel.cvtlwdm.workers.dev/">🪄 IranX Deployer</a>
+
+<a href="https://iranxpanel.cvtlwdm.workers.dev/">
+<img src="https://img.shields.io/badge/Open%20IranX%20Deployer-Deploy%20in%202%20minutes-7C5CFF?style=for-the-badge&logo=rocket&logoColor=white" alt="Open IranX Deployer" />
+</a>
+
+<sub>https://iranxpanel.cvtlwdm.workers.dev/</sub>
+
+</div>
+
+The deployer is a **single web page** that builds the whole thing for you: it creates the
+project on your hosting account, sets every environment variable, generates the domain,
+and hands you back a working panel URL and password. No CLI, no `git clone`, no YAML.
+
+| What it does | Detail |
+|:--|:--|
+| 🚄 **Railway or Render** | Pick your provider, paste an API token, press start |
+| 🏷️ **Project name & workspace** | Loads your workspaces and server locations from the API |
+| 🔑 **Panel password** | Type your own, or leave it blank for a generated one |
+| ♻️ **Anti-sleep (Render Free)** | Pings itself every 10 minutes so the free service never sleeps |
+| 🟠 **Cloudflare relay** | Optionally creates a Worker in *your own* Cloudflare account and points the configs at it instead of the host domain |
+| 🔐 **Token hygiene** | The token is used in-memory for that single request — never stored, never logged |
+
+<div align="center">
 
 ```mermaid
 flowchart LR
-    A["Client<br/>v2rayNG · Hiddify"]
-    B["Cloudflare relay<br/>optional"]
-    C["IranX Panel<br/>Railway · Render"]
-    D["Destination"]
+    U["🧑 You"] -->|"API token"| D["🪄 IranX Deployer<br/>workers.dev page"]
+    D -->|"create project + env vars"| H["🚄 Railway / 🎨 Render"]
+    H -->|"builds main.py"| P["🛡️ IranX Panel<br/>https://your-app"]
+    D -.->|"optional"| W["🟠 Cloudflare Worker<br/>relay in your account"]
+    W -.-> P
+
+    style U fill:#7C5CFF,stroke:#9B81FF,color:#fff
+    style D fill:#2F83F6,stroke:#57A5FF,color:#fff
+    style H fill:#0B0D0E,stroke:#46E3B7,color:#fff
+    style P fill:#22c58c,stroke:#43E0A8,color:#fff
+    style W fill:#F38020,stroke:#FFA257,color:#fff
+```
+
+</div>
+
+> [!IMPORTANT]
+> **One prerequisite for Railway:** Railway must be allowed to read a GitHub repo — even a
+> public one. Go to **Account Settings → Integrations → GitHub** once and connect it.
+> After the install finishes, delete the API token from your dashboard and create a fresh one.
+
+> [!TIP]
+> **Railway for anything serious.** Render's free plan sleeps after 15 minutes and wipes the
+> `/tmp` database when it wakes — users and quotas disappear. Railway does not sleep and
+> accepts a persistent disk.
+
+---
+
+## 💡 Why this exists
+
+Most panels want a VPS, a domain, a certificate and an Xray binary. This one wants a
+**free PaaS account**. The platform terminates TLS for you, so `main.py` implements the
+VLESS inbounds in pure Python and relays TCP — nothing to install, nothing to renew.
+
+<div align="center">
+
+```mermaid
+flowchart LR
+    A["📱 Client<br/>v2rayNG · Hiddify"]
+    B["🟠 Cloudflare relay<br/>optional"]
+    C["🛡️ IranX Panel<br/>Railway · Render"]
+    D["🌍 Destination"]
 
     A -->|"wss:// or https://"| B
     A -.->|"direct"| C
@@ -53,20 +122,22 @@ flowchart LR
     style D fill:#22c58c,stroke:#43E0A8,color:#fff
 ```
 
+</div>
+
 TLS terminates at the platform's edge, so `main.py` only ever speaks plain VLESS over an
 already-encrypted stream. The relay is optional — add it when the host's own domain is
 unreachable from your network.
 
 ---
 
-## Features
+## ✨ Features
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
-**Access & security**
-- Password-only login — the username is always `admin`
+### 🔐 Access & security
+- Password-only login — username is always `admin`
 - You choose the password on **first visit**
 - PBKDF2-SHA256, 200 000 rounds
 - Rate-limited login, JWT session cookie
@@ -75,7 +146,7 @@ unreachable from your network.
 </td>
 <td width="50%" valign="top">
 
-**Users**
+### 👥 Users
 - Create, edit, enable/disable, delete
 - GB quota per user (`0` = unlimited)
 - Expiry in days
@@ -85,20 +156,20 @@ unreachable from your network.
 </td>
 </tr>
 <tr>
-<td valign="top">
+<td width="50%" valign="top">
 
-**Transports**
+### 🔀 Transports
 - `VLESS + WS + TLS`
 - `VLESS + XHTTP + TLS` *(packet-up)*
 - Chosen per user: one, the other, or both
 - Wrong transport for a user is refused
 
 </td>
-<td valign="top">
+<td width="50%" valign="top">
 
-**Interface**
+### 🎨 Interface
 - Hamburger drawer, five sections
-- Six themes, remembered per browser
+- **Six themes**, remembered per browser
 - Bilingual FA / EN, RTL aware
 - 24-hour traffic chart, transport split
 - QR code for every subscription
@@ -109,12 +180,45 @@ unreachable from your network.
 
 ---
 
-## Quick start
+## 🖼️ Screenshots
+
+<div align="center">
+
+<!-- Drop your images in docs/ with these names and the gallery below fills itself in -->
+
+| 📊 Dashboard | 👥 Users |
+|:--:|:--:|
+| <img src="docs/dashboard.png" alt="Dashboard" width="420" /> | <img src="docs/users.png" alt="Users" width="420" /> |
+
+| 🧊 Clean IP | 🎨 Themes |
+|:--:|:--:|
+| <img src="docs/clean-ip.png" alt="Clean IP" width="420" /> | <img src="docs/themes.png" alt="Themes" width="420" /> |
+
+<sub>Six themes, light and dark, FA/EN with full RTL support.</sub>
+
+</div>
+
+---
+
+## 📦 Quick start
 
 <details open>
-<summary><b>Deploy on Railway</b></summary>
+<summary><b>🪄 Option A — IranX Deployer (recommended)</b></summary>
 
-<br>
+<br/>
+
+1. Open **[IranX Deployer](https://iranxpanel.cvtlwdm.workers.dev/)**
+2. Choose **Railway** or **Render**
+3. Paste your provider API token, pick a project name, load your workspace and location
+4. Optionally set a panel password, enable anti-sleep, or add a Cloudflare relay
+5. Press **Start** — you get the panel URL and login password at the end
+
+</details>
+
+<details>
+<summary><b>🚄 Option B — Railway by hand</b></summary>
+
+<br/>
 
 **1.** Fork this repository, or upload these files to a repo of your own.
 
@@ -144,9 +248,9 @@ unreachable from your network.
 </details>
 
 <details>
-<summary><b>Deploy on Render</b></summary>
+<summary><b>🎨 Option C — Render</b></summary>
 
-<br>
+<br/>
 
 Render reads `render.yaml` automatically. Create a **Web Service**, connect the repo,
 then add `SECRET_KEY` and `DOMAIN` under Environment.
@@ -154,9 +258,9 @@ then add `SECRET_KEY` and `DOMAIN` under Environment.
 </details>
 
 <details>
-<summary><b>Any other ASGI host</b></summary>
+<summary><b>🐍 Option D — Any other ASGI host</b></summary>
 
-<br>
+<br/>
 
 ```bash
 pip install -r requirements.txt
@@ -169,19 +273,19 @@ Anything that terminates TLS and forwards WebSocket upgrades will work.
 
 ---
 
-## The panel
+## 🧭 The panel
 
 | Section | What's in it |
 |:--|:--|
-| **Dashboard** | Totals, 24-hour chart, WS/XHTTP split, live XHTTP session count |
-| **Users** | Create, list, edit, per-user configs and IP list |
-| **Clean IP** | Single and bulk add, enable/disable, delete |
-| **Panel settings** | Theme, language, change password, server info |
-| **Events** | Login attempts, refused connections, UUID rotations |
+| 📊 **Dashboard** | Totals, 24-hour chart, WS/XHTTP split, live XHTTP session count |
+| 👥 **Users** | Create, list, edit, per-user configs and IP list |
+| 🧊 **Clean IP** | Single and bulk add, enable/disable, delete |
+| ⚙️ **Panel settings** | Theme, language, change password, server info |
+| 📝 **Events** | Login attempts, refused connections, UUID rotations |
 
 ---
 
-## Transports
+## 🔀 Transports
 
 Each user is set to one mode:
 
@@ -206,7 +310,7 @@ The two paths must differ.
 
 ---
 
-## Clean IP
+## 🧊 Clean IP
 
 Add clean addresses once; they are appended to **every** user's subscription as extra
 configs. The connection address becomes the clean IP while `sni` and `host` stay on your
@@ -225,7 +329,7 @@ Use ⏸ to disable an address without deleting it.
 
 ---
 
-## Subscription output
+## 📬 Subscription output
 
 The first entry is an **info config** — non-functional, present only so the client
 displays the account state at the top of the list:
@@ -244,19 +348,19 @@ quota and expiry in their own UI as well.
 
 ---
 
-## Killing a leaked config
+## 🔄 Killing a leaked config
 
 **Users → Edit:**
 
-- **New UUID** — fresh random UUID, and the IP list is cleared
-- **Custom UUID** — any UUID you choose
+- 🎲 **New UUID** — fresh random UUID, and the IP list is cleared
+- ✍️ **Custom UUID** — any UUID you choose
 
 Old configs stop working immediately. The subscription link is unchanged, so the user only
 needs to refresh their subscription.
 
 ---
 
-## How the device limit works
+## 📱 How the device limit works
 
 Every source IP is recorded with its protocol and counts as an active device for
 `DEVICE_WINDOW` seconds after its last connection. Once the limit is reached, a new IP is
@@ -268,7 +372,7 @@ refused. The **IPs** button shows the exact list with online state and protocol 
 
 ---
 
-## Repository
+## 🗂️ Repository
 
 ```
 main.py             core — FastAPI, both inbounds, embedded UI
@@ -281,20 +385,30 @@ panel-config.toml   environment variable reference
 
 ---
 
-## Good to know
+## ℹ️ Good to know
 
-- **The database on `/tmp` is ephemeral** and wiped on every redeploy. For persistence,
+- 💾 **The database on `/tmp` is ephemeral** and wiped on every redeploy. For persistence,
   attach a volume and set `DB_PATH=/data/panel.db`.
-- **UDP is not supported** — TCP only. Set DNS to DoH in your client.
-- Upgrading from an older version is safe: new columns are added automatically via
+- 🚫 **UDP is not supported** — TCP only. Set DNS to DoH in your client.
+- ⬆️ Upgrading from an older version is safe: new columns are added automatically via
   `ALTER TABLE`.
-- Your host bills you for the bandwidth your users consume. Watch the billing dashboard.
-- Built for personal and educational use.
+- 💳 Your host bills you for the bandwidth your users consume. Watch the billing dashboard.
+- 📚 Built for personal and educational use.
+- ⚠️ Cloudflare's free Workers plan allows 100 000 requests/day, and proxying general
+  traffic through Workers is against Cloudflare's terms — use the relay responsibly.
 
 ---
 
 <div align="center">
 
+### ⭐ If this saved you a VPS bill, drop a star
+
+<a href="https://iranxpanel.cvtlwdm.workers.dev/">
+<img src="https://img.shields.io/badge/Deploy%20now-IranX%20Deployer-22C58C?style=for-the-badge&logo=rocket&logoColor=white" alt="Deploy now" />
+</a>
+
 **MIT** · issues and pull requests welcome
+
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:22C58C,50:2F83F6,100:7C5CFF&height=120&section=footer" width="100%" alt="" />
 
 </div>
