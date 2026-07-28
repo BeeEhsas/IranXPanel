@@ -199,26 +199,6 @@ TLS در لبهٔ پلتفرم خاتمه می‌شود، پس `main.py` همی�
 
 <div dir="rtl" align="right">
 
-## 🖼️ تصاویر پنل
-
-</div>
-
-<div align="center">
-
-<!-- تصاویر را با همین نام‌ها در پوشهٔ docs/ بگذار تا گالری خودش پر شود -->
-
-| 📊 داشبورد | 👥 کاربران |
-|:--:|:--:|
-| <img src="docs/dashboard.png" alt="داشبورد" width="420" /> | <img src="docs/users.png" alt="کاربران" width="420" /> |
-
-| 🧊 آی‌پی تمیز | 🎨 تم‌ها |
-|:--:|:--:|
-| <img src="docs/clean-ip.png" alt="آی‌پی تمیز" width="420" /> | <img src="docs/themes.png" alt="تم‌ها" width="420" /> |
-
-<sub>شش تم روشن و تاریک، فارسی و انگلیسی با پشتیبانی کامل راست‌به‌چپ</sub>
-
-</div>
-
 ---
 
 <div dir="rtl" align="right">
