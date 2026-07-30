@@ -1747,9 +1747,6 @@ CLIENTS: list[dict] = [
     {"os": "ios", "name": "V2Box", "repo": "App Store", "accent": "#0ea5e9",
      "logo": "", "scheme": "v2box",
      "builds": [{"label": "iPhone / iPad", "url": APPLE + "/v2box-v2ray-client/id6446814690", "note": "App Store"}]},
-    {"os": "ios", "name": "FoXray", "repo": "App Store", "accent": "#f97316",
-     "logo": "", "scheme": "",
-     "builds": [{"label": "iPhone / iPad", "url": APPLE + "/foxray/id6448898396", "note": "App Store"}]},
     # ─── macOS ───
     {"os": "macos", "name": "Hiddify", "repo": HID, "accent": "#22c55e",
      "logo": LOGO_HID, "scheme": "hiddify",
