@@ -15,6 +15,8 @@ Login model:
   * every later login needs the password only
 """
 
+import html
+import json
 import os
 import re
 import time
@@ -1252,6 +1254,790 @@ async def logs(_=Depends(require_admin)):
 
 # ────────────────────────────── SUBSCRIPTION ──────────────────────────────
 
+
+
+# ══════════════════════════ SUBSCRIPTION PAGE ══════════════════════════
+# Self-contained: QR encoder + HTML renderer for /sub/<token> in a browser.
+
+"""Minimal, dependency-free QR code encoder (byte mode) returning SVG.
+
+Only what the subscription page needs: encode a UTF-8 string, pick the smallest
+version that fits, render as a compact SVG path.
+"""
+
+# (ec_per_block, [(num_blocks, data_codewords), ...]) keyed by (version, level)
+_EC: dict[tuple[int, str], tuple[int, list[tuple[int, int]]]] = {
+    (1, "L"): (7, [(1, 19)]),   (1, "M"): (10, [(1, 16)]),
+    (2, "L"): (10, [(1, 34)]),  (2, "M"): (16, [(1, 28)]),
+    (3, "L"): (15, [(1, 55)]),  (3, "M"): (26, [(1, 44)]),
+    (4, "L"): (20, [(1, 80)]),  (4, "M"): (18, [(2, 32)]),
+    (5, "L"): (26, [(1, 108)]), (5, "M"): (24, [(2, 43)]),
+    (6, "L"): (18, [(2, 68)]),  (6, "M"): (16, [(4, 27)]),
+    (7, "L"): (20, [(2, 78)]),  (7, "M"): (18, [(4, 31)]),
+    (8, "L"): (24, [(2, 97)]),  (8, "M"): (22, [(2, 38), (2, 39)]),
+    (9, "L"): (30, [(2, 116)]), (9, "M"): (22, [(3, 36), (2, 37)]),
+    (10, "L"): (18, [(2, 68), (2, 69)]),   (10, "M"): (26, [(4, 43), (1, 44)]),
+    (11, "L"): (20, [(4, 81)]),            (11, "M"): (30, [(1, 50), (4, 51)]),
+    (12, "L"): (24, [(2, 92), (2, 93)]),   (12, "M"): (22, [(6, 36), (2, 37)]),
+    (13, "L"): (26, [(4, 107)]),           (13, "M"): (22, [(8, 37), (1, 38)]),
+    (14, "L"): (30, [(3, 115), (1, 116)]), (14, "M"): (24, [(4, 40), (5, 41)]),
+    (15, "L"): (22, [(5, 87), (1, 88)]),   (15, "M"): (24, [(5, 41), (5, 42)]),
+    (16, "L"): (24, [(5, 98), (1, 99)]),   (16, "M"): (28, [(7, 45), (3, 46)]),
+    (17, "L"): (28, [(1, 107), (5, 108)]), (17, "M"): (28, [(10, 46), (1, 47)]),
+    (18, "L"): (30, [(5, 120), (1, 121)]), (18, "M"): (26, [(9, 43), (4, 44)]),
+    (19, "L"): (28, [(3, 113), (4, 114)]), (19, "M"): (26, [(3, 44), (11, 45)]),
+    (20, "L"): (28, [(3, 107), (5, 108)]), (20, "M"): (26, [(3, 41), (13, 42)]),
+    (21, "L"): (28, [(4, 116), (4, 117)]), (21, "M"): (26, [(17, 42)]),
+    (22, "L"): (28, [(2, 111), (7, 112)]), (22, "M"): (28, [(17, 46)]),
+    (23, "L"): (30, [(4, 121), (5, 122)]), (23, "M"): (28, [(4, 47), (14, 48)]),
+    (24, "L"): (30, [(6, 117), (4, 118)]), (24, "M"): (28, [(6, 45), (14, 46)]),
+    (25, "L"): (26, [(8, 106), (4, 107)]), (25, "M"): (28, [(8, 47), (13, 48)]),
+    (26, "L"): (28, [(10, 114), (2, 115)]), (26, "M"): (28, [(19, 46), (4, 47)]),
+    (27, "L"): (30, [(8, 122), (4, 123)]), (27, "M"): (28, [(22, 45), (3, 46)]),
+    (28, "L"): (30, [(3, 117), (10, 118)]), (28, "M"): (28, [(3, 45), (23, 46)]),
+    (29, "L"): (30, [(7, 116), (7, 117)]), (29, "M"): (28, [(21, 45), (7, 46)]),
+    (30, "L"): (30, [(5, 115), (10, 116)]), (30, "M"): (28, [(19, 47), (10, 48)]),
+}
+
+_ALIGN: dict[int, list[int]] = {
+    1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34],
+    7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50],
+    11: [6, 30, 54], 12: [6, 32, 58], 13: [6, 34, 62], 14: [6, 26, 46, 66],
+    15: [6, 26, 48, 70], 16: [6, 26, 50, 74], 17: [6, 30, 54, 78],
+    18: [6, 30, 56, 82], 19: [6, 30, 58, 86], 20: [6, 34, 62, 90],
+    21: [6, 28, 50, 72, 94], 22: [6, 26, 50, 74, 98], 23: [6, 30, 54, 78, 102],
+    24: [6, 28, 54, 80, 106], 25: [6, 32, 58, 84, 110], 26: [6, 30, 58, 86, 114],
+    27: [6, 34, 62, 90, 118], 28: [6, 26, 50, 74, 98, 122],
+    29: [6, 30, 54, 78, 102, 126], 30: [6, 26, 52, 78, 104, 130],
+}
+
+# ── GF(256) ──────────────────────────────────────────────────────────────
+_EXP = [1] * 512
+_LOG = [0] * 256
+_x = 1
+for _i in range(1, 255):
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D
+    _EXP[_i] = _x
+    _LOG[_x] = _i
+for _i in range(255, 512):
+    _EXP[_i] = _EXP[_i - 255]
+
+
+def _mul(a: int, b: int) -> int:
+    if a == 0 or b == 0:
+        return 0
+    return _EXP[_LOG[a] + _LOG[b]]
+
+
+def _gen_poly(n: int) -> list[int]:
+    g = [1]
+    for i in range(n):
+        g2 = [0] * (len(g) + 1)
+        for j, c in enumerate(g):
+            g2[j] ^= c
+            g2[j + 1] ^= _mul(c, _EXP[i])
+        g = g2
+    return g
+
+
+def _rs(data: list[int], n: int) -> list[int]:
+    g = _gen_poly(n)
+    rem = [0] * n
+    for d in data:
+        factor = d ^ rem[0]
+        rem = rem[1:] + [0]
+        if factor:
+            for i, c in enumerate(g[1:]):
+                rem[i] ^= _mul(c, factor)
+    return rem
+
+
+def _bch(data: int, gen: int, gen_bits: int) -> int:
+    rem = data
+    while rem.bit_length() >= gen_bits:
+        rem ^= gen << (rem.bit_length() - gen_bits)
+    return rem
+
+
+def _capacity(version: int, level: str) -> int:
+    ecb, groups = _EC[(version, level)]
+    return sum(n * d for n, d in groups)
+
+
+def _bitstream(payload: bytes, version: int, level: str) -> list[int]:
+    count_bits = 8 if version < 10 else 16
+    bits: list[int] = [0, 1, 0, 0]
+    for i in range(count_bits - 1, -1, -1):
+        bits.append((len(payload) >> i) & 1)
+    for byte in payload:
+        for i in range(7, -1, -1):
+            bits.append((byte >> i) & 1)
+    total = _capacity(version, level) * 8
+    bits += [0] * min(4, total - len(bits))
+    while len(bits) % 8:
+        bits.append(0)
+    pads = (0xEC, 0x11)
+    k = 0
+    while len(bits) < total:
+        for i in range(7, -1, -1):
+            bits.append((pads[k % 2] >> i) & 1)
+        k += 1
+    return bits
+
+
+def _codewords(payload: bytes, version: int, level: str) -> list[int]:
+    bits = _bitstream(payload, version, level)
+    data = [int("".join(str(b) for b in bits[i:i + 8]), 2) for i in range(0, len(bits), 8)]
+    ecb, groups = _EC[(version, level)]
+    blocks: list[list[int]] = []
+    pos = 0
+    for count, dc in groups:
+        for _ in range(count):
+            blocks.append(data[pos:pos + dc])
+            pos += dc
+    ec_blocks = [_rs(b, ecb) for b in blocks]
+    out: list[int] = []
+    for i in range(max(len(b) for b in blocks)):
+        for b in blocks:
+            if i < len(b):
+                out.append(b[i])
+    for i in range(ecb):
+        for b in ec_blocks:
+            out.append(b[i])
+    return out
+
+
+def _blank(size: int) -> list[list[int | None]]:
+    return [[None] * size for _ in range(size)]
+
+
+def _place_function_patterns(m, version: int) -> None:
+    size = len(m)
+
+    def finder(r0: int, c0: int) -> None:
+        for r in range(-1, 8):
+            for c in range(-1, 8):
+                rr, cc = r0 + r, c0 + c
+                if not (0 <= rr < size and 0 <= cc < size):
+                    continue
+                inner = 2 <= r <= 4 and 2 <= c <= 4
+                ring = r in (0, 6) and 0 <= c <= 6 or c in (0, 6) and 0 <= r <= 6
+                m[rr][cc] = 1 if (inner or ring) else 0
+
+    finder(0, 0)
+    finder(0, size - 7)
+    finder(size - 7, 0)
+
+    for i in range(size):
+        if m[6][i] is None:
+            m[6][i] = 1 if i % 2 == 0 else 0
+        if m[i][6] is None:
+            m[i][6] = 1 if i % 2 == 0 else 0
+
+    centers = _ALIGN[version]
+    skip = {(centers[0], centers[0]), (centers[0], centers[-1]), (centers[-1], centers[0])} if centers else set()
+    for r in centers:
+        for c in centers:
+            if (r, c) in skip:
+                continue
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    edge = max(abs(dr), abs(dc))
+                    m[r + dr][c + dc] = 1 if edge != 1 else 0
+
+    m[size - 8][8] = 1  # dark module
+
+    # reserve format areas
+    for i in range(9):
+        if m[8][i] is None:
+            m[8][i] = 0
+        if m[i][8] is None:
+            m[i][8] = 0
+    for i in range(8):
+        if m[8][size - 1 - i] is None:
+            m[8][size - 1 - i] = 0
+        if m[size - 1 - i][8] is None:
+            m[size - 1 - i][8] = 0
+
+    if version >= 7:
+        bits = (version << 12) | _bch(version << 12, 0x1F25, 13)
+        for i in range(18):
+            b = (bits >> i) & 1
+            m[size - 11 + i % 3][i // 3] = b
+            m[i // 3][size - 11 + i % 3] = b
+
+
+def _reserved_mask(version: int) -> list[list[bool]]:
+    size = version * 4 + 17
+    m = _blank(size)
+    _place_function_patterns(m, version)
+    return [[m[r][c] is not None for c in range(size)] for r in range(size)]
+
+
+def _mask_bit(mask: int, r: int, c: int) -> bool:
+    if mask == 0:
+        return (r + c) % 2 == 0
+    if mask == 1:
+        return r % 2 == 0
+    if mask == 2:
+        return c % 3 == 0
+    if mask == 3:
+        return (r + c) % 3 == 0
+    if mask == 4:
+        return (r // 2 + c // 3) % 2 == 0
+    if mask == 5:
+        return (r * c) % 2 + (r * c) % 3 == 0
+    if mask == 6:
+        return ((r * c) % 2 + (r * c) % 3) % 2 == 0
+    return ((r + c) % 2 + (r * c) % 3) % 2 == 0
+
+
+def _penalty(g: list[list[int]]) -> int:
+    size = len(g)
+    score = 0
+    for line in list(g) + [list(col) for col in zip(*g)]:
+        run, prev = 0, None
+        for v in line:
+            if v == prev:
+                run += 1
+            else:
+                if run >= 5:
+                    score += 3 + (run - 5)
+                run, prev = 1, v
+        if run >= 5:
+            score += 3 + (run - 5)
+    for r in range(size - 1):
+        for c in range(size - 1):
+            s = g[r][c] + g[r][c + 1] + g[r + 1][c] + g[r + 1][c + 1]
+            if s in (0, 4):
+                score += 3
+    pat1 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0]
+    pat2 = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1]
+    for line in list(g) + [list(col) for col in zip(*g)]:
+        for i in range(size - 10):
+            window = line[i:i + 11]
+            if window == pat1 or window == pat2:
+                score += 40
+    dark = sum(sum(row) for row in g)
+    ratio = dark * 100 // (size * size)
+    score += 10 * (abs(ratio - 50) // 5)
+    return score
+
+
+def encode(text: str, level: str = "M", force_mask: int | None = None) -> list[list[int]]:
+    """Return the QR matrix (list of rows of 0/1) for `text`."""
+    payload = text.encode("utf-8")
+    version = None
+    for v in range(1, 31):
+        overhead = 4 + (8 if v < 10 else 16)
+        if _capacity(v, level) * 8 >= overhead + len(payload) * 8:
+            version = v
+            break
+    if version is None:
+        if level != "L":
+            return encode(text, "L")
+        raise ValueError("data too long for QR")
+
+    size = version * 4 + 17
+    codewords = _codewords(payload, version, level)
+    reserved = _reserved_mask(version)
+
+    base = _blank(size)
+    _place_function_patterns(base, version)
+
+    bits = [(cw >> i) & 1 for cw in codewords for i in range(7, -1, -1)]
+    idx = 0
+    col = size - 1
+    upward = True
+    while col > 0:
+        if col == 6:
+            col -= 1
+        rows = range(size - 1, -1, -1) if upward else range(size)
+        for r in rows:
+            for c in (col, col - 1):
+                if reserved[r][c]:
+                    continue
+                base[r][c] = bits[idx] if idx < len(bits) else 0
+                idx += 1
+        upward = not upward
+        col -= 2
+
+    ec_bits = {"L": 0b01, "M": 0b00, "Q": 0b11, "H": 0b10}[level]
+    best = None
+    for mask in (range(8) if force_mask is None else (force_mask,)):
+        g = [[int(base[r][c]) ^ (1 if (not reserved[r][c] and _mask_bit(mask, r, c)) else 0)
+              for c in range(size)] for r in range(size)]
+        fmt_data = (ec_bits << 3) | mask
+        fmt = ((fmt_data << 10) | _bch(fmt_data << 10, 0x537, 11)) ^ 0x5412
+        for i in range(15):
+            bit = (fmt >> i) & 1
+            if i < 6:
+                g[i][8] = bit
+            elif i < 8:
+                g[i + 1][8] = bit
+            else:
+                g[size - 15 + i][8] = bit
+            if i < 8:
+                g[8][size - 1 - i] = bit
+            elif i == 8:
+                g[8][7] = bit
+            else:
+                g[8][14 - i] = bit
+        g[size - 8][8] = 1
+        score = _penalty(g)
+        if best is None or score < best[0]:
+            best = (score, g)
+    return best[1]
+
+
+def svg(text: str, level: str = "M", quiet: int = 3, css_class: str = "qr") -> str:
+    """Return a compact, self-contained SVG string for `text`."""
+    g = encode(text, level)
+    size = len(g)
+    total = size + quiet * 2
+    parts = []
+    for r, row in enumerate(g):
+        c = 0
+        while c < size:
+            if row[c]:
+                start = c
+                while c < size and row[c]:
+                    c += 1
+                parts.append(f"M{start + quiet} {r + quiet}h{c - start}v1h-{c - start}z")
+            else:
+                c += 1
+    path = "".join(parts)
+    return (
+        f'<svg class="{css_class}" viewBox="0 0 {total} {total}" '
+        f'xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" role="img">'
+        f'<rect width="{total}" height="{total}" fill="#fff"/>'
+        f'<path d="{path}" fill="#111"/></svg>'
+    )
+
+
+"""Subscription landing page for IranX Panel.
+
+Adds a browser-facing page for `/sub/{token}` without touching any existing
+panel logic: `render_sub_page()` returns one self-contained dark HTML page with
+quota, remaining time, QR codes, per-config copy buttons and client downloads.
+No new dependencies (QR codes are generated by `subpage_qr.py`).
+"""
+
+import html
+import json
+import time
+
+qr_svg = svg
+
+
+GH = "https://github.com"
+
+
+def _rel(repo: str) -> str:
+    """Stable link to the newest release of a repo."""
+    return f"{GH}/{repo}/releases/latest"
+
+
+def _dl(repo: str, asset: str) -> str:
+    """Direct download of a version-free asset name from the newest release."""
+    return f"{GH}/{repo}/releases/latest/download/{asset}"
+
+
+# ── client catalogue (static links, nothing fetched at runtime) ───────────────
+HID = "hiddify/hiddify-app"
+
+CLIENTS: list[dict] = [
+    # ─── Android ───
+    {"os": "android", "name": "v2rayNG", "repo": "2dust/v2rayNG", "accent": "#5E9FE8",
+     "logo": "https://raw.githubusercontent.com/2dust/v2rayNG/master/V2rayNG/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+     "builds": [
+         {"label": "arm64-v8a", "url": _rel("2dust/v2rayNG"), "note": "Releases"},
+         {"label": "armeabi-v7a", "url": _rel("2dust/v2rayNG"), "note": "Releases"},
+         {"label": "x86_64", "url": _rel("2dust/v2rayNG"), "note": "Releases"},
+         {"label": "x86", "url": _rel("2dust/v2rayNG"), "note": "Releases"},
+         {"label": "universal", "url": _rel("2dust/v2rayNG"), "note": "Releases"},
+     ]},
+    {"os": "android", "name": "Hiddify", "repo": HID, "accent": "#72BC8F",
+     "logo": "https://raw.githubusercontent.com/hiddify/hiddify-app/main/assets/images/logo.png",
+     "builds": [
+         {"label": "arm64", "url": _dl(HID, "Hiddify-Android-arm64.apk"), "note": ".apk"},
+         {"label": "arm32", "url": _dl(HID, "Hiddify-Android-arm7.apk"), "note": ".apk"},
+         {"label": "x86_64", "url": _dl(HID, "Hiddify-Android-x86_64.apk"), "note": ".apk"},
+         {"label": "universal", "url": _dl(HID, "Hiddify-Android-universal.apk"), "note": ".apk"},
+     ]},
+    {"os": "android", "name": "Exclave", "repo": "dyhkwong/Exclave", "accent": "#A78BFA",
+     "logo": "https://raw.githubusercontent.com/dyhkwong/Exclave/main/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+     "builds": [
+         {"label": "arm64-v8a", "url": _rel("dyhkwong/Exclave"), "note": "Releases"},
+         {"label": "armeabi-v7a", "url": _rel("dyhkwong/Exclave"), "note": "Releases"},
+         {"label": "x86_64", "url": _rel("dyhkwong/Exclave"), "note": "Releases"},
+         {"label": "x86", "url": _rel("dyhkwong/Exclave"), "note": "Releases"},
+     ]},
+    {"os": "android", "name": "NekoBox", "repo": "MatsuriDayo/NekoBoxForAndroid", "accent": "#DE9255",
+     "logo": "",
+     "builds": [
+         {"label": "arm64-v8a", "url": _rel("MatsuriDayo/NekoBoxForAndroid"), "note": "Releases"},
+         {"label": "armeabi-v7a", "url": _rel("MatsuriDayo/NekoBoxForAndroid"), "note": "Releases"},
+         {"label": "x86_64", "url": _rel("MatsuriDayo/NekoBoxForAndroid"), "note": "Releases"},
+     ]},
+    # ─── Windows ───
+    {"os": "windows", "name": "Hiddify", "repo": HID, "accent": "#72BC8F",
+     "logo": "https://raw.githubusercontent.com/hiddify/hiddify-app/main/assets/images/logo.png",
+     "builds": [
+         {"label": "Setup x64", "url": _dl(HID, "Hiddify-Windows-Setup-x64.exe"), "note": ".exe"},
+         {"label": "Portable x64", "url": _dl(HID, "Hiddify-Windows-Portable-x64.zip"), "note": ".zip"},
+     ]},
+    {"os": "windows", "name": "v2rayN", "repo": "2dust/v2rayN", "accent": "#5E9FE8",
+     "logo": "",
+     "builds": [
+         {"label": "windows x64", "url": _rel("2dust/v2rayN"), "note": "Releases"},
+         {"label": "windows arm64", "url": _rel("2dust/v2rayN"), "note": "Releases"},
+     ]},
+    {"os": "windows", "name": "NekoRay", "repo": "MatsuriDayo/nekoray", "accent": "#DE9255",
+     "logo": "",
+     "builds": [{"label": "windows x64", "url": _rel("MatsuriDayo/nekoray"), "note": "Releases"}]},
+    # ─── iOS ───
+    {"os": "ios", "name": "Streisand", "repo": "App Store", "accent": "#5E9FE8", "logo": "",
+     "builds": [{"label": "iPhone / iPad", "url": "https://apps.apple.com/app/streisand/id6450534064", "note": "App Store"}]},
+    {"os": "ios", "name": "Shadowrocket", "repo": "App Store", "accent": "#A78BFA", "logo": "",
+     "builds": [{"label": "iPhone / iPad", "url": "https://apps.apple.com/app/shadowrocket/id932747118", "note": "App Store"}]},
+    {"os": "ios", "name": "V2Box", "repo": "App Store", "accent": "#72BC8F", "logo": "",
+     "builds": [{"label": "iPhone / iPad", "url": "https://apps.apple.com/app/v2box-v2ray-client/id6446814690", "note": "App Store"}]},
+    {"os": "ios", "name": "FoXray", "repo": "App Store", "accent": "#DE9255", "logo": "",
+     "builds": [{"label": "iPhone / iPad", "url": "https://apps.apple.com/app/foxray/id6448898396", "note": "App Store"}]},
+    # ─── macOS ───
+    {"os": "macos", "name": "Hiddify", "repo": HID, "accent": "#72BC8F",
+     "logo": "https://raw.githubusercontent.com/hiddify/hiddify-app/main/assets/images/logo.png",
+     "builds": [
+         {"label": "Apple Silicon / Intel", "url": _dl(HID, "Hiddify-MacOS.dmg"), "note": ".dmg"},
+         {"label": "همه نسخه‌ها", "url": _rel(HID), "note": "Releases"},
+     ]},
+    {"os": "macos", "name": "V2Box", "repo": "App Store", "accent": "#5E9FE8", "logo": "",
+     "builds": [{"label": "macOS", "url": "https://apps.apple.com/app/v2box-v2ray-client/id6446814690", "note": "App Store"}]},
+    {"os": "macos", "name": "NekoRay", "repo": "MatsuriDayo/nekoray", "accent": "#DE9255", "logo": "",
+     "builds": [{"label": "macOS", "url": _rel("MatsuriDayo/nekoray"), "note": "Releases"}]},
+    # ─── Linux ───
+    {"os": "linux", "name": "Hiddify", "repo": HID, "accent": "#72BC8F",
+     "logo": "https://raw.githubusercontent.com/hiddify/hiddify-app/main/assets/images/logo.png",
+     "builds": [
+         {"label": "AppImage x64", "url": _dl(HID, "Hiddify-Linux-x64.AppImage"), "note": ".AppImage"},
+         {"label": ".deb x64", "url": _dl(HID, "Hiddify-Debian-x64.deb"), "note": ".deb"},
+         {"label": ".rpm x64", "url": _dl(HID, "Hiddify-rpm-x64.rpm"), "note": ".rpm"},
+     ]},
+    {"os": "linux", "name": "NekoRay", "repo": "MatsuriDayo/nekoray", "accent": "#DE9255", "logo": "",
+     "builds": [{"label": "linux x64", "url": _rel("MatsuriDayo/nekoray"), "note": "Releases"}]},
+    {"os": "linux", "name": "v2rayA", "repo": "v2rayA/v2rayA", "accent": "#5E9FE8", "logo": "",
+     "builds": [
+         {"label": "amd64 (.deb/.rpm)", "url": _rel("v2rayA/v2rayA"), "note": "Releases"},
+         {"label": "arm64 (.deb/.rpm)", "url": _rel("v2rayA/v2rayA"), "note": "Releases"},
+     ]},
+]
+
+OS_TABS = [
+    ("android", "اندروید", "Android"),
+    ("windows", "ویندوز", "Windows"),
+    ("ios", "آی‌او‌اس", "iOS"),
+    ("macos", "مک‌او‌اس", "macOS"),
+    ("linux", "لینوکس", "Linux"),
+]
+
+
+def _fmt_bytes(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+
+def render_sub_page(
+    *,
+    name: str,
+    sub_link: str,
+    configs: list,
+    used_bytes: int = 0,
+    quota_bytes: int = 0,
+    expire_at: int = 0,
+    active: bool = True,
+    status: str = "",
+    transport: str = "both",
+    device_limit: int = 0,
+    devices_now: int = 0,
+    panel_url: str = "",
+    update_interval: int = 12,
+) -> str:
+    """Return the full HTML page for one subscription token."""
+    now = int(time.time())
+    quota_bytes = int(quota_bytes or 0)
+    used_bytes = int(used_bytes or 0)
+    expire_at = int(expire_at or 0)
+
+    remain_bytes = max(0, quota_bytes - used_bytes) if quota_bytes else 0
+    pct = min(100, round(used_bytes * 100 / quota_bytes)) if quota_bytes else 0
+    remain_secs = max(0, expire_at - now) if expire_at else 0
+
+    cfgs = []
+    for c in configs or []:
+        c = dict(c)
+        cfgs.append({"label": c.get("label", ""), "transport": c.get("transport", ""),
+                     "uri": c.get("uri", "")})
+
+    payload = {
+        "name": name,
+        "subLink": sub_link,
+        "panelUrl": panel_url,
+        "active": bool(active),
+        "status": status or ("" if active else "inactive"),
+        "transport": (transport or "both").upper(),
+        "used": used_bytes,
+        "quota": quota_bytes,
+        "usedText": _fmt_bytes(used_bytes),
+        "quotaText": "∞" if not quota_bytes else _fmt_bytes(quota_bytes),
+        "remainText": "∞" if not quota_bytes else _fmt_bytes(remain_bytes),
+        "pct": pct,
+        "expireAt": expire_at,
+        "remainDays": remain_secs // 86400,
+        "remainHours": remain_secs % 86400 // 3600,
+        "deviceLimit": int(device_limit or 0),
+        "devicesNow": int(devices_now or 0),
+        "updateInterval": int(update_interval or 12),
+        "configs": cfgs,
+        "allConfigs": "\n".join(c["uri"] for c in cfgs if c["uri"]),
+        "clients": CLIENTS,
+        "osTabs": OS_TABS,
+    }
+
+    qrs = [qr_svg(sub_link, level="M", css_class="qrsvg")]
+    for c in cfgs:
+        try:
+            qrs.append(qr_svg(c["uri"], level="L", css_class="qrsvg sm"))
+        except Exception:
+            qrs.append("")
+
+    data = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    qr_json = json.dumps(qrs, ensure_ascii=False).replace("</", "<\\/")
+    return (_TEMPLATE
+            .replace("__TITLE__", html.escape(name or "Subscription"))
+            .replace("__QRS__", qr_json)
+            .replace("__DATA__", data))
+
+
+_TEMPLATE = r"""<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="color-scheme" content="dark">
+<title>__TITLE__ &middot; Subscription</title>
+<style>
+:root{--bg:#0f1113;--surface:#16181b;--raised:#1e2126;--line:rgba(255,255,255,.11);
+--tx:#f5f6f7;--tx2:rgba(255,255,255,.62);--accent:#5E9FE8;--ok:#72BC8F;--warn:#DE9255;--bad:#E97366}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);min-height:100vh;padding:24px 16px 48px;
+font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Vazirmatn,"Noto Sans Arabic",Tahoma,sans-serif}
+.wrap{max-width:940px;margin:0 auto}
+.top{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px rgba(114,188,143,.15)}
+.dot.off{background:var(--bad);box-shadow:0 0 0 4px rgba(233,115,102,.15)}
+.spacer{flex:1}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px}
+.hero{display:grid;grid-template-columns:1.4fr .6fr;gap:16px;align-items:stretch}
+@media(max-width:780px){.hero{grid-template-columns:1fr}}
+h1{margin:0 0 2px;font-size:23px;letter-spacing:-.2px}
+.sub{margin:0 0 18px;color:var(--tx2);font-size:13.5px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+@media(max-width:520px){.stats{grid-template-columns:1fr 1fr}}
+.stat{background:var(--raised);border-radius:12px;padding:12px 14px}
+.stat b{display:block;font-size:19px;font-weight:650;letter-spacing:-.2px}
+.stat span{color:var(--tx2);font-size:12.5px}
+.bar{height:9px;border-radius:99px;background:var(--raised);overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--ok))}
+.bar.hot>i{background:linear-gradient(90deg,var(--warn),var(--bad))}
+.meta{display:flex;justify-content:space-between;color:var(--tx2);font-size:12.5px;margin-top:8px}
+.qrbox{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center}
+.qrsvg{width:186px;height:186px;background:#fff;border-radius:10px;padding:7px;display:block}
+.qrsvg.sm{width:158px;height:158px}
+.hint{margin:0;color:var(--tx2);font-size:12.5px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+.btn{border:0;border-radius:10px;background:var(--accent);color:#fff;font:inherit;font-size:14px;font-weight:600;
+min-height:44px;padding:0 16px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none}
+.btn.alt{background:var(--raised);color:var(--tx);border:1px solid var(--line)}
+.btn:active{transform:translateY(1px)}
+h2{font-size:17px;margin:32px 0 12px}
+.cfg{display:flex;align-items:center;gap:10px;padding:11px 14px;border:1px solid var(--line);
+border-radius:12px;background:var(--surface);margin-bottom:8px;flex-wrap:wrap}
+.cfg .nm{flex:1 1 120px;min-width:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:430px){.cfg .nm{flex:1 1 100%}}
+.tag{font-size:11px;font-weight:700;padding:4px 9px;border-radius:99px;background:rgba(94,159,232,.16);color:var(--accent)}
+.tag.x{background:rgba(222,146,85,.16);color:var(--warn)}
+.ico{width:44px;height:44px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--tx);cursor:pointer;font-size:14px}
+.ico:hover{background:var(--raised)}
+.cfgqr{width:100%;display:flex;justify-content:center;padding:14px 0 4px}
+.cfgqr[hidden]{display:none}
+.ico svg{width:18px;height:18px;display:block;margin:auto;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.tab{border:1px solid var(--line);background:transparent;color:var(--tx2);border-radius:99px;
+min-height:40px;padding:0 16px;font:inherit;font-size:13.5px;cursor:pointer}
+.tab[aria-selected=true]{background:var(--accent);border-color:transparent;color:#fff;font-weight:600}
+.apps{display:grid;grid-template-columns:repeat(auto-fill,minmax(238px,1fr));gap:12px}
+.app{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:16px}
+.app .head{display:flex;align-items:center;gap:11px;margin-bottom:12px}
+.logo,.mark{width:42px;height:42px;border-radius:11px;display:block;flex:none}
+.logo{object-fit:cover;background:var(--raised)}
+.mark{display:grid;place-items:center;color:#0d1013;font-weight:800;font-size:16px}
+.app .nm{font-weight:650;font-size:15px}
+.app .rp{color:var(--tx2);font-size:11.5px;word-break:break-all}
+.dl{display:flex;flex-direction:column;gap:6px}
+.dl a{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:40px;padding:0 12px;
+border:1px solid var(--line);border-radius:10px;color:var(--tx);text-decoration:none;font-size:13.5px}
+.dl a:hover{background:var(--raised);border-color:rgba(94,159,232,.5)}
+.dl a .sz{color:var(--tx2);font-size:11.5px}
+.banner{display:flex;gap:10px;align-items:center;border:1px solid rgba(233,115,102,.4);background:rgba(233,115,102,.1);
+color:#ffd9d4;border-radius:12px;padding:12px 14px;font-size:13.5px;margin-bottom:16px}
+footer{margin-top:36px;text-align:center;color:var(--tx2);font-size:12px}
+.toast{position:fixed;inset-inline:0;bottom:22px;margin:auto;width:max-content;max-width:90vw;background:var(--ok);
+color:#08130d;font-weight:650;font-size:14px;padding:11px 18px;border-radius:99px;opacity:0;transform:translateY(8px);
+transition:.2s;pointer-events:none}
+.toast.on{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand"><span class="dot" id="dot"></span><span>IranX &middot; اشتراک من</span></div>
+    <span class="spacer"></span>
+    <span class="tag" id="trTag">—</span>
+  </div>
+
+  <div id="banner"></div>
+
+  <section class="hero">
+    <div class="card">
+      <h1 id="uname">—</h1>
+      <p class="sub" id="usub">—</p>
+      <div class="stats">
+        <div class="stat"><b id="sRemain">—</b><span>حجم باقی‌مانده</span></div>
+        <div class="stat"><b id="sDays">—</b><span>زمان باقی‌مانده</span></div>
+        <div class="stat"><b id="sDev">—</b><span>دستگاه مجاز</span></div>
+      </div>
+      <div class="bar" id="bar"><i style="width:0%"></i></div>
+      <div class="meta"><span id="mUsed">—</span><span id="mQuota">—</span></div>
+      <div class="row">
+        <button class="btn" id="copySub">کپی لینک اشتراک</button>
+        <button class="btn alt" id="copyAll">کپی همه کانفیگ‌ها</button>
+        <a class="btn alt" id="impHid" href="#">افزودن به Hiddify</a>
+        <a class="btn alt" id="impV2" href="#">افزودن به v2rayNG</a>
+      </div>
+    </div>
+    <div class="card qrbox">
+      <div id="qrMain"></div>
+      <p class="hint">با دوربین برنامه اسکن کنید<br>تا اشتراک خودکار اضافه شود</p>
+    </div>
+  </section>
+
+  <h2>کانفیگ‌ها</h2>
+  <div id="cfgs"></div>
+
+  <h2>دانلود برنامه‌ها</h2>
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <div class="apps" id="apps"></div>
+
+  <footer>لینک اشتراک شخصی شماست — آن را با کسی به اشتراک نگذارید · <span id="upd"></span></footer>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const D = __DATA__, QRS = __QRS__;
+const $ = (s)=>document.querySelector(s);
+const esc = (s)=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fa = (n)=>Number(n).toLocaleString("fa-IR");
+const ICON_QR = '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 14h3v3h-3zM20 14v3M14 20h6"/></svg>';
+const ICON_COPY = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 5.5A2.5 2.5 0 0012.5 3H6.5A2.5 2.5 0 004 5.5v6A2.5 2.5 0 006.5 14"/></svg>';
+
+/* header + stats */
+$("#uname").textContent = D.name || "اشتراک";
+$("#trTag").textContent = D.transport === "BOTH" ? "WS + XHTTP" : D.transport;
+$("#sRemain").textContent = D.remainText;
+$("#sDays").textContent = D.expireAt ? (D.remainDays > 0 ? fa(D.remainDays)+" روز" : fa(D.remainHours)+" ساعت") : "بی‌نهایت";
+$("#sDev").textContent = D.deviceLimit ? fa(D.devicesNow)+" / "+fa(D.deviceLimit) : "بی‌نهایت";
+$("#mUsed").textContent = "مصرف‌شده: " + D.usedText;
+$("#mQuota").textContent = "کل: " + D.quotaText;
+$("#bar").firstElementChild.style.width = (D.quota ? D.pct : 0) + "%";
+if (D.pct >= 85) $("#bar").classList.add("hot");
+const expTxt = D.expireAt ? new Date(D.expireAt*1000).toLocaleDateString("fa-IR") : "بدون انقضا";
+$("#usub").textContent = "انقضا: " + expTxt + " · " + fa(D.configs.length) + " کانفیگ فعال";
+$("#upd").textContent = "به‌روزرسانی هر " + fa(D.updateInterval) + " ساعت";
+if (!D.active){
+  $("#dot").classList.add("off");
+  $("#banner").innerHTML = '<div class="banner">⚠️ این اشتراک فعال نیست'+(D.status?" ("+esc(D.status)+")":"")+' — با پشتیبانی تماس بگیرید.</div>';
+}
+
+/* QR + import buttons */
+$("#qrMain").innerHTML = QRS[0] || '<p class="hint">QR در دسترس نیست</p>';
+$("#impHid").href = "hiddify://import/" + D.subLink;
+$("#impV2").href = "v2rayng://install-sub?url=" + encodeURIComponent(D.subLink);
+
+/* toast + copy */
+let t;
+function toast(msg){ const el=$("#toast"); el.textContent=msg; el.classList.add("on"); clearTimeout(t); t=setTimeout(()=>el.classList.remove("on"),1800); }
+async function copy(text,msg){
+  try{ await navigator.clipboard.writeText(text); }
+  catch(e){ const ta=document.createElement("textarea"); ta.value=text; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+  toast(msg);
+}
+$("#copySub").onclick = ()=>copy(D.subLink, "لینک اشتراک کپی شد ✓");
+$("#copyAll").onclick = ()=>copy(D.allConfigs, "همه کانفیگ‌ها کپی شد ✓");
+
+/* configs */
+$("#cfgs").innerHTML = D.configs.length ? D.configs.map((c,i)=>`
+  <div class="cfg">
+    <span class="nm">${esc(c.label)}</span>
+    <span class="tag ${c.transport==="XHTTP"?"x":""}">${esc(c.transport)}</span>
+    <button class="ico" data-qr="${i}" title="نمایش QR" aria-label="نمایش QR">${ICON_QR}</button>
+    <button class="ico" data-copy="${i}" title="کپی کانفیگ" aria-label="کپی کانفیگ">${ICON_COPY}</button>
+    <div class="cfgqr" data-box="${i}" hidden></div>
+  </div>`).join("") : '<div class="card"><p class="hint" style="margin:0">کانفیگ فعالی وجود ندارد.</p></div>';
+$("#cfgs").addEventListener("click",(e)=>{
+  const b=e.target.closest("button"); if(!b) return;
+  if(b.dataset.copy!==undefined) copy(D.configs[+b.dataset.copy].uri, "کانفیگ کپی شد ✓");
+  if(b.dataset.qr!==undefined){
+    const i=+b.dataset.qr, box=$(`[data-box="${i}"]`);
+    if(!box.innerHTML) box.innerHTML = QRS[i+1] || '<p class="hint">QR در دسترس نیست</p>';
+    box.hidden = !box.hidden;
+  }
+});
+
+/* clients */
+const tabs=$("#tabs"), apps=$("#apps");
+let current = D.osTabs[0][0];
+function paint(){
+  tabs.innerHTML = D.osTabs.map(([id,faName,en])=>`<button class="tab" role="tab" data-os="${id}" aria-selected="${id===current}">${esc(faName)}</button>`).join("");
+  apps.innerHTML = D.clients.filter(a=>a.os===current).map(a=>`
+    <div class="app">
+      <div class="head">
+        ${a.logo
+          ? `<img class="logo" src="${esc(a.logo)}" alt="" loading="lazy" onerror="this.outerHTML='<span class=&quot;mark&quot; style=&quot;background:${esc(a.accent)}&quot;>${esc(a.name[0])}</span>'">`
+          : `<span class="mark" style="background:${esc(a.accent)}">${esc(a.name[0])}</span>`}
+        <div><div class="nm">${esc(a.name)}</div><div class="rp">${esc(a.repo)}</div></div>
+      </div>
+      <div class="dl">${a.builds.map(b=>`<a href="${esc(b.url)}" target="_blank" rel="noopener"><span>${esc(b.label)}</span><span class="sz">${esc(b.note||"")}</span></a>`).join("")}</div>
+    </div>`).join("");
+}
+tabs.addEventListener("click",(e)=>{ const b=e.target.closest("[data-os]"); if(!b) return; current=b.dataset.os; paint(); });
+paint();
+</script>
+</body>
+</html>
+"""
+
+
 @app.get("/sub/{token}")
 async def subscription(token: str, request: Request):
     with db() as c:
@@ -1264,6 +2050,28 @@ async def subscription(token: str, request: Request):
     lines = build_info_lines(row, d)
     if user_status(row)[0]:
         lines += [c["uri"] for c in build_configs(row, d, ips)]
+
+    # browser? serve the subscription page, clients keep the base64 payload
+    ua = (request.headers.get("user-agent") or "").lower()
+    accept = request.headers.get("accept") or ""
+    force_page = request.query_params.get("page") in ("1", "true")
+    force_raw = request.query_params.get("raw") in ("1", "true")
+    if not force_raw and (force_page or ("text/html" in accept and "mozilla" in ua)):
+        ok, reason = user_status(row)
+        return HTMLResponse(render_sub_page(
+            name=row["name"],
+            sub_link=("https" + "://") + d + "/sub/" + row["sub_token"],
+            configs=build_configs(row, d, ips) if ok else [],
+            used_bytes=row["used_bytes"],
+            quota_bytes=row["quota_bytes"],
+            expire_at=row["expire_at"],
+            active=ok,
+            status="" if ok else reason,
+            transport=row["transport"],
+            device_limit=row["device_limit"],
+            devices_now=active_devices(row["id"]),
+            panel_url=("https" + "://") + origin_domain(request) + "/",
+        ))
 
     body = base64.b64encode("\n".join(lines).encode()).decode()
     headers = {
