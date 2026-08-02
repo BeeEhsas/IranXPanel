@@ -2128,7 +2128,7 @@ const T = {
     updEvery:(h)=>"به‌روزرسانی هر "+h+" ساعت", expires:"انقضا", noExpiry:"بدون انقضا",
     unlimited:"بی‌نهایت", inactive:"این اشتراک فعال نیست", support:"با پشتیبانی تماس بگیرید",
     days:"روز", hours:"ساعت", cfgCount:(n)=>n+" کانفیگ فعال", copiedSub:"لینک اشتراک کپی شد ✓",
-    copiedAll:"همه کانفیگ‌ها کپی شد ✓", copiedCfg:"کانفیگ کپی شد ✓", noQr:"QR در دسترس نیست",
+    copiedAll:"همه کانفیگ‌ها کپ�� شد ✓", copiedCfg:"کانفیگ کپی شد ✓", noQr:"QR در دسترس نیست",
     importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گ��ینهٔ Add from clipboard را بزنید",
     allVersions:"همه نسخه‌ها", theme:"تم", light:"روشن", dark:"تیره", subName:"اشتراک"},
   en:{brand:"IranX · My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
@@ -2808,6 +2808,31 @@ function toggleNav(force){
 }
 placeNav(false);
 
+/* ─── country flags + inline icons ───
+   `var` and function declarations on purpose: paintStatic() runs during boot, before
+   this point in the script, and `const` would throw a temporal-dead-zone error that
+   aborts the whole panel script. */
+var CC=['DE','NL','FR','GB','FI','SE','PL','AT','CH','ES','IT','RO','TR','RU','AE','QA','OM',
+        'AM','GE','IN','SG','JP','KR','HK','CA','US','BR','AU','DK','NO','BE','CZ','HU','LT',
+        'LV','EE','IE','UA','KZ','IR'];
+function flagOf(c){
+ return String(c||'').toUpperCase().replace(/[^A-Z]/g,'').slice(0,2)
+   .replace(/./g,ch=>String.fromCodePoint(0x1F1E6+ch.charCodeAt(0)-65));
+}
+function fillCountry(sel,cur){
+ if(!sel)return;
+ sel.innerHTML='<option value="">'+T('autoCountry')+'</option>'+
+  CC.map(c=>'<option value="'+c+'">'+flagOf(c)+' '+c+'</option>').join('');
+ sel.value=cur||'';
+}
+var SVG_PAUSE='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M9.5 5v14M14.5 5v14"/></svg>';
+var SVG_PLAY='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M7.5 5.2l11 6.8-11 6.8z"/></svg>';
+var SVG_X='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M6 6l12 12M18 6L6 18"/></svg>';
+var MAIN_CC='';
+
 /* ─── routing ─── */
 let PAGE=localStorage.getItem('page')||'dash';
 function go(p){
@@ -2916,7 +2941,6 @@ async function loadStats(){
 }
 async function loadUsers(){users=await api('/api/users');renderUsers()}
 async function loadCips(){cips=await api('/api/clean-ips');renderCips()}
-let MAIN_CC='';
 async function loadMainCountry(){
  try{const r=await api('/api/main-country');MAIN_CC=r.country||'';
       fillCountry(document.getElementById('mcSel'),MAIN_CC);}catch(e){}
@@ -2960,23 +2984,6 @@ function renderUsers(){
    </div></div>`}).join('')||`<p class="p-6 text-center text-sm dim">${T('noUsers')}</p>`;
 }
 
-const CC=['DE','NL','FR','GB','FI','SE','PL','AT','CH','ES','IT','RO','TR','RU','AE','QA','OM',
-          'AM','GE','IN','SG','JP','KR','HK','CA','US','BR','AU','DK','NO','BE','CZ','HU','LT',
-          'LV','EE','IE','UA','KZ','IR'];
-const flagOf=c=>(c||'').toUpperCase().replace(/[^A-Z]/g,'').slice(0,2)
-  .replace(/./g,ch=>String.fromCodePoint(0x1F1E6+ch.charCodeAt(0)-65));
-function fillCountry(sel,cur){
- if(!sel)return;
- sel.innerHTML='<option value="">'+T('autoCountry')+'</option>'+
-  CC.map(c=>`<option value="${c}">${flagOf(c)} ${c}</option>`).join('');
- sel.value=cur||'';
-}
-const SVG_PAUSE='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M9.5 5v14M14.5 5v14"/></svg>';
-const SVG_PLAY='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M7.5 5.2l11 6.8-11 6.8z"/></svg>';
-const SVG_X='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M6 6l12 12M18 6L6 18"/></svg>';
 function renderCips(){
  cipRows.innerHTML=cips.map(x=>`
   <div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
