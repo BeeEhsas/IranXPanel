@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS clean_ips (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     address  TEXT UNIQUE NOT NULL,
     remark   TEXT DEFAULT '',
+    country  TEXT DEFAULT '',
     enabled  INTEGER DEFAULT 1,
     added_at INTEGER NOT NULL
 );
@@ -138,7 +139,8 @@ def now() -> int:
 def migrate():
     """Add columns that older databases may be missing."""
     wanted = {"users": [("transport", "TEXT DEFAULT 'both'")],
-              "user_ips": [("proto", "TEXT DEFAULT 'ws'")]}
+              "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
+              "clean_ips": [("country", "TEXT DEFAULT ''")]}
     with db() as c:
         for table, cols in wanted.items():
             have = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
@@ -791,6 +793,70 @@ def xhttp_uri(row, address: str, host: str, label: str) -> str:
             f"#{quote(label)}")
 
 
+# ─────────────────────── country flags in config names ───────────────────────
+
+COUNTRY_WORDS = {
+    "germany": "DE", "deutschland": "DE", "\u0622\u0644\u0645\u0627\u0646": "DE", "frankfurt": "DE",
+    "netherlands": "NL", "holland": "NL", "\u0647\u0644\u0646\u062f": "NL", "amsterdam": "NL",
+    "france": "FR", "\u0641\u0631\u0627\u0646\u0633\u0647": "FR", "paris": "FR",
+    "england": "GB", "britain": "GB", "london": "GB", "\u0627\u0646\u06af\u0644\u06cc\u0633": "GB",
+    "finland": "FI", "\u0641\u0646\u0644\u0627\u0646\u062f": "FI", "sweden": "SE", "\u0633\u0648\u0626\u062f": "SE",
+    "poland": "PL", "\u0644\u0647\u0633\u062a\u0627\u0646": "PL", "austria": "AT", "\u0627\u062a\u0631\u06cc\u0634": "AT",
+    "switzerland": "CH", "\u0633\u0648\u0626\u06cc\u0633": "CH", "spain": "ES", "\u0627\u0633\u067e\u0627\u0646\u06cc\u0627": "ES",
+    "italy": "IT", "\u0627\u06cc\u062a\u0627\u0644\u06cc\u0627": "IT", "romania": "RO", "\u0631\u0648\u0645\u0627\u0646\u06cc": "RO",
+    "turkey": "TR", "turkiye": "TR", "\u062a\u0631\u06a9\u06cc\u0647": "TR", "istanbul": "TR",
+    "russia": "RU", "\u0631\u0648\u0633\u06cc\u0647": "RU", "emirates": "AE", "dubai": "AE", "\u0627\u0645\u0627\u0631\u0627\u062a": "AE",
+    "qatar": "QA", "\u0642\u0637\u0631": "QA", "oman": "OM", "\u0639\u0645\u0627\u0646": "OM",
+    "armenia": "AM", "\u0627\u0631\u0645\u0646\u0633\u062a\u0627\u0646": "AM", "georgia": "GE", "\u06af\u0631\u062c\u0633\u062a\u0627\u0646": "GE",
+    "india": "IN", "\u0647\u0646\u062f": "IN", "singapore": "SG", "\u0633\u0646\u06af\u0627\u067e\u0648\u0631": "SG",
+    "japan": "JP", "\u0698\u0627\u067e\u0646": "JP", "korea": "KR", "\u06a9\u0631\u0647": "KR",
+    "canada": "CA", "\u06a9\u0627\u0646\u0627\u062f\u0627": "CA", "america": "US", "usa": "US", "\u0622\u0645\u0631\u06cc\u06a9\u0627": "US",
+    "iran": "IR", "\u0627\u06cc\u0631\u0627\u0646": "IR", "australia": "AU", "\u0627\u0633\u062a\u0631\u0627\u0644\u06cc\u0627": "AU",
+    "brazil": "BR", "\u0628\u0631\u0632\u06cc\u0644": "BR", "denmark": "DK", "\u062f\u0627\u0646\u0645\u0627\u0631\u06a9": "DK",
+    "norway": "NO", "\u0646\u0631\u0648\u0698": "NO", "belgium": "BE", "\u0628\u0644\u0698\u06cc\u06a9": "BE",
+    "czech": "CZ", "\u0686\u06a9": "CZ", "hungary": "HU", "\u0645\u062c\u0627\u0631\u0633\u062a\u0627\u0646": "HU",
+    "lithuania": "LT", "latvia": "LV", "estonia": "EE", "ireland": "IE", "\u0627\u06cc\u0631\u0644\u0646\u062f": "IE",
+    "ukraine": "UA", "\u0627\u0648\u06a9\u0631\u0627\u06cc\u0646": "UA", "kazakhstan": "KZ", "\u0642\u0632\u0627\u0642\u0633\u062a\u0627\u0646": "KZ",
+    "hongkong": "HK", "hong kong": "HK", "\u0647\u0646\u06af\u200c\u06a9\u0646\u06af": "HK",
+    "cloudflare": "", "cdn": "",
+}
+
+ISO2_RE = re.compile(r"(?:^|[\s\-_\[\(#|])([A-Za-z]{2})(?:$|[\s\-_\]\)#|])")
+
+
+def flag_of(code: str) -> str:
+    """ISO-3166 alpha-2 -> regional-indicator flag (e.g. DE -> German flag)."""
+    c = re.sub(r"[^A-Za-z]", "", code or "")[:2].upper()
+    if len(c) != 2:
+        return ""
+    return "".join(chr(0x1F1E6 + ord(ch) - 65) for ch in c)
+
+
+def guess_country(text: str) -> str:
+    """Best-effort country code from a free-text label such as 'DE Frankfurt'."""
+    low = (text or "").strip().lower()
+    if not low:
+        return ""
+    for word, code in COUNTRY_WORDS.items():
+        if word and word in low:
+            return code
+    m = ISO2_RE.search(" " + low + " ")
+    return m.group(1).upper() if m else ""
+
+
+def cip_flag(cip) -> str:
+    """Flag for one clean IP: the stored country wins, otherwise guess it."""
+    try:
+        stored = cip["country"]
+    except (KeyError, IndexError):
+        stored = ""
+    return flag_of(stored) or flag_of(guess_country(cip["remark"] or ""))
+
+
+def main_flag() -> str:
+    return flag_of(get_setting("main_country") or "")
+
+
 def build_configs(row, host: str, clean_ips) -> list[dict]:
     t = (row["transport"] or "both").lower()
     kinds = []
@@ -799,17 +865,19 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     if t in ("xhttp", "both"):
         kinds.append(("XHTTP", xhttp_uri))
 
+    head = main_flag() or "\U0001f310"
     out = []
     for tag, fn in kinds:
-        out.append({"label": f"🌐 {row['name']} · {tag} · Default",
+        out.append({"label": f"{head} {row['name']} · {tag} · Default",
                     "transport": tag,
-                    "uri": fn(row, host, host, f"🌐 {row['name']} · {tag}")})
+                    "uri": fn(row, host, host, f"{head} {row['name']} · {tag}")})
         for cip in clean_ips:
             note = cip["remark"] or cip["address"]
-            out.append({"label": f"⚡ {note} · {tag}",
+            mark = cip_flag(cip) or "\u26a1"
+            out.append({"label": f"{mark} {note} · {tag}",
                         "transport": tag,
                         "uri": fn(row, cip["address"], host,
-                                  f"⚡ {row['name']} · {note} · {tag}")})
+                                  f"{mark} {row['name']} · {note} · {tag}")})
     return out
 
 
@@ -899,6 +967,11 @@ class UserPatch(BaseModel):
 class CleanIpIn(BaseModel):
     address: str
     remark: str = ""
+    country: str = ""
+
+
+class CountryIn(BaseModel):
+    country: str = ""
 
 
 class CleanIpBulkIn(BaseModel):
@@ -964,7 +1037,7 @@ async def api_logout():
     return resp
 
 
-# ────────────────────────────── USERS ──────────────────────────────
+# ────���───────────────────────── USERS ──────────────────────────────
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{2,32}$")
 
@@ -1148,7 +1221,26 @@ def valid_address(a: str) -> bool:
 async def list_clean_ips(_=Depends(require_admin)):
     with db() as c:
         rows = c.execute("SELECT * FROM clean_ips ORDER BY id DESC").fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["country"] = (d.get("country") or "").upper()
+        d["flag"] = cip_flag(r)
+        out.append(d)
+    return out
+
+
+@app.get("/api/main-country")
+async def read_main_country(_=Depends(require_admin)):
+    code = (get_setting("main_country") or "").upper()
+    return {"country": code, "flag": flag_of(code)}
+
+
+@app.post("/api/main-country")
+async def write_main_country(body: CountryIn, _=Depends(require_admin)):
+    code = re.sub(r"[^A-Za-z]", "", body.country or "")[:2].upper()
+    set_setting("main_country", code)
+    return {"ok": True, "country": code, "flag": flag_of(code)}
 
 
 @app.post("/api/clean-ips")
@@ -1157,9 +1249,11 @@ async def add_clean_ip(body: CleanIpIn, _=Depends(require_admin)):
     if not valid_address(addr):
         raise HTTPException(400, "invalid IP or domain")
     try:
+        remark = body.remark.strip()[:40]
+        code = re.sub(r"[^A-Za-z]", "", body.country or "")[:2].upper() or guess_country(remark)
         with db() as c:
-            c.execute("INSERT INTO clean_ips(address,remark,enabled,added_at) "
-                      "VALUES(?,?,1,?)", (addr, body.remark.strip()[:40], now()))
+            c.execute("INSERT INTO clean_ips(address,remark,country,enabled,added_at) "
+                      "VALUES(?,?,?,1,?)", (addr, remark, code, now()))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "already in the list")
     return {"ok": True}
@@ -1179,8 +1273,9 @@ async def bulk_clean_ips(body: CleanIpBulkIn, _=Depends(require_admin)):
                 bad += 1
                 continue
             try:
-                c.execute("INSERT INTO clean_ips(address,remark,enabled,added_at) "
-                          "VALUES(?,?,1,?)", (addr, remark, now()))
+                c.execute("INSERT INTO clean_ips(address,remark,country,enabled,added_at) "
+                          "VALUES(?,?,?,1,?)",
+                          (addr, remark, guess_country(remark), now()))
                 added += 1
             except sqlite3.IntegrityError:
                 dup += 1
@@ -1212,7 +1307,7 @@ async def clear_clean_ips(_=Depends(require_admin)):
     return {"ok": True}
 
 
-# ────────────────────────────── STATS ──────────────────────────────
+# ───────────────────────────���── STATS ──────────────────────────────
 
 @app.get("/api/stats")
 async def stats(_=Depends(require_admin)):
@@ -1747,6 +1842,9 @@ CLIENTS: list[dict] = [
     {"os": "ios", "name": "V2Box", "repo": "App Store", "accent": "#0ea5e9",
      "logo": "", "scheme": "v2box",
      "builds": [{"label": "iPhone / iPad", "url": APPLE + "/v2box-v2ray-client/id6446814690", "note": "App Store"}]},
+    {"os": "ios", "name": "FoXray", "repo": "App Store", "accent": "#f97316",
+     "logo": "", "scheme": "",
+     "builds": [{"label": "iPhone / iPad", "url": APPLE + "/foxray/id6448898396", "note": "App Store"}]},
     # ─── macOS ───
     {"os": "macos", "name": "Hiddify", "repo": HID, "accent": "#22c55e",
      "logo": LOGO_HID, "scheme": "hiddify",
@@ -2025,13 +2123,13 @@ const T = {
     devices:"دستگاه مجاز", used:"مصرف‌شده", total:"کل", copySub:"کپی لینک اشتراک",
     copyAll:"کپی همه کانفیگ‌ها", addTo:"افزودن به", configs:"کانفیگ‌ها", downloads:"دانلود برنامه‌ها",
     noConfigs:"کانفیگ فعالی وجود ندارد.", showQr:"نمایش QR", copyCfg:"کپی کانفیگ",
-    scanHint:"با دوربین برنامه اسکن کنید<br>تا اشتراک خودکار اضافه شود",
+    scanHint:"با دوربین برنامه اس��ن کنید<br>تا اشتراک خودکار اضافه شود",
     footer:"لینک اشتراک شخصی شماست — آن را با کسی به اشتراک نگذارید",
     updEvery:(h)=>"به‌روزرسانی هر "+h+" ساعت", expires:"انقضا", noExpiry:"بدون انقضا",
     unlimited:"بی‌نهایت", inactive:"این اشتراک فعال نیست", support:"با پشتیبانی تماس بگیرید",
     days:"روز", hours:"ساعت", cfgCount:(n)=>n+" کانفیگ فعال", copiedSub:"لینک اشتراک کپی شد ✓",
     copiedAll:"همه کانفیگ‌ها کپی شد ✓", copiedCfg:"کانفیگ کپی شد ✓", noQr:"QR در دسترس نیست",
-    importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گزینهٔ Add from clipboard را بزنید",
+    importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گ��ینهٔ Add from clipboard را بزنید",
     allVersions:"همه نسخه‌ها", theme:"تم", light:"روشن", dark:"تیره", subName:"اشتراک"},
   en:{brand:"IranX · My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
     devices:"Devices", used:"Used", total:"Total", copySub:"Copy subscription link",
@@ -2275,17 +2373,28 @@ async def healthz():
 # ════════════════════════════ FRONTEND ════════════════════════════
 
 THEME_CSS = r"""
-:root{--bg:#020617;--panel:#0b1220;--card:#ffffff0d;--line:#ffffff17;--txt:#e2e8f0;
-      --dim:#94a3b8;--a1:#6366f1;--a2:#d946ef;--ok:#34d399;--bad:#fb7185;--info:#38bdf8}
-[data-theme="ocean"]{--bg:#04121f;--panel:#07203a;--a1:#0ea5e9;--a2:#22d3ee}
-[data-theme="forest"]{--bg:#04160f;--panel:#062718;--a1:#10b981;--a2:#84cc16}
-[data-theme="sunset"]{--bg:#1a0710;--panel:#2b0c1a;--a1:#f97316;--a2:#ec4899}
-[data-theme="violet"]{--bg:#0e0524;--panel:#190a3a;--a1:#8b5cf6;--a2:#c026d3}
-[data-theme="light"]{--bg:#f1f5f9;--panel:#ffffff;--card:#ffffff;--line:#0f172a17;
-                     --txt:#0f172a;--dim:#64748b;--a1:#4f46e5;--a2:#c026d3}
+/* three themes only: black+blue, white+blue, grey. Buttons are black on white text. */
+:root,[data-theme="dark"]{--bg:#000000;--panel:#07090f;--card:#0b0f17;--line:#1b2537;
+      --txt:#f2f6fc;--dim:#8fa3c0;--a1:#1d4ed8;--a2:#3b82f6;--ok:#34d399;--bad:#fb7185;--info:#38bdf8;
+      --btn:#000000;--btn-tx:#ffffff;--btn-line:#2f4570;--ring:#1d4ed855}
+[data-theme="light"]{--bg:#f3f7ff;--panel:#ffffff;--card:#ffffff;--line:#d3e0f5;
+      --txt:#0b1c38;--dim:#5b7a9c;--a1:#1d4ed8;--a2:#3b82f6;--ok:#15803d;--bad:#b91c1c;--info:#0369a1;
+      --btn:#0b0f17;--btn-tx:#ffffff;--btn-line:#0b0f17;--ring:#1d4ed833}
+[data-theme="gray"]{--bg:#1a1d21;--panel:#22262b;--card:#282d33;--line:#3a424c;
+      --txt:#eef1f5;--dim:#a7b0bc;--a1:#3f6fd1;--a2:#5b8ae6;--ok:#4ade80;--bad:#f87171;--info:#60a5fa;
+      --btn:#0d0f12;--btn-tx:#ffffff;--btn-line:#0d0f12;--ring:#3f6fd155}
 body{background:var(--bg);color:var(--txt)}
 .card{background:var(--card);border:1px solid var(--line)}
 .grad{background-image:linear-gradient(to right,var(--a1),var(--a2))}
+/* every action button: solid black, white text */
+button.grad,a.grad.btn,.btn-solid{background-image:none;background:var(--btn);color:var(--btn-tx);
+  border:1px solid var(--btn-line)}
+button.grad:hover,.btn-solid:hover{filter:brightness(1.25)}
+button.grad:focus-visible,.btn-solid:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.ic{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;
+    stroke-linecap:round;stroke-linejoin:round}
+.ic-lg{width:22px;height:22px}
+.icbox{display:grid;place-items:center}
 .dim{color:var(--dim)}
 .inp{background:color-mix(in srgb,var(--bg) 65%,#8881);border:1px solid var(--line);color:var(--txt)}
 .inp:focus{border-color:var(--a1);outline:none}
@@ -2293,7 +2402,8 @@ body{background:var(--bg);color:var(--txt)}
 .navi{display:flex;align-items:center;gap:.6rem;padding:.7rem .9rem;border-radius:.85rem;
       font-size:.85rem;cursor:pointer;transition:.15s}
 .navi:hover{background:color-mix(in srgb,var(--txt) 7%,transparent)}
-.navi.on{background-image:linear-gradient(to right,var(--a1),var(--a2));color:#fff;font-weight:700}
+.navi.on{background:var(--btn);color:var(--btn-tx);font-weight:700;border:1px solid var(--btn-line)}
+.navi.on .ic{stroke:var(--btn-tx)}
 .sheet{background:var(--panel)}
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
@@ -2305,15 +2415,15 @@ const I18N={
  fa:{dir:'rtl',
   setupTitle:'تعیین رمز عبور',setupSub:'اولین ورود — یک رمز برای پنل انتخاب کنید',
   loginTitle:'ورود به پنل',loginSub:'رمز عبور خود را وارد کنید',
-  password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخیره و ورود',
+  password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخی��ه و ورود',
   pwRule:'حداقل ۸ کاراکتر شامل حرف بزرگ، حرف کوچک و عدد',netErr:'خطای شبکه',
   navDash:'داشبورد',navUsers:'مدیریت کاربران',navClean:'Clean IP',
   navSettings:'تنظیمات پنل',navLogs:'رخدادها',menu:'منو',
   totalUsers:'کل کاربران',online:'کاربران آنلاین',devices:'دستگاه‌های متصل',
   traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'سشن‌های XHTTP',
-  chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تقسیم بر اساس ترنسپورت',
+  chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تقسیم ب�� اساس ترنسپورت',
   newUser:'ساخت کاربر جدید',users:'کاربران',
-  name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',
+  name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعد��د دستگاه',
   transport:'ترنسپورت',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 هر دو',
   add:'افزودن',zeroInf:'۰ = بی‌نهایت. «تعداد دستگاه» بر اساس IP یکتای فعال محاسبه می‌شود.',
   search:'جستجو…',noUsers:'کاربری نیست',
@@ -2332,13 +2442,17 @@ const I18N={
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
-  cleanTitle:'مدیریت Clean IP',
+  cleanTitle:'��دیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
   addrPh:'مثلا 1.2.3.4 یا cdn.example.com',remarkPh:'برچسب (اختیاری)',
-  bulkPh:'چند مورد، هر خط یکی:\n1.2.3.4 # ایرانسل\n5.6.7.8 # همراه اول',
+  bulkPh:'چند مورد، هر خط یکی:\n1.2.3.4 # ای��انسل\n5.6.7.8 # همراه اول',
   bulkAdd:'افزودن انبوه',clearAll:'حذف همه',
   addedN:'افزوده شد',dupN:'تکراری',invalidN:'نامعتبر',noCleanIps:'لیست خالی است',
   settings:'تنظیمات',appearance:'ظاهر',theme:'تم',language:'زبان',
+  thDark:'تیره (مشکی و آبی)',thLight:'روشن (سفید و آبی)',thGray:'خاکستری',
+  country:'کشور',autoCountry:'تشخیص خودکار',mainCountry:'کشور سرور اصلی',
+  flagsHint:'پرچم کشور به ابتدای نام کانفیگ‌ها در لینک اشتراک اضافه می‌شود',
+  savedOk:'ذخیره شد',save:'ذخیره',
   changePw:'تغییر رمز عبور',curPw:'رمز فعلی',newPw:'رمز جدید',pwChanged:'رمز تغییر کرد ✓',
   serverInfo:'اطلاعات سرور',wsPathLbl:'مسیر WebSocket',xhPathLbl:'مسیر XHTTP',
   relayLbl:'دامنه رله',keepAliveLbl:'جلوگیری از خواب',relayNone:'ندارد',
@@ -2385,6 +2499,10 @@ const I18N={
   bulkAdd:'Bulk add',clearAll:'Delete all',
   addedN:'added',dupN:'duplicates',invalidN:'invalid',noCleanIps:'List is empty',
   settings:'Settings',appearance:'Appearance',theme:'Theme',language:'Language',
+  thDark:'Dark (black & blue)',thLight:'Light (white & blue)',thGray:'Gray',
+  country:'Country',autoCountry:'Auto detect',mainCountry:'Main server country',
+  flagsHint:'The country flag is prepended to every config name in the subscription.',
+  savedOk:'Saved',save:'Save',
   changePw:'Change password',curPw:'Current password',newPw:'New password',
   pwChanged:'Password changed ✓',
   serverInfo:'Server info',wsPathLbl:'WebSocket path',xhPathLbl:'XHTTP path',
@@ -2397,7 +2515,9 @@ const I18N={
  }
 };
 let LANG=localStorage.getItem('lang')||'fa';
-let THEME=localStorage.getItem('theme')||'default';
+const THEMES=['dark','light','gray'];
+let THEME=localStorage.getItem('theme')||'dark';
+if(!THEMES.includes(THEME)){THEME='light'===THEME?'light':'dark';localStorage.setItem('theme',THEME)}
 const T=k=>I18N[LANG][k]||k;
 function applyChrome(){
  document.documentElement.lang=LANG;
@@ -2425,12 +2545,14 @@ AUTH_HTML = r"""<!DOCTYPE html><html><head>
   <select onchange="setLang(this.value)" id="langSel" class="inp rounded-lg px-2 py-1 text-xs">
    <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select>
   <select onchange="setTheme(this.value)" id="thSel" class="inp rounded-lg px-2 py-1 text-xs">
-   <option value="default">🌌 Midnight</option><option value="ocean">🌊 Ocean</option>
-   <option value="forest">🌿 Forest</option><option value="sunset">🌅 Sunset</option>
-   <option value="violet">🔮 Violet</option><option value="light">☀️ Light</option></select>
+   <option value="dark">Dark</option><option value="light">Light</option>
+   <option value="gray">Gray</option></select>
  </div>
  <div class="mb-6 text-center">
-  <div class="mx-auto mb-3 h-14 w-14 rounded-2xl grad grid place-items-center text-2xl">⚡</div>
+  <div class="mx-auto mb-3 h-14 w-14 rounded-2xl grad grid place-items-center">
+   <svg viewBox="0 0 24 24" style="width:30px;height:30px;stroke:#fff;fill:none;stroke-width:1.6;stroke-linejoin:round">
+    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
+    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
   <h1 id="h1" class="text-xl font-extrabold"></h1>
   <p id="sub" class="text-xs dim mt-1"></p>
  </div>
@@ -2488,8 +2610,12 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
         style="border-color:var(--line);background:color-mix(in srgb,var(--bg) 88%,transparent)">
  <div class="max-w-6xl mx-auto px-3 py-3 flex items-center gap-2">
   <button onclick="toggleNav()" aria-label="menu"
-          class="h-9 w-9 rounded-xl soft grid place-items-center text-lg">☰</button>
-  <div class="h-9 w-9 rounded-xl grad grid place-items-center">⚡</div>
+          class="h-9 w-9 rounded-xl soft grid place-items-center">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <div class="h-9 w-9 rounded-xl grad grid place-items-center text-white">
+   <svg class="ic" viewBox="0 0 24 24" style="stroke:#fff">
+    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
+    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
   <h1 class="font-extrabold text-sm sm:text-base">{{TITLE}}</h1>
   <span id="crumb" class="text-[11px] dim px-2 py-1 rounded-lg soft hidden sm:inline"></span>
   <div class="flex-1"></div>
@@ -2503,24 +2629,38 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
         transition-transform duration-200 overflow-y-auto"
        style="border-inline-end:1px solid var(--line)">
  <div class="flex items-center gap-2 mb-4">
-  <div class="h-10 w-10 rounded-xl grad grid place-items-center text-lg">⚡</div>
+  <div class="h-10 w-10 rounded-xl grad grid place-items-center">
+   <svg class="ic ic-lg" viewBox="0 0 24 24" style="stroke:#fff">
+    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
+    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
   <div><p class="font-extrabold text-sm">{{TITLE}}</p>
        <p class="text-[10px] dim">admin</p></div>
-  <button onclick="toggleNav()" class="ms-auto dim text-lg">✕</button>
+  <button onclick="toggleNav()" aria-label="close" class="ms-auto dim icbox h-8 w-8">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
  </div>
 
- <div class="navi" data-page="dash"     onclick="go('dash')"><span>📊</span><span data-t="navDash"></span></div>
- <div class="navi" data-page="users"    onclick="go('users')"><span>👥</span><span data-t="navUsers"></span></div>
- <div class="navi" data-page="clean"    onclick="go('clean')"><span>🧊</span><span data-t="navClean"></span></div>
- <div class="navi" data-page="settings" onclick="go('settings')"><span>⚙️</span><span data-t="navSettings"></span></div>
- <div class="navi" data-page="logs"     onclick="go('logs')"><span>📜</span><span data-t="navLogs"></span></div>
+ <div class="navi" data-page="dash" onclick="go('dash')">
+  <svg class="ic" viewBox="0 0 24 24"><path d="M4 19V11M9.5 19V5M15 19v-6M20.5 19V8"/>
+   <path d="M3 21h18"/></svg><span data-t="navDash"></span></div>
+ <div class="navi" data-page="users" onclick="go('users')">
+  <svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/>
+   <path d="M3.5 19.5c0-3 2.5-4.8 5.5-4.8s5.5 1.8 5.5 4.8"/>
+   <path d="M16.5 5.6a3 3 0 010 5.6M18 14.9c2 .6 3.4 2.2 3.4 4.6"/></svg><span data-t="navUsers"></span></div>
+ <div class="navi" data-page="clean" onclick="go('clean')">
+  <svg class="ic" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/>
+   <path d="M9.4 14.6a2.8 2.8 0 002.6 2.6"/></svg><span data-t="navClean"></span></div>
+ <div class="navi" data-page="settings" onclick="go('settings')">
+  <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
+   <path d="M19.4 14.5a1.7 1.7 0 00.35 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.35 1.7 1.7 0 00-1.03 1.56V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.55 1.7 1.7 0 00-1.87.35l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.7 1.7 0 00.35-1.87 1.7 1.7 0 00-1.56-1.03H3a2 2 0 110-4h.1a1.7 1.7 0 001.55-1.1 1.7 1.7 0 00-.35-1.87l-.06-.06a2 2 0 112.83-2.83l.06.06a1.7 1.7 0 001.87.35H9a1.7 1.7 0 001-1.56V3a2 2 0 114 0v.1a1.7 1.7 0 001.03 1.56 1.7 1.7 0 001.87-.35l.06-.06a2 2 0 112.83 2.83l-.06.06a1.7 1.7 0 00-.35 1.87V9a1.7 1.7 0 001.56 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1.05z"/></svg><span data-t="navSettings"></span></div>
+ <div class="navi" data-page="logs" onclick="go('logs')">
+  <svg class="ic" viewBox="0 0 24 24"><path d="M5 4.5h11l3 3V19a1 1 0 01-1 1H5a1 1 0 01-1-1V5.5a1 1 0 011-1z"/>
+   <path d="M15.5 4.5V8H19M7.5 12h9M7.5 15.5h6"/></svg><span data-t="navLogs"></span></div>
 
  <div class="pt-3 mt-3 border-t space-y-2" style="border-color:var(--line)">
   <div class="flex gap-2">
    <select id="thSel" onchange="setTheme(this.value)" class="inp rounded-lg px-2 py-1.5 text-xs flex-1">
-    <option value="default">🌌 Midnight</option><option value="ocean">🌊 Ocean</option>
-    <option value="forest">🌿 Forest</option><option value="sunset">🌅 Sunset</option>
-    <option value="violet">🔮 Violet</option><option value="light">☀️ Light</option></select>
+    <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
+    <option value="gray" data-t="thGray"></option></select>
    <select id="langSel" onchange="setLang(this.value)" class="inp rounded-lg px-2 py-1.5 text-xs">
     <option value="fa">فا</option><option value="en">EN</option></select>
   </div>
@@ -2583,10 +2723,11 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
   <div class="card rounded-2xl p-4">
    <p class="text-sm font-bold" data-t="cleanTitle"></p>
    <p class="text-[11px] dim mt-1 mb-3" data-t="cleanHint"></p>
-   <div class="grid sm:grid-cols-3 gap-2">
+   <div class="grid sm:grid-cols-4 gap-2">
     <input id="cAddr" class="inp rounded-xl px-3 py-2 text-sm">
     <input id="cRem" class="inp rounded-xl px-3 py-2 text-sm">
-    <button onclick="addCip()" id="btnCipAdd" class="grad rounded-xl px-4 py-2 text-sm font-bold text-white"></button>
+    <select id="cCty" class="inp rounded-xl px-3 py-2 text-sm"></select>
+    <button onclick="addCip()" id="btnCipAdd" class="grad rounded-xl px-4 py-2 text-sm font-bold"></button>
    </div>
    <textarea id="cBulk" rows="4" class="inp rounded-xl px-3 py-2 text-sm w-full mt-2 mono"></textarea>
    <div class="grid grid-cols-2 gap-2 mt-2">
@@ -2606,9 +2747,14 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    <div class="grid sm:grid-cols-2 gap-2">
     <div><label class="text-xs dim" data-t="theme"></label>
      <select id="thSel2" onchange="setTheme(this.value);syncSelects()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-      <option value="default">🌌 Midnight</option><option value="ocean">🌊 Ocean</option>
-      <option value="forest">🌿 Forest</option><option value="sunset">🌅 Sunset</option>
-      <option value="violet">🔮 Violet</option><option value="light">☀️ Light</option></select></div>
+      <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
+      <option value="gray" data-t="thGray"></option></select></div>
+    <div><label class="text-xs dim" data-t="mainCountry"></label>
+     <div class="flex gap-2 mt-1">
+      <select id="mcSel" class="flex-1 inp rounded-xl px-3 py-2 text-sm"></select>
+      <button onclick="saveMainCountry()" id="btnMc" class="grad rounded-xl px-3 py-2 text-xs font-bold"></button>
+     </div>
+     <p class="text-[10px] dim mt-1" data-t="flagsHint"></p></div>
     <div><label class="text-xs dim" data-t="language"></label>
      <select id="langSel2" onchange="setLang(this.value);syncSelects()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
       <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select></div>
@@ -2711,6 +2857,9 @@ function paintStatic(){
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
  cAddr.placeholder=T('addrPh'); cRem.placeholder=T('remarkPh'); cBulk.placeholder=T('bulkPh');
+ fillCountry(document.getElementById('cCty'),document.getElementById('cCty')?.value||'');
+ fillCountry(document.getElementById('mcSel'),MAIN_CC);
+ const _mb=document.getElementById('btnMc'); if(_mb)_mb.textContent=T('save');
  pwCur.placeholder=T('curPw'); pwNew.placeholder=T('newPw');
  placeNav(navOpen);
 }
@@ -2767,6 +2916,20 @@ async function loadStats(){
 }
 async function loadUsers(){users=await api('/api/users');renderUsers()}
 async function loadCips(){cips=await api('/api/clean-ips');renderCips()}
+let MAIN_CC='';
+async function loadMainCountry(){
+ try{const r=await api('/api/main-country');MAIN_CC=r.country||'';
+      fillCountry(document.getElementById('mcSel'),MAIN_CC);}catch(e){}
+}
+async function saveMainCountry(){
+ const sel=document.getElementById('mcSel');if(!sel)return;
+ try{const r=await api('/api/main-country',{method:'POST',
+      body:JSON.stringify({country:sel.value})});
+  MAIN_CC=r.country||'';
+  const b=document.getElementById('btnMc');
+  if(b){const old=b.textContent;b.textContent=T('savedOk');setTimeout(()=>{b.textContent=old},1500)}
+ }catch(e){alert(e.message)}
+}
 async function loadLogs(){logItems=await api('/api/logs');renderLogs()}
 
 function renderUsers(){
@@ -2797,15 +2960,33 @@ function renderUsers(){
    </div></div>`}).join('')||`<p class="p-6 text-center text-sm dim">${T('noUsers')}</p>`;
 }
 
+const CC=['DE','NL','FR','GB','FI','SE','PL','AT','CH','ES','IT','RO','TR','RU','AE','QA','OM',
+          'AM','GE','IN','SG','JP','KR','HK','CA','US','BR','AU','DK','NO','BE','CZ','HU','LT',
+          'LV','EE','IE','UA','KZ','IR'];
+const flagOf=c=>(c||'').toUpperCase().replace(/[^A-Z]/g,'').slice(0,2)
+  .replace(/./g,ch=>String.fromCodePoint(0x1F1E6+ch.charCodeAt(0)-65));
+function fillCountry(sel,cur){
+ if(!sel)return;
+ sel.innerHTML='<option value="">'+T('autoCountry')+'</option>'+
+  CC.map(c=>`<option value="${c}">${flagOf(c)} ${c}</option>`).join('');
+ sel.value=cur||'';
+}
+const SVG_PAUSE='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M9.5 5v14M14.5 5v14"/></svg>';
+const SVG_PLAY='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M7.5 5.2l11 6.8-11 6.8z"/></svg>';
+const SVG_X='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M6 6l12 12M18 6L6 18"/></svg>';
 function renderCips(){
  cipRows.innerHTML=cips.map(x=>`
   <div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
    <span class="h-2 w-2 rounded-full" style="background:${x.enabled?'var(--ok)':'var(--dim)'}"></span>
+   ${x.flag?`<span class="text-sm">${x.flag}</span>`:''}
    <span class="mono text-[11px]">${x.address}</span>
    ${x.remark?`<span class="text-[10px] dim">${x.remark}</span>`:''}
    <div class="flex-1"></div>
-   <button onclick="toggleCip(${x.id})" class="text-[10px] px-2 py-0.5 rounded-lg soft">${x.enabled?'⏸':'▶️'}</button>
-   <button onclick="delCip(${x.id})" class="text-[10px] px-2 py-0.5 rounded-lg" style="color:var(--bad)">✕</button>
+   <button onclick="toggleCip(${x.id})" class="icbox px-2 py-1 rounded-lg soft">${x.enabled?SVG_PAUSE:SVG_PLAY}</button>
+   <button onclick="delCip(${x.id})" class="icbox px-2 py-1 rounded-lg" style="color:var(--bad)">${SVG_X}</button>
   </div>`).join('')||`<p class="text-xs dim">${T('noCleanIps')}</p>`;
 }
 
@@ -2834,8 +3015,9 @@ async function createUser(){
 async function addCip(){
  cipMsg.textContent='';
  try{await api('/api/clean-ips',{method:'POST',
-  body:JSON.stringify({address:cAddr.value.trim(),remark:cRem.value.trim()})});
-  cAddr.value='';cRem.value='';loadCips();loadStats();
+  body:JSON.stringify({address:cAddr.value.trim(),remark:cRem.value.trim(),
+                       country:(cCty&&cCty.value)||''})});
+  cAddr.value='';cRem.value='';if(cCty)cCty.value='';loadCips();loadStats();
  }catch(e){cipMsg.textContent=e.message}
 }
 async function bulkCip(){
@@ -2974,7 +3156,7 @@ function copy(btn,t){navigator.clipboard.writeText(t);
  const old=btn.textContent;btn.textContent=T('copied');setTimeout(()=>btn.textContent=old,1200)}
 
 go(PAGE);
-loadStats();loadUsers();loadCips();
+loadStats();loadUsers();loadCips();loadMainCountry();
 setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 </script></body></html>"""
 
