@@ -103,6 +103,27 @@ CREATE TABLE IF NOT EXISTS clean_ips (
     enabled  INTEGER DEFAULT 1,
     added_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS proxies (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT    DEFAULT 'socks5',
+    host         TEXT    NOT NULL,
+    port         INTEGER NOT NULL,
+    username     TEXT    DEFAULT '',
+    password     TEXT    DEFAULT '',
+    remark       TEXT    DEFAULT '',
+    country      TEXT    DEFAULT '',
+    country_name TEXT    DEFAULT '',
+    city         TEXT    DEFAULT '',
+    isp          TEXT    DEFAULT '',
+    exit_ip      TEXT    DEFAULT '',
+    healthy      INTEGER DEFAULT 0,
+    latency_ms   INTEGER DEFAULT 0,
+    last_error   TEXT    DEFAULT '',
+    checked_at   INTEGER DEFAULT 0,
+    enabled      INTEGER DEFAULT 1,
+    added_at     INTEGER NOT NULL,
+    UNIQUE(kind, host, port, username)
+);
 CREATE TABLE IF NOT EXISTS user_ips (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL,
@@ -140,7 +161,16 @@ def migrate():
     """Add columns that older databases may be missing."""
     wanted = {"users": [("transport", "TEXT DEFAULT 'both'")],
               "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
-              "clean_ips": [("country", "TEXT DEFAULT ''")]}
+              "clean_ips": [("country", "TEXT DEFAULT ''")],
+              "proxies": [("country", "TEXT DEFAULT ''"),
+                          ("country_name", "TEXT DEFAULT ''"),
+                          ("city", "TEXT DEFAULT ''"),
+                          ("isp", "TEXT DEFAULT ''"),
+                          ("exit_ip", "TEXT DEFAULT ''"),
+                          ("healthy", "INTEGER DEFAULT 0"),
+                          ("latency_ms", "INTEGER DEFAULT 0"),
+                          ("last_error", "TEXT DEFAULT ''"),
+                          ("checked_at", "INTEGER DEFAULT 0")]}
     with db() as c:
         for table, cols in wanted.items():
             have = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
@@ -479,6 +509,239 @@ BLOCKED = [ipaddress.ip_network(x) for x in
             "169.254.0.0/16", "::1/128", "fc00::/7")]
 
 
+# ════════════════════════ OUTBOUND PROXY (socks5 / socks4 / http) ════════════
+#
+#  Every VLESS session dials its target through dial_target(). When a proxy is
+#  marked active, that dial is wrapped in a proxy handshake, so the destination
+#  site sees the proxy's IP instead of the Railway/Render one.
+#
+#  "strict" (the default) means a broken proxy fails the session instead of
+#  silently falling back to the platform IP, which would leak the real exit.
+
+PROXY_KINDS = ("socks5", "socks4", "http")
+IP_CHECK_HOST = "ip-api.com"
+IP_CHECK_PATH = "/json/?fields=status,message,country,countryCode,city,isp,query"
+
+
+def proxy_strict() -> bool:
+    return (get_setting("proxy_strict") or "1") == "1"
+
+
+def active_proxy():
+    """The proxy every outbound connection should ride, or None for direct."""
+    pid = get_setting("active_proxy") or ""
+    if not pid.isdigit():
+        return None
+    with db() as c:
+        return c.execute("SELECT * FROM proxies WHERE id=? AND enabled=1",
+                         (int(pid),)).fetchone()
+
+
+def _addr_bytes(host: str) -> bytes:
+    """SOCKS5 address field: literal IPv4/IPv6 when possible, else a hostname."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        h = host.encode()[:255]
+        return b"\x03" + bytes([len(h)]) + h
+    return (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+
+
+async def _socks5(reader, writer, host, port, user, pwd):
+    writer.write(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")
+    await writer.drain()
+    ver, method = await reader.readexactly(2)
+    if ver != 5:
+        raise OSError("socks5: not a socks5 proxy")
+    if method == 0x02:
+        if not user:
+            raise OSError("socks5: proxy wants a username/password")
+        u, p = user.encode()[:255], (pwd or "").encode()[:255]
+        writer.write(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+        await writer.drain()
+        if (await reader.readexactly(2))[1] != 0:
+            raise OSError("socks5: username/password rejected")
+    elif method != 0x00:
+        raise OSError("socks5: no shared auth method")
+
+    writer.write(b"\x05\x01\x00" + _addr_bytes(host) + port.to_bytes(2, "big"))
+    await writer.drain()
+    head = await reader.readexactly(4)
+    if head[1] != 0:
+        raise OSError("socks5: target refused (code %d)" % head[1])
+    atyp = head[3]
+    if atyp == 1:
+        await reader.readexactly(4)
+    elif atyp == 4:
+        await reader.readexactly(16)
+    elif atyp == 3:
+        await reader.readexactly((await reader.readexactly(1))[0])
+    await reader.readexactly(2)          # bound port
+
+
+async def _socks4(reader, writer, host, port, user):
+    """SOCKS4, falling back to SOCKS4a when the target is a hostname."""
+    try:
+        packed, tail = ipaddress.IPv4Address(host).packed, b""
+    except ipaddress.AddressValueError:
+        packed, tail = b"\x00\x00\x00\x01", host.encode()[:255] + b"\x00"
+    writer.write(b"\x04\x01" + port.to_bytes(2, "big") + packed +
+                 (user or "").encode()[:255] + b"\x00" + tail)
+    await writer.drain()
+    resp = await reader.readexactly(8)
+    if resp[1] != 0x5a:
+        raise OSError("socks4: target refused (code 0x%02x)" % resp[1])
+
+
+async def _http_connect(reader, writer, host, port, user, pwd):
+    req = "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n" % (host, port, host, port)
+    if user:
+        cred = base64.b64encode(("%s:%s" % (user, pwd or "")).encode()).decode()
+        req += "Proxy-Authorization: Basic %s\r\n" % cred
+    req += "Proxy-Connection: keep-alive\r\n\r\n"
+    writer.write(req.encode())
+    await writer.drain()
+
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = await reader.read(2048)
+        if not chunk:
+            raise OSError("http proxy: connection closed during CONNECT")
+        head += chunk
+        if len(head) > 32768:
+            raise OSError("http proxy: response header too long")
+    first = head.split(b"\r\n", 1)[0].decode("latin1")
+    parts = first.split(" ")
+    if len(parts) < 2 or not parts[1].startswith("2"):
+        raise OSError("http proxy: %s" % first)
+
+
+async def open_via_proxy(px, host: str, port: int, timeout: float = 15.0):
+    """Open a TCP leg to host:port through one proxy row."""
+    kind = (px["kind"] or "socks5").lower()
+    if kind not in PROXY_KINDS:
+        raise OSError("unsupported proxy kind: %s" % kind)
+    user = px["username"] or ""
+    pwd = px["password"] or ""
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(px["host"], int(px["port"])), timeout=timeout)
+    try:
+        if kind == "socks5":
+            await asyncio.wait_for(_socks5(reader, writer, host, port, user, pwd),
+                                   timeout=timeout)
+        elif kind == "socks4":
+            await asyncio.wait_for(_socks4(reader, writer, host, port, user),
+                                   timeout=timeout)
+        else:
+            await asyncio.wait_for(_http_connect(reader, writer, host, port, user, pwd),
+                                   timeout=timeout)
+    except Exception:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise
+    return reader, writer
+
+
+async def dial_target(host: str, port: int):
+    """The single outbound path for user traffic: proxy when armed, else direct."""
+    px = active_proxy()
+    if px:
+        try:
+            return await open_via_proxy(px, host, port, timeout=15)
+        except Exception as exc:
+            audit("proxy-fail", "", "%s %s:%s \u2192 %s" %
+                  (px["kind"], px["host"], px["port"], exc))
+            mark_proxy_down(px["id"], str(exc))
+            if proxy_strict():
+                raise
+    return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=12)
+
+
+def mark_proxy_down(pid: int, err: str):
+    with db() as c:
+        c.execute("UPDATE proxies SET healthy=0, last_error=?, checked_at=? WHERE id=?",
+                  (err[:200], now(), pid))
+
+
+async def probe_proxy(px) -> dict:
+    """Health check: ride the proxy to an IP-echo service and read the exit IP.
+
+    Plain HTTP on purpose \u2014 no TLS stack needed on top of the proxied socket,
+    and the response carries the country, city and ISP of the exit node.
+    """
+    start = time.perf_counter()
+    reader, writer = await open_via_proxy(px, IP_CHECK_HOST, 80, timeout=12)
+    try:
+        writer.write(("GET " + IP_CHECK_PATH + " HTTP/1.1\r\n"
+                      "Host: " + IP_CHECK_HOST + "\r\n"
+                      "User-Agent: IranXPanel/3\r\n"
+                      "Accept: application/json\r\n"
+                      "Connection: close\r\n\r\n").encode())
+        await writer.drain()
+        raw = b""
+        while len(raw) < 65536:
+            try:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=8)
+            except asyncio.TimeoutError:
+                break            # some proxies never forward the server's close
+            if not chunk:
+                break
+            raw += chunk
+            head, _, body = raw.partition(b"\r\n\r\n")
+            if body.rstrip().endswith(b"}"):
+                break            # the JSON answer is already complete
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    ms = int((time.perf_counter() - start) * 1000)
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else raw
+    data = {}
+    match = re.search(rb"\{.*\}", body, re.S)      # tolerate chunked bodies
+    if match:
+        try:
+            data = json.loads(match.group(0).decode("utf-8", "replace"))
+        except Exception:
+            data = {}
+    if not data:
+        raise OSError("proxy answered, but the IP echo was unreadable")
+    if (data.get("status") or "success") != "success":
+        raise OSError("ip lookup failed: %s" % (data.get("message") or "unknown"))
+
+    return {"latency_ms": ms,
+            "exit_ip": str(data.get("query") or ""),
+            "country": str(data.get("countryCode") or "").upper()[:2],
+            "country_name": str(data.get("country") or ""),
+            "city": str(data.get("city") or ""),
+            "isp": str(data.get("isp") or "")}
+
+
+async def run_proxy_test(pid: int) -> dict:
+    """Probe one stored proxy and persist what came back."""
+    with db() as c:
+        px = c.execute("SELECT * FROM proxies WHERE id=?", (pid,)).fetchone()
+    if not px:
+        raise HTTPException(404, "proxy not found")
+    try:
+        res = await probe_proxy(px)
+    except Exception as exc:
+        msg = str(exc) or exc.__class__.__name__
+        mark_proxy_down(pid, msg)
+        return {"ok": False, "error": msg[:200], "id": pid}
+    with db() as c:
+        c.execute("""UPDATE proxies SET healthy=1, latency_ms=?, exit_ip=?, country=?,
+                            country_name=?, city=?, isp=?, last_error='', checked_at=?
+                     WHERE id=?""",
+                  (res["latency_ms"], res["exit_ip"], res["country"],
+                   res["country_name"], res["city"], res["isp"], now(), pid))
+    res.update({"ok": True, "id": pid, "flag": flag_of(res["country"])})
+    return res
+
+
 def blocked(host: str) -> bool:
     try:
         a = ipaddress.ip_address(host)
@@ -527,8 +790,7 @@ async def relay_session(stream: ByteStream,
     if blocked(host) or port == 0:
         raise PermissionError("blocked destination")
 
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, port), timeout=12)
+    reader, writer = await dial_target(host, port)
 
     await send(b"\x00\x00")            # VLESS response header
 
@@ -857,6 +1119,19 @@ def main_flag() -> str:
     return flag_of(get_setting("main_country") or "")
 
 
+def proxy_flag() -> str:
+    """Flag of the active proxy: with one armed, that is the real exit country."""
+    if (get_setting("flag_source") or "proxy") != "proxy":
+        return ""
+    px = active_proxy()
+    if not px:
+        return ""
+    try:
+        return flag_of(px["country"] or "")
+    except Exception:
+        return ""
+
+
 def build_configs(row, host: str, clean_ips) -> list[dict]:
     t = (row["transport"] or "both").lower()
     kinds = []
@@ -865,7 +1140,8 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     if t in ("xhttp", "both"):
         kinds.append(("XHTTP", xhttp_uri))
 
-    head = main_flag() or "\U0001f310"
+    exit_flag = proxy_flag()
+    head = exit_flag or main_flag() or "\U0001f310"
     out = []
     for tag, fn in kinds:
         out.append({"label": f"{head} {row['name']} · {tag} · Default",
@@ -873,7 +1149,7 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
                     "uri": fn(row, host, host, f"{head} {row['name']} · {tag}")})
         for cip in clean_ips:
             note = cip["remark"] or cip["address"]
-            mark = cip_flag(cip) or "\u26a1"
+            mark = exit_flag or cip_flag(cip) or "\u26a1"
             out.append({"label": f"{mark} {note} · {tag}",
                         "transport": tag,
                         "uri": fn(row, cip["address"], host,
@@ -978,6 +1254,26 @@ class CleanIpBulkIn(BaseModel):
     text: str
 
 
+class ProxyIn(BaseModel):
+    kind: str = "socks5"
+    host: str
+    port: int
+    username: str = ""
+    password: str = ""
+    remark: str = ""
+
+
+class ProxyPatch(BaseModel):
+    enabled: Optional[bool] = None
+    remark: Optional[str] = None
+    country: Optional[str] = None
+
+
+class ProxyModeIn(BaseModel):
+    strict: Optional[bool] = None
+    flag_source: Optional[str] = None
+
+
 # ────────────────────────────── SETUP & AUTH ──────────────────────────────
 
 @app.get("/api/state")
@@ -1037,7 +1333,7 @@ async def api_logout():
     return resp
 
 
-# ────���───────────────────────── USERS ──────────────────────────────
+# ────────────────────────────── USERS ──────────────────────────────
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{2,32}$")
 
@@ -1307,7 +1603,135 @@ async def clear_clean_ips(_=Depends(require_admin)):
     return {"ok": True}
 
 
-# ───────────────────────────���── STATS ──────────────────────────────
+# ────────────────────────────── PROXIES ──────────────────────────────
+
+def proxy_out(r) -> dict:
+    """Public shape of a proxy row \u2014 credentials are never echoed back."""
+    d = dict(r)
+    d.pop("password", None)
+    d["has_auth"] = bool(r["username"])
+    d["flag"] = flag_of(r["country"] or "") or flag_of(guess_country(r["remark"] or ""))
+    d["label"] = "%s://%s:%s" % (r["kind"], r["host"], r["port"])
+    return d
+
+
+@app.get("/api/proxies")
+async def list_proxies(_=Depends(require_admin)):
+    with db() as c:
+        rows = c.execute("SELECT * FROM proxies ORDER BY id DESC").fetchall()
+    act = get_setting("active_proxy") or ""
+    return {"proxies": [proxy_out(r) for r in rows],
+            "active_id": int(act) if act.isdigit() else 0,
+            "strict": proxy_strict(),
+            "flag_source": get_setting("flag_source") or "proxy"}
+
+
+@app.post("/api/proxies")
+async def add_proxy(body: ProxyIn, _=Depends(require_admin)):
+    kind = (body.kind or "socks5").strip().lower()
+    if kind not in PROXY_KINDS:
+        raise HTTPException(400, "kind must be socks5, socks4 or http")
+    host = (body.host or "").strip().lstrip("[").rstrip("]")
+    if not host or len(host) > 255 or " " in host:
+        raise HTTPException(400, "invalid proxy host")
+    if not 1 <= int(body.port) <= 65535:
+        raise HTTPException(400, "invalid proxy port")
+    if kind == "socks4" and body.password:
+        raise HTTPException(400, "socks4 has no password field \u2014 leave it empty")
+    with db() as c:
+        try:
+            cur = c.execute("""INSERT INTO proxies(kind,host,port,username,password,
+                                                   remark,country,added_at)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (kind, host, int(body.port), body.username.strip(),
+                             body.password, body.remark.strip()[:80],
+                             guess_country(body.remark or ""), now()))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "this proxy is already in the list")
+        pid = cur.lastrowid
+    audit("proxy-add", "", "%s %s:%s" % (kind, host, body.port))
+    return await run_proxy_test(pid)          # a fresh proxy is tested at once
+
+
+@app.post("/api/proxies/{pid}/test")
+async def test_proxy(pid: int, _=Depends(require_admin)):
+    return await run_proxy_test(pid)
+
+
+@app.post("/api/proxies/test-all")
+async def test_all_proxies(_=Depends(require_admin)):
+    with db() as c:
+        ids = [r["id"] for r in c.execute("SELECT id FROM proxies ORDER BY id")]
+    out = await asyncio.gather(*(run_proxy_test(i) for i in ids),
+                               return_exceptions=True)
+    return {"results": [r for r in out if isinstance(r, dict)]}
+
+
+@app.post("/api/proxies/{pid}/activate")
+async def activate_proxy(pid: int, _=Depends(require_admin)):
+    """Arm one proxy (or pass 0 to go back to the platform IP)."""
+    if pid == 0:
+        set_setting("active_proxy", "")
+        audit("proxy-off", "", "direct outbound")
+        return {"ok": True, "active_id": 0}
+    with db() as c:
+        px = c.execute("SELECT * FROM proxies WHERE id=?", (pid,)).fetchone()
+    if not px:
+        raise HTTPException(404, "proxy not found")
+    if not px["enabled"]:
+        raise HTTPException(400, "enable the proxy before arming it")
+    res = await run_proxy_test(pid)
+    if not res.get("ok"):
+        raise HTTPException(400, "proxy failed its health check: %s" % res.get("error"))
+    set_setting("active_proxy", str(pid))
+    audit("proxy-on", "", "%s %s:%s (%s)" %
+          (px["kind"], px["host"], px["port"], res.get("country") or "?"))
+    return {"ok": True, "active_id": pid, "country": res.get("country"),
+            "flag": res.get("flag"), "exit_ip": res.get("exit_ip")}
+
+
+@app.post("/api/proxies/mode")
+async def set_proxy_mode(body: ProxyModeIn, _=Depends(require_admin)):
+    if body.strict is not None:
+        set_setting("proxy_strict", "1" if body.strict else "0")
+    if body.flag_source is not None:
+        src = body.flag_source if body.flag_source in ("proxy", "entry") else "proxy"
+        set_setting("flag_source", src)
+    return {"ok": True, "strict": proxy_strict(),
+            "flag_source": get_setting("flag_source") or "proxy"}
+
+
+@app.patch("/api/proxies/{pid}")
+async def patch_proxy(pid: int, body: ProxyPatch, _=Depends(require_admin)):
+    sets, args = [], []
+    if body.enabled is not None:
+        sets.append("enabled=?"); args.append(1 if body.enabled else 0)
+    if body.remark is not None:
+        sets.append("remark=?"); args.append(body.remark.strip()[:80])
+    if body.country is not None:
+        sets.append("country=?")
+        args.append(re.sub(r"[^A-Za-z]", "", body.country)[:2].upper())
+    if not sets:
+        return {"ok": True}
+    args.append(pid)
+    with db() as c:
+        c.execute("UPDATE proxies SET %s WHERE id=?" % ",".join(sets), args)
+    if body.enabled is False and (get_setting("active_proxy") or "") == str(pid):
+        set_setting("active_proxy", "")      # never keep a disabled proxy armed
+    return {"ok": True}
+
+
+@app.delete("/api/proxies/{pid}")
+async def delete_proxy(pid: int, _=Depends(require_admin)):
+    with db() as c:
+        c.execute("DELETE FROM proxies WHERE id=?", (pid,))
+    if (get_setting("active_proxy") or "") == str(pid):
+        set_setting("active_proxy", "")
+    audit("proxy-del", "", "id=%d" % pid)
+    return {"ok": True}
+
+
+# ─────────────────────────────── STATS ──────────────────────────────
 
 @app.get("/api/stats")
 async def stats(_=Depends(require_admin)):
@@ -2123,13 +2547,13 @@ const T = {
     devices:"دستگاه مجاز", used:"مصرف‌شده", total:"کل", copySub:"کپی لینک اشتراک",
     copyAll:"کپی همه کانفیگ‌ها", addTo:"افزودن به", configs:"کانفیگ‌ها", downloads:"دانلود برنامه‌ها",
     noConfigs:"کانفیگ فعالی وجود ندارد.", showQr:"نمایش QR", copyCfg:"کپی کانفیگ",
-    scanHint:"با دوربین برنامه اس��ن کنید<br>تا اشتراک خودکار اضافه شود",
+    scanHint:"با دوربین برنامه اسکن کنید<br>تا اشتراک خودکار اضافه شود",
     footer:"لینک اشتراک شخصی شماست — آن را با کسی به اشتراک نگذارید",
     updEvery:(h)=>"به‌روزرسانی هر "+h+" ساعت", expires:"انقضا", noExpiry:"بدون انقضا",
     unlimited:"بی‌نهایت", inactive:"این اشتراک فعال نیست", support:"با پشتیبانی تماس بگیرید",
     days:"روز", hours:"ساعت", cfgCount:(n)=>n+" کانفیگ فعال", copiedSub:"لینک اشتراک کپی شد ✓",
-    copiedAll:"همه کانفیگ‌ها کپ�� شد ✓", copiedCfg:"کانفیگ کپی شد ✓", noQr:"QR در دسترس نیست",
-    importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گ��ینهٔ Add from clipboard را بزنید",
+    copiedAll:"همه کانفیگ‌ها کپی شد ✓", copiedCfg:"کانفیگ کپی شد ✓", noQr:"QR در دسترس نیست",
+    importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گزینهٔ Add from clipboard را بزنید",
     allVersions:"همه نسخه‌ها", theme:"تم", light:"روشن", dark:"تیره", subName:"اشتراک"},
   en:{brand:"IranX · My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
     devices:"Devices", used:"Used", total:"Total", copySub:"Copy subscription link",
@@ -2399,6 +2823,11 @@ button.grad:focus-visible,.btn-solid:focus-visible{outline:2px solid var(--ring)
 .inp{background:color-mix(in srgb,var(--bg) 65%,#8881);border:1px solid var(--line);color:var(--txt)}
 .inp:focus{border-color:var(--a1);outline:none}
 .soft{background:color-mix(in srgb,var(--txt) 8%,transparent)}
+.sw{width:44px;height:24px;background:var(--line);position:relative;transition:.18s;flex:none}
+.sw:after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:18px;height:18px;
+  border-radius:50%;background:var(--txt);transition:.18s}
+.sw.on{background:var(--a1)}
+.sw.on:after{inset-inline-start:23px;background:#fff}
 .navi{display:flex;align-items:center;gap:.6rem;padding:.7rem .9rem;border-radius:.85rem;
       font-size:.85rem;cursor:pointer;transition:.15s}
 .navi:hover{background:color-mix(in srgb,var(--txt) 7%,transparent)}
@@ -2415,15 +2844,16 @@ const I18N={
  fa:{dir:'rtl',
   setupTitle:'تعیین رمز عبور',setupSub:'اولین ورود — یک رمز برای پنل انتخاب کنید',
   loginTitle:'ورود به پنل',loginSub:'رمز عبور خود را وارد کنید',
-  password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخی��ه و ورود',
+  password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخیره و ورود',
   pwRule:'حداقل ۸ کاراکتر شامل حرف بزرگ، حرف کوچک و عدد',netErr:'خطای شبکه',
   navDash:'داشبورد',navUsers:'مدیریت کاربران',navClean:'Clean IP',
+  navProxy:'پروکسی',
   navSettings:'تنظیمات پنل',navLogs:'رخدادها',menu:'منو',
   totalUsers:'کل کاربران',online:'کاربران آنلاین',devices:'دستگاه‌های متصل',
   traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'سشن‌های XHTTP',
-  chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تقسیم ب�� اساس ترنسپورت',
+  chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تقسیم بر اساس ترنسپورت',
   newUser:'ساخت کاربر جدید',users:'کاربران',
-  name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعد��د دستگاه',
+  name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',
   transport:'ترنسپورت',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 هر دو',
   add:'افزودن',zeroInf:'۰ = بی‌نهایت. «تعداد دستگاه» بر اساس IP یکتای فعال محاسبه می‌شود.',
   search:'جستجو…',noUsers:'کاربری نیست',
@@ -2442,11 +2872,27 @@ const I18N={
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
-  cleanTitle:'��دیریت Clean IP',
+  cleanTitle:'مدیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
   addrPh:'مثلا 1.2.3.4 یا cdn.example.com',remarkPh:'برچسب (اختیاری)',
-  bulkPh:'چند مورد، هر خط یکی:\n1.2.3.4 # ای��انسل\n5.6.7.8 # همراه اول',
+  bulkPh:'چند مورد، هر خط یکی:\n1.2.3.4 # ایرانسل\n5.6.7.8 # همراه اول',
   bulkAdd:'افزودن انبوه',clearAll:'حذف همه',
+  pxTitle:'پروکسی خروجی',
+  pxHint:'با فعال کردن یک پروکسی، تمام ترافیک کاربران از همان مسیر خارج می‌شود و سایت‌ها ایپی پروکسی را می‌بینند.',
+  pxKind:'نوع',pxHost:'هاست / ایپی',pxPort:'پورت',
+  pxUser:'یوزرنیم (اختیاری)',pxPass:'پسورد (اختیاری)',
+  pxAdd:'افزودن و تست',pxTestAll:'تست همه',
+  pxDirect:'اتصال مستقیم (بدون پروکسی)',
+  pxActive:'فعال',pxArm:'فعال کردن',pxTest:'تست سلامت',
+  pxHealthy:'سالم',pxDown:'خراب',pxUntested:'تست نشده',
+  pxExitIp:'ایپی خروجی',pxLatency:'تاخیر',
+  pxNone:'هنوز پروکسی اضافه نشده است',
+  pxStrict:'حالت سختگیرانه',
+  pxStrictHint:'اگر پروکسی قطع شد، اتصال رد می‌شود تا ایپی اصلی سرور لو نرود',
+  pxFlagSrc:'منبع پرچم نام کانفیگ',
+  pxFlagProxy:'کشور پروکسی',pxFlagEntry:'کشور سرور ورودی',
+  pxTesting:'در حال تست...',pxArmed:'پروکسی فعال شد',
+  pxDelWarn:'این پروکسی حذف شود؟',
   addedN:'افزوده شد',dupN:'تکراری',invalidN:'نامعتبر',noCleanIps:'لیست خالی است',
   settings:'تنظیمات',appearance:'ظاهر',theme:'تم',language:'زبان',
   thDark:'تیره (مشکی و آبی)',thLight:'روشن (سفید و آبی)',thGray:'خاکستری',
@@ -2468,6 +2914,7 @@ const I18N={
   password:'Password',confirm:'Confirm password',enter:'Sign in',save:'Save & enter',
   pwRule:'At least 8 chars with upper case, lower case and a digit',netErr:'Network error',
   navDash:'Dashboard',navUsers:'Users',navClean:'Clean IP',
+  navProxy:'Proxy',
   navSettings:'Panel settings',navLogs:'Events',menu:'Menu',
   totalUsers:'Total users',online:'Online users',devices:'Connected devices',
   traffic:'Total traffic',cleanIps:'Clean IPs',xSessions:'XHTTP sessions',
@@ -2497,6 +2944,22 @@ const I18N={
   addrPh:'e.g. 1.2.3.4 or cdn.example.com',remarkPh:'Label (optional)',
   bulkPh:'One per line:\n1.2.3.4 # Irancell\n5.6.7.8 # MCI',
   bulkAdd:'Bulk add',clearAll:'Delete all',
+  pxTitle:'Outbound proxy',
+  pxHint:'Arm a proxy and every user connection leaves through it, so target sites see the proxy IP.',
+  pxKind:'Type',pxHost:'Host / IP',pxPort:'Port',
+  pxUser:'Username (optional)',pxPass:'Password (optional)',
+  pxAdd:'Add & test',pxTestAll:'Test all',
+  pxDirect:'Direct connection (no proxy)',
+  pxActive:'Active',pxArm:'Activate',pxTest:'Health test',
+  pxHealthy:'healthy',pxDown:'down',pxUntested:'untested',
+  pxExitIp:'Exit IP',pxLatency:'Latency',
+  pxNone:'No proxy added yet',
+  pxStrict:'Strict mode',
+  pxStrictHint:'If the proxy breaks, refuse the connection instead of leaking the server IP',
+  pxFlagSrc:'Flag shown in config names',
+  pxFlagProxy:'Proxy country',pxFlagEntry:'Entry server country',
+  pxTesting:'Testing...',pxArmed:'Proxy armed',
+  pxDelWarn:'Delete this proxy?',
   addedN:'added',dupN:'duplicates',invalidN:'invalid',noCleanIps:'List is empty',
   settings:'Settings',appearance:'Appearance',theme:'Theme',language:'Language',
   thDark:'Dark (black & blue)',thLight:'Light (white & blue)',thGray:'Gray',
@@ -2649,6 +3112,10 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
  <div class="navi" data-page="clean" onclick="go('clean')">
   <svg class="ic" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/>
    <path d="M9.4 14.6a2.8 2.8 0 002.6 2.6"/></svg><span data-t="navClean"></span></div>
+ <div class="navi" data-page="proxy" onclick="go('proxy')">
+  <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h6.5a3 3 0 013 3v4a3 3 0 003 3H20"/>
+   <path d="M17 4l3 3-3 3M17 14l3 3-3 3"/><circle cx="4" cy="7" r="1.6"/></svg>
+  <span data-t="navProxy"></span></div>
  <div class="navi" data-page="settings" onclick="go('settings')">
   <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
    <path d="M19.4 14.5a1.7 1.7 0 00.35 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.35 1.7 1.7 0 00-1.03 1.56V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.55 1.7 1.7 0 00-1.87.35l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.7 1.7 0 00.35-1.87 1.7 1.7 0 00-1.56-1.03H3a2 2 0 110-4h.1a1.7 1.7 0 001.55-1.1 1.7 1.7 0 00-.35-1.87l-.06-.06a2 2 0 112.83-2.83l.06.06a1.7 1.7 0 001.87.35H9a1.7 1.7 0 001-1.56V3a2 2 0 114 0v.1a1.7 1.7 0 001.03 1.56 1.7 1.7 0 001.87-.35l.06-.06a2 2 0 112.83 2.83l-.06.06a1.7 1.7 0 00-.35 1.87V9a1.7 1.7 0 001.56 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1.05z"/></svg><span data-t="navSettings"></span></div>
@@ -2738,6 +3205,56 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    <p id="cipMsg" class="text-xs dim mt-2"></p>
   </div>
   <div class="card rounded-2xl p-4"><div id="cipRows" class="grid sm:grid-cols-2 gap-2"></div></div>
+ </section>
+
+ <!-- ══ PROXY ══ -->
+ <section data-pg="proxy" class="space-y-4 hidden">
+  <div class="card rounded-2xl p-4">
+   <p class="text-sm font-bold" data-t="pxTitle"></p>
+   <p class="text-[11px] dim mt-1 mb-3" data-t="pxHint"></p>
+   <div class="grid sm:grid-cols-3 gap-2">
+    <div><label class="text-[11px] dim" data-t="pxKind"></label>
+     <select id="pKind" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
+      <option value="socks5">SOCKS5</option><option value="socks4">SOCKS4</option>
+      <option value="http">HTTP</option></select></div>
+    <div><label class="text-[11px] dim" data-t="pxHost"></label>
+     <input id="pHost" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono" placeholder="1.2.3.4"></div>
+    <div><label class="text-[11px] dim" data-t="pxPort"></label>
+     <input id="pPort" type="number" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono" placeholder="1080"></div>
+    <div><label class="text-[11px] dim" data-t="pxUser"></label>
+     <input id="pUser" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono"></div>
+    <div><label class="text-[11px] dim" data-t="pxPass"></label>
+     <input id="pPass" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono"></div>
+    <div><label class="text-[11px] dim" data-t="remarkPh"></label>
+     <input id="pRem" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1"></div>
+   </div>
+   <div class="grid grid-cols-2 gap-2 mt-3">
+    <button onclick="addProxy()" class="grad rounded-xl px-4 py-2 text-sm font-bold" data-t="pxAdd"></button>
+    <button onclick="testAllProxies()" class="rounded-xl soft py-2 text-xs font-bold" data-t="pxTestAll"></button>
+   </div>
+   <p id="pxMsg" class="text-xs dim mt-2"></p>
+  </div>
+
+  <div class="card rounded-2xl p-4 space-y-3">
+   <div class="flex items-center gap-3">
+    <div class="flex-1">
+     <p class="text-sm font-bold" data-t="pxStrict"></p>
+     <p class="text-[10px] dim" data-t="pxStrictHint"></p>
+    </div>
+    <button id="pxStrictBtn" onclick="toggleStrict()" class="sw rounded-full"></button>
+   </div>
+   <div>
+    <label class="text-xs dim" data-t="pxFlagSrc"></label>
+    <select id="pxFlagSel" onchange="saveFlagSource()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
+     <option value="proxy" data-t="pxFlagProxy"></option>
+     <option value="entry" data-t="pxFlagEntry"></option></select>
+   </div>
+  </div>
+
+  <div class="card rounded-2xl p-4 space-y-2">
+   <button onclick="armProxy(0)" id="pxDirectBtn" class="w-full rounded-xl soft px-3 py-2 text-xs font-bold text-start" data-t="pxDirect"></button>
+   <div id="pxRows" class="space-y-2"></div>
+  </div>
  </section>
 
  <!-- ══ SETTINGS ══ -->
@@ -2832,6 +3349,11 @@ var SVG_PLAY='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24"
 var SVG_X='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
   '<path d="M6 6l12 12M18 6L6 18"/></svg>';
 var MAIN_CC='';
+var SVG_PING='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>';
+var SVG_ARM='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
+  '<path d="M13 3L5 14h5l-1 7 8-11h-5z"/></svg>';
+var PROXIES=[],PX_ACTIVE=0,PX_STRICT=true,PX_FLAG='proxy';
 
 /* ─── routing ─── */
 let PAGE=localStorage.getItem('page')||'dash';
@@ -2840,7 +3362,7 @@ function go(p){
  document.querySelectorAll('[data-pg]').forEach(s=>s.classList.toggle('hidden',s.dataset.pg!==p));
  document.querySelectorAll('.navi').forEach(n=>n.classList.toggle('on',n.dataset.page===p));
  crumb.textContent=T({dash:'navDash',users:'navUsers',clean:'navClean',
-   settings:'navSettings',logs:'navLogs'}[p]);
+   proxy:'navProxy',settings:'navSettings',logs:'navLogs'}[p]);
  toggleNav(false);
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
@@ -3039,6 +3561,103 @@ async function toggleCip(id){await api('/api/clean-ips/'+id,{method:'PATCH'});lo
 async function delCip(id){await api('/api/clean-ips/'+id,{method:'DELETE'});loadCips();loadStats()}
 async function clearCips(){if(confirm(T('clearAll')+'?')){await api('/api/clean-ips',{method:'DELETE'});loadCips();loadStats()}}
 
+
+async function loadProxies(){
+ try{const r=await api('/api/proxies');
+  PROXIES=r.proxies||[];PX_ACTIVE=r.active_id||0;
+  PX_STRICT=!!r.strict;PX_FLAG=r.flag_source||'proxy';
+  renderProxies();
+ }catch(e){if(pxMsg)pxMsg.textContent=e.message}
+}
+function renderProxies(){
+ if(!window.pxRows)return;
+ const sb=document.getElementById('pxStrictBtn');
+ if(sb)sb.classList.toggle('on',PX_STRICT);
+ const fs=document.getElementById('pxFlagSel');
+ if(fs)fs.value=PX_FLAG;
+ const db=document.getElementById('pxDirectBtn');
+ if(db)db.classList.toggle('btn-solid',PX_ACTIVE===0);
+ pxRows.innerHTML=PROXIES.map(x=>{
+  const on=x.id===PX_ACTIVE;
+  const dot=x.healthy?'var(--ok)':(x.checked_at?'var(--bad)':'var(--dim)');
+  const state=x.healthy?T('pxHealthy'):(x.checked_at?T('pxDown'):T('pxUntested'));
+  const geo=[x.country_name||'',x.city||''].filter(Boolean).join(' \u00b7 ');
+  return `<div class="rounded-xl soft px-3 py-2 ${on?'ring-2':''}" style="${on?'outline:2px solid var(--a1)':''}">
+   <div class="flex items-center gap-2">
+    <span class="h-2 w-2 rounded-full" style="background:${dot}"></span>
+    <span class="text-base">${x.flag||'\u{1F310}'}</span>
+    <span class="mono text-[11px]">${x.label}</span>
+    ${x.has_auth?'<span class="text-[10px] dim">\u{1F511}</span>':''}
+    ${on?`<span class="text-[10px] font-bold" style="color:var(--a2)">${T('pxActive')}</span>`:''}
+    <div class="flex-1"></div>
+    <button onclick="testProxy(${x.id})" title="${T('pxTest')}" class="icbox px-2 py-1 rounded-lg soft">${SVG_PING}</button>
+    ${on?'':`<button onclick="armProxy(${x.id})" title="${T('pxArm')}" class="icbox px-2 py-1 rounded-lg soft">${SVG_ARM}</button>`}
+    <button onclick="toggleProxy(${x.id},${x.enabled?1:0})" class="icbox px-2 py-1 rounded-lg soft">${x.enabled?SVG_PAUSE:SVG_PLAY}</button>
+    <button onclick="delProxy(${x.id})" class="icbox px-2 py-1 rounded-lg" style="color:var(--bad)">${SVG_X}</button>
+   </div>
+   <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1 text-[10px] dim">
+    <span>${state}</span>
+    ${x.latency_ms?`<span>${T('pxLatency')}: ${x.latency_ms} ms</span>`:''}
+    ${x.exit_ip?`<span class="mono">${T('pxExitIp')}: ${x.exit_ip}</span>`:''}
+    ${geo?`<span>${geo}</span>`:''}
+    ${x.isp?`<span>${x.isp}</span>`:''}
+    ${x.remark?`<span>${x.remark}</span>`:''}
+    ${x.last_error?`<span style="color:var(--bad)">${x.last_error}</span>`:''}
+   </div>
+  </div>`}).join('')||`<p class="text-xs dim">${T('pxNone')}</p>`;
+}
+async function addProxy(){
+ pxMsg.textContent=T('pxTesting');
+ try{const r=await api('/api/proxies',{method:'POST',body:JSON.stringify({
+   kind:pKind.value,host:pHost.value.trim(),port:parseInt(pPort.value||'0',10),
+   username:pUser.value.trim(),password:pPass.value,remark:pRem.value.trim()})});
+  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} \u00b7 ${r.exit_ip||''} \u00b7 ${r.latency_ms}ms`
+                       :`${T('pxDown')}: ${r.error||''}`;
+  pHost.value='';pPort.value='';pUser.value='';pPass.value='';pRem.value='';
+  loadProxies();
+ }catch(e){pxMsg.textContent=e.message}
+}
+async function testProxy(id){
+ pxMsg.textContent=T('pxTesting');
+ try{const r=await api('/api/proxies/'+id+'/test',{method:'POST'});
+  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} \u00b7 ${r.exit_ip||''} \u00b7 ${r.latency_ms}ms`
+                       :`${T('pxDown')}: ${r.error||''}`;
+  loadProxies();
+ }catch(e){pxMsg.textContent=e.message}
+}
+async function testAllProxies(){
+ pxMsg.textContent=T('pxTesting');
+ try{await api('/api/proxies/test-all',{method:'POST'});pxMsg.textContent='';loadProxies();
+ }catch(e){pxMsg.textContent=e.message}
+}
+async function armProxy(id){
+ pxMsg.textContent=T('pxTesting');
+ try{const r=await api('/api/proxies/'+id+'/activate',{method:'POST'});
+  pxMsg.textContent=id?`${T('pxArmed')} ${r.flag||''} ${r.exit_ip||''}`:'';
+  loadProxies();
+ }catch(e){pxMsg.textContent=e.message}
+}
+async function toggleProxy(id,on){
+ try{await api('/api/proxies/'+id,{method:'PATCH',body:JSON.stringify({enabled:!on})});loadProxies();
+ }catch(e){pxMsg.textContent=e.message}
+}
+async function delProxy(id){
+ if(!confirm(T('pxDelWarn')))return;
+ try{await api('/api/proxies/'+id,{method:'DELETE'});loadProxies();
+ }catch(e){pxMsg.textContent=e.message}
+}
+async function toggleStrict(){
+ PX_STRICT=!PX_STRICT;renderProxies();
+ try{await api('/api/proxies/mode',{method:'POST',body:JSON.stringify({strict:PX_STRICT})});
+ }catch(e){pxMsg.textContent=e.message;loadProxies()}
+}
+async function saveFlagSource(){
+ const v=document.getElementById('pxFlagSel').value;
+ try{await api('/api/proxies/mode',{method:'POST',body:JSON.stringify({flag_source:v})});
+  PX_FLAG=v;pxMsg.textContent=T('savedOk');
+ }catch(e){pxMsg.textContent=e.message}
+}
+
 function openModal(t,h){mTitle.textContent=t;mBody.innerHTML=h;
  modal.classList.remove('hidden');modal.classList.add('flex')}
 function closeModal(){modal.classList.add('hidden');modal.classList.remove('flex');
@@ -3163,7 +3782,7 @@ function copy(btn,t){navigator.clipboard.writeText(t);
  const old=btn.textContent;btn.textContent=T('copied');setTimeout(()=>btn.textContent=old,1200)}
 
 go(PAGE);
-loadStats();loadUsers();loadCips();loadMainCountry();
+loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();
 setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 </script></body></html>"""
 
