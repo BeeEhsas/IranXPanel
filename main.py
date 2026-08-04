@@ -2855,7 +2855,6 @@ function paintConfigs(){
   $("#cfgs").innerHTML = D.configs.length ? D.configs.map((c,i)=>`
   <div class="cfg">
     <span class="nm">${esc(c.label)}</span>
-    <span class="tag ${c.transport==="XHTTP"?"x":""}">${esc(c.transport)}</span>
     <button class="ico" data-qr="${i}" title="${esc(t("showQr"))}" aria-label="${esc(t("showQr"))}">${ICON_QR}</button>
     <button class="ico" data-copy="${i}" title="${esc(t("copyCfg"))}" aria-label="${esc(t("copyCfg"))}">${ICON_COPY}</button>
     <div class="cfgqr" data-box="${i}" hidden></div>
