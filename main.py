@@ -644,9 +644,14 @@ async def open_via_proxy(px, host: str, port: int, timeout: float = 15.0):
     return reader, writer
 
 
-async def dial_target(host: str, port: int):
-    """The single outbound path for user traffic: proxy when armed, else direct."""
-    px = active_proxy()
+async def dial_target(host: str, port: int, direct: bool = False):
+    """The single outbound path for user traffic: proxy when armed, else direct.
+
+    `direct` is set by the "-d" inbound variant, which the platform-exit configs in
+    every subscription use, so those keep leaving from the host's own IP even while a
+    proxy is armed for everything else.
+    """
+    px = None if direct else active_proxy()
     if px:
         try:
             return await open_via_proxy(px, host, port, timeout=15)
@@ -773,7 +778,7 @@ def authorize(uid_str: str, ip: str, proto: str):
 
 async def relay_session(stream: ByteStream,
                         send: Callable[[bytes], Awaitable[None]],
-                        ip: str, proto: str) -> None:
+                        ip: str, proto: str, direct: bool = False) -> None:
     """Shared VLESS handling: authenticate, dial the target, pump both ways."""
     parsed = await parse_vless(stream)
     if not parsed:
@@ -790,7 +795,7 @@ async def relay_session(stream: ByteStream,
     if blocked(host) or port == 0:
         raise PermissionError("blocked destination")
 
-    reader, writer = await dial_target(host, port)
+    reader, writer = await dial_target(host, port, direct)
 
     await send(b"\x00\x00")            # VLESS response header
 
@@ -888,10 +893,11 @@ SESSIONS: dict[str, XSession] = {}
 SID_RE = re.compile(r"^[A-Za-z0-9._\-]{4,64}$")
 
 
-def get_session(sid: str, ip: str) -> XSession:
+def get_session(sid: str, ip: str, direct: bool = False) -> XSession:
     s = SESSIONS.get(sid)
     if s is None or s.closed:
         s = XSession(sid, ip)
+        s.direct = direct
         SESSIONS[sid] = s
         s.worker = asyncio.create_task(run_session(s))
     s.touch()
@@ -900,7 +906,8 @@ def get_session(sid: str, ip: str) -> XSession:
 
 async def run_session(s: XSession):
     try:
-        await relay_session(s.stream, s.send, s.ip, "xhttp")
+        await relay_session(s.stream, s.send, s.ip, "xhttp",
+                            getattr(s, "direct", False))
     except Exception:
         pass
     finally:
@@ -979,10 +986,48 @@ async def xhttp_up(session: str, seq: str, request: Request):
     return Response(status_code=200, headers=NOBUF_HEADERS)
 
 
+# ── XHTTP, no-proxy variant ──
+#  Same protocol on "<XHTTP_PATH>-d"; session keys are namespaced so a direct and a
+#  proxied session can never collide.
+
+@app.get("/" + XHTTP_PATH + "-d/{session}")
+async def xhttp_down_direct(session: str, request: Request):
+    if not SID_RE.match(session):
+        raise HTTPException(404)
+    s = get_session("d." + session, client_ip(request), True)
+
+    async def gen():
+        try:
+            while True:
+                item = await s.out.get()
+                if item is None:
+                    break
+                yield item
+        except asyncio.CancelledError:
+            pass
+        finally:
+            s.close()
+
+    return StreamingResponse(gen(), headers=NOBUF_HEADERS)
+
+
+@app.post("/" + XHTTP_PATH + "-d/{session}/{seq}")
+async def xhttp_up_direct(session: str, seq: str, request: Request):
+    if not SID_RE.match(session) or not seq.isdigit():
+        raise HTTPException(404)
+    s = get_session("d." + session, client_ip(request), True)
+    body = await request.body()
+    if body:
+        s.push(int(seq), body)
+    return Response(status_code=200, headers=NOBUF_HEADERS)
+
+
 # ── WebSocket inbound (catch-all, validated inside) ──
 @app.websocket("/{path:path}")
 async def vless_ws(websocket: WebSocket, path: str):
-    if path.strip("/") != WS_PATH:
+    p = path.strip("/")
+    direct = p == WS_PATH + "-d"          # the platform-exit variant
+    if p != WS_PATH and not direct:
         await websocket.close(code=1008)
         return
     ip = client_ip(websocket)
@@ -993,7 +1038,7 @@ async def vless_ws(websocket: WebSocket, path: str):
         await websocket.send_bytes(data)
 
     try:
-        await relay_session(stream, send, ip, "ws")
+        await relay_session(stream, send, ip, "ws", direct)
     except PermissionError:
         try:
             await websocket.close(code=1008)
@@ -1041,17 +1086,19 @@ def fmt_bytes(b: int) -> str:
     return f"{n:.1f} {units[i]}" if i else f"{int(n)} {units[i]}"
 
 
-def ws_uri(row, address: str, host: str, label: str) -> str:
+def ws_uri(row, address: str, host: str, label: str, direct: bool = False) -> str:
+    path = WS_PATH + ("-d" if direct else "")
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome&alpn=http%2F1.1"
-            f"&type=ws&host={host}&path=%2F{WS_PATH}"
+            f"&type=ws&host={host}&path=%2F{path}"
             f"#{quote(label)}")
 
 
-def xhttp_uri(row, address: str, host: str, label: str) -> str:
+def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False) -> str:
+    path = XHTTP_PATH + ("-d" if direct else "")
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome"
-            f"&type=xhttp&host={host}&path=%2F{XHTTP_PATH}&mode=packet-up"
+            f"&type=xhttp&host={host}&path=%2F{path}&mode=packet-up"
             f"#{quote(label)}")
 
 
@@ -1140,20 +1187,36 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     if t in ("xhttp", "both"):
         kinds.append(("XHTTP", xhttp_uri))
 
-    exit_flag = proxy_flag()
-    head = exit_flag or main_flag() or "\U0001f310"
+    # The host's own exit (Render / Railway) is always offered and flagged with the
+    # server country. With a proxy armed, its entries are listed next to those and
+    # flagged with the proxy's exit country, so the user can pick either route.
+    server_flag = main_flag() or "\U0001f310"
+    px = active_proxy()
+    exit_flag = ""
+    if px:
+        try:
+            exit_flag = proxy_flag() or flag_of(px["country"] or "")
+        except Exception:
+            exit_flag = ""
+    routes = [(server_flag, "", True)]                     # direct: never proxied
+    if px:
+        routes.append((exit_flag or "\U0001f310", " · PX", False))
+
     out = []
-    for tag, fn in kinds:
-        out.append({"label": f"{head} {row['name']} · {tag} · Default",
-                    "transport": tag,
-                    "uri": fn(row, host, host, f"{head} {row['name']} · {tag}")})
-        for cip in clean_ips:
-            note = cip["remark"] or cip["address"]
-            mark = exit_flag or cip_flag(cip) or "\u26a1"
-            out.append({"label": f"{mark} {note} · {tag}",
+    for mark, suffix, direct in routes:
+        for tag, fn in kinds:
+            title = f"{mark} {row['name']} · {tag}{suffix}"
+            out.append({"label": f"{mark} {row['name']} · {tag}{suffix} · Default",
                         "transport": tag,
-                        "uri": fn(row, cip["address"], host,
-                                  f"{mark} {row['name']} · {note} · {tag}")})
+                        "uri": fn(row, host, host, title, direct)})
+            for cip in clean_ips:
+                note = cip["remark"] or cip["address"]
+                cmark = (cip_flag(cip) or mark) if direct else mark
+                out.append({"label": f"{cmark} {note} · {tag}{suffix}",
+                            "transport": tag,
+                            "uri": fn(row, cip["address"], host,
+                                      f"{cmark} {row['name']} · {note} · {tag}{suffix}",
+                                      direct)})
     return out
 
 
@@ -1651,6 +1714,78 @@ async def add_proxy(body: ProxyIn, _=Depends(require_admin)):
         pid = cur.lastrowid
     audit("proxy-add", "", "%s %s:%s" % (kind, host, body.port))
     return await run_proxy_test(pid)          # a fresh proxy is tested at once
+
+
+PROXY_URI_RE = re.compile(
+    r"^(?:(?P<kind>socks5h?|socks4a?|https?)://)?"
+    r"(?:(?P<user>[^:@/\s]*)(?::(?P<pw>[^@/\s]*))?@)?"
+    r"(?P<host>\[[0-9A-Fa-f:]+\]|[^:@/\s]+)[:\s]+(?P<port>\d{1,5})"
+    r"/?$", re.I)
+
+KIND_ALIASES = {"socks5h": "socks5", "socks4a": "socks4", "https": "http"}
+
+
+def parse_proxy_uri(line: str) -> dict:
+    """One pasted line -> proxy fields.
+
+    Accepted: socks5://1.2.3.4:1080, socks5://user:pass@host:1080#label,
+    http://host:8080, and a bare 1.2.3.4:1080 (assumed socks5).
+    """
+    raw = (line or "").strip()
+    if not raw or raw.startswith("#") or raw.startswith("//"):
+        return {}
+    remark = ""
+    if "#" in raw:
+        raw, remark = raw.split("#", 1)
+        raw, remark = raw.strip(), remark.strip()[:80]
+    m = PROXY_URI_RE.match(raw)
+    if not m:
+        raise ValueError("unreadable — use kind://host:port")
+    kind = (m.group("kind") or "socks5").lower()
+    kind = KIND_ALIASES.get(kind, kind)
+    if kind not in PROXY_KINDS:
+        raise ValueError("kind must be socks5, socks4 or http")
+    port = int(m.group("port"))
+    if not 1 <= port <= 65535:
+        raise ValueError("port out of range")
+    user, pw = m.group("user") or "", m.group("pw") or ""
+    if kind == "socks4":
+        pw = ""                       # socks4 carries a user id only
+    return {"kind": kind,
+            "host": m.group("host").strip("[]"),
+            "port": port,
+            "username": user,
+            "password": pw,
+            "remark": remark}
+
+
+class ProxyBulkIn(BaseModel):
+    text: str = ""
+
+
+@app.post("/api/proxies/bulk")
+async def add_proxies_bulk(body: ProxyBulkIn, _=Depends(require_admin)):
+    """Adds a pasted list (one proxy per line) and health-tests each entry."""
+    results = []
+    for line in (body.text or "").splitlines()[:50]:
+        if not line.strip():
+            continue
+        shown = line.strip()[:60]
+        try:
+            fields = parse_proxy_uri(line)
+        except ValueError as exc:
+            results.append({"ok": False, "label": shown, "error": str(exc)})
+            continue
+        if not fields:
+            continue
+        shown = "%s://%s:%s" % (fields["kind"], fields["host"], fields["port"])
+        try:
+            res = await add_proxy(ProxyIn(**fields), None)
+            res["label"] = shown
+            results.append(res)
+        except HTTPException as exc:
+            results.append({"ok": False, "label": shown, "error": str(exc.detail)})
+    return {"results": results}
 
 
 @app.post("/api/proxies/{pid}/test")
@@ -2797,6 +2932,7 @@ async def healthz():
 # ════════════════════════════ FRONTEND ════════════════════════════
 
 THEME_CSS = r"""
+html,body{overflow-x:hidden;max-width:100%}
 /* three themes only: black+blue, white+blue, grey. Buttons are black on white text. */
 :root,[data-theme="dark"]{--bg:#000000;--panel:#07090f;--card:#0b0f17;--line:#1b2537;
       --txt:#f2f6fc;--dim:#8fa3c0;--a1:#1d4ed8;--a2:#3b82f6;--ok:#34d399;--bad:#fb7185;--info:#38bdf8;
@@ -2882,6 +3018,9 @@ const I18N={
   pxKind:'نوع',pxHost:'هاست / ایپی',pxPort:'پورت',
   pxUser:'یوزرنیم (اختیاری)',pxPass:'پسورد (اختیاری)',
   pxAdd:'افزودن و تست',pxTestAll:'تست همه',
+  pxLineHint:'هر خط یک پروکسی — مانند socks5://1.1.1.1:5866 یا http://user:pass@2.2.2.2:8080',
+  pxAddLines:'افزودن لیست و تست',
+  pxAdvanced:'ورود دستی فیلدها',
   pxDirect:'اتصال مستقیم (بدون پروکسی)',
   pxActive:'فعال',pxArm:'فعال کردن',pxTest:'تست سلامت',
   pxHealthy:'سالم',pxDown:'خراب',pxUntested:'تست نشده',
@@ -2949,6 +3088,9 @@ const I18N={
   pxKind:'Type',pxHost:'Host / IP',pxPort:'Port',
   pxUser:'Username (optional)',pxPass:'Password (optional)',
   pxAdd:'Add & test',pxTestAll:'Test all',
+  pxLineHint:'One proxy per line — e.g. socks5://1.1.1.1:5866 or http://user:pass@2.2.2.2:8080',
+  pxAddLines:'Add list & test',
+  pxAdvanced:'Enter fields manually',
   pxDirect:'Direct connection (no proxy)',
   pxActive:'Active',pxArm:'Activate',pxTest:'Health test',
   pxHealthy:'healthy',pxDown:'down',pxUntested:'untested',
@@ -3212,7 +3354,15 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
   <div class="card rounded-2xl p-4">
    <p class="text-sm font-bold" data-t="pxTitle"></p>
    <p class="text-[11px] dim mt-1 mb-3" data-t="pxHint"></p>
-   <div class="grid sm:grid-cols-3 gap-2">
+   <textarea id="pBulk" rows="3" spellcheck="false"
+     class="w-full inp rounded-xl px-3 py-2 text-sm mono"
+     placeholder="socks5://1.1.1.1:5866"></textarea>
+   <p class="text-[10px] dim mt-1" data-t="pxLineHint"></p>
+   <button onclick="addBulk()" class="w-full grad rounded-xl px-4 py-2 text-sm font-bold mt-2"
+     data-t="pxAddLines"></button>
+   <details class="mt-3">
+   <summary class="text-[11px] dim cursor-pointer" data-t="pxAdvanced"></summary>
+   <div class="grid sm:grid-cols-3 gap-2 mt-2">
     <div><label class="text-[11px] dim" data-t="pxKind"></label>
      <select id="pKind" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
       <option value="socks5">SOCKS5</option><option value="socks4">SOCKS4</option>
@@ -3228,6 +3378,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
     <div><label class="text-[11px] dim" data-t="remarkPh"></label>
      <input id="pRem" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1"></div>
    </div>
+   </details>
    <div class="grid grid-cols-2 gap-2 mt-3">
     <button onclick="addProxy()" class="grad rounded-xl px-4 py-2 text-sm font-bold" data-t="pxAdd"></button>
     <button onclick="testAllProxies()" class="rounded-xl soft py-2 text-xs font-bold" data-t="pxTestAll"></button>
@@ -3316,6 +3467,11 @@ function placeNav(open){
  nav.style.left = rtl?'auto':'0';
  nav.style.right= rtl?'0':'auto';
  nav.style.transform = open?'translateX(0)':(rtl?'translateX(100%)':'translateX(-100%)');
+ /* A drawer that is only pushed aside still takes up layout width, so any sideways
+    scroll (long proxy rows caused exactly that) dragged it back into view. Pulling it
+    out of the layout keeps it hidden until it is actually asked for. */
+ nav.style.visibility    = open?'visible':'hidden';
+ nav.style.pointerEvents = open?'auto':'none';
 }
 let navOpen=false;
 function toggleNav(force){
@@ -3583,10 +3739,10 @@ function renderProxies(){
   const state=x.healthy?T('pxHealthy'):(x.checked_at?T('pxDown'):T('pxUntested'));
   const geo=[x.country_name||'',x.city||''].filter(Boolean).join(' \u00b7 ');
   return `<div class="rounded-xl soft px-3 py-2 ${on?'ring-2':''}" style="${on?'outline:2px solid var(--a1)':''}">
-   <div class="flex items-center gap-2">
+   <div class="flex items-center gap-2 flex-wrap">
     <span class="h-2 w-2 rounded-full" style="background:${dot}"></span>
     <span class="text-base">${x.flag||'\u{1F310}'}</span>
-    <span class="mono text-[11px]">${x.label}</span>
+    <span class="mono text-[11px] min-w-0 break-all">${x.label}</span>
     ${x.has_auth?'<span class="text-[10px] dim">\u{1F511}</span>':''}
     ${on?`<span class="text-[10px] font-bold" style="color:var(--a2)">${T('pxActive')}</span>`:''}
     <div class="flex-1"></div>
@@ -3614,6 +3770,20 @@ async function addProxy(){
   pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} \u00b7 ${r.exit_ip||''} \u00b7 ${r.latency_ms}ms`
                        :`${T('pxDown')}: ${r.error||''}`;
   pHost.value='';pPort.value='';pUser.value='';pPass.value='';pRem.value='';
+  loadProxies();
+ }catch(e){pxMsg.textContent=e.message}
+}
+async function addBulk(){
+ const text=pBulk.value.trim();
+ if(!text){pxMsg.textContent=T('pxLineHint');return}
+ pxMsg.textContent=T('pxTesting');
+ try{const r=await api('/api/proxies/bulk',{method:'POST',body:JSON.stringify({text:text})});
+  const rows=r.results||[], good=rows.filter(x=>x.ok).length;
+  pxMsg.innerHTML=rows.map(x=>x.ok
+    ?`<span style="color:var(--ok)">${x.flag||''} ${x.label} · ${x.country_name||''} ${x.latency_ms||0}ms</span>`
+    :`<span style="color:var(--bad)">${x.label}: ${x.error||''}</span>`).join('<br>')+
+   `<br>${good}/${rows.length}`;
+  if(good)pBulk.value='';
   loadProxies();
  }catch(e){pxMsg.textContent=e.message}
 }
