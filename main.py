@@ -537,6 +537,30 @@ def active_proxy():
                          (int(pid),)).fetchone()
 
 
+def proxy_by_id(pid: int):
+    """One enabled proxy, looked up by the id carried in the inbound path."""
+    with db() as c:
+        return c.execute("SELECT * FROM proxies WHERE id=? AND enabled=1",
+                         (int(pid),)).fetchone()
+
+
+def sub_proxies():
+    """Every enabled proxy that passed its health check, fastest first.
+
+    These are exactly the proxies a subscription lists, so a working proxy joins
+    the user's config list on its own and a failing one drops out — no arming step.
+    """
+    with db() as c:
+        return c.execute("""SELECT * FROM proxies WHERE enabled=1 AND healthy=1
+                            ORDER BY latency_ms IS NULL, latency_ms, id""").fetchall()
+
+
+def preferred_proxy():
+    """Fallback for the plain inbound path used by older subscriptions."""
+    rows = sub_proxies()
+    return rows[0] if rows else active_proxy()
+
+
 def _addr_bytes(host: str) -> bytes:
     """SOCKS5 address field: literal IPv4/IPv6 when possible, else a hostname."""
     try:
@@ -644,14 +668,17 @@ async def open_via_proxy(px, host: str, port: int, timeout: float = 15.0):
     return reader, writer
 
 
-async def dial_target(host: str, port: int, direct: bool = False):
-    """The single outbound path for user traffic: proxy when armed, else direct.
+async def dial_target(host: str, port: int, direct: bool = False,
+                      pid: int | None = None):
+    """The single outbound path for user traffic.
 
-    `direct` is set by the "-d" inbound variant, which the platform-exit configs in
-    every subscription use, so those keep leaving from the host's own IP even while a
-    proxy is armed for everything else.
+    The inbound path decides the exit: "-d" leaves from the host's own IP, "-p<id>"
+    leaves through that one proxy, and the plain path follows the fastest healthy
+    proxy so subscriptions handed out earlier keep working.
     """
-    px = None if direct else active_proxy()
+    px = None
+    if not direct:
+        px = proxy_by_id(pid) if pid else preferred_proxy()
     if px:
         try:
             return await open_via_proxy(px, host, port, timeout=15)
@@ -778,7 +805,8 @@ def authorize(uid_str: str, ip: str, proto: str):
 
 async def relay_session(stream: ByteStream,
                         send: Callable[[bytes], Awaitable[None]],
-                        ip: str, proto: str, direct: bool = False) -> None:
+                        ip: str, proto: str, direct: bool = False,
+                        pid: int | None = None) -> None:
     """Shared VLESS handling: authenticate, dial the target, pump both ways."""
     parsed = await parse_vless(stream)
     if not parsed:
@@ -795,7 +823,7 @@ async def relay_session(stream: ByteStream,
     if blocked(host) or port == 0:
         raise PermissionError("blocked destination")
 
-    reader, writer = await dial_target(host, port, direct)
+    reader, writer = await dial_target(host, port, direct, pid)
 
     await send(b"\x00\x00")            # VLESS response header
 
@@ -893,11 +921,13 @@ SESSIONS: dict[str, XSession] = {}
 SID_RE = re.compile(r"^[A-Za-z0-9._\-]{4,64}$")
 
 
-def get_session(sid: str, ip: str, direct: bool = False) -> XSession:
+def get_session(sid: str, ip: str, direct: bool = False,
+                pid: int | None = None) -> XSession:
     s = SESSIONS.get(sid)
     if s is None or s.closed:
         s = XSession(sid, ip)
         s.direct = direct
+        s.pid = pid
         SESSIONS[sid] = s
         s.worker = asyncio.create_task(run_session(s))
     s.touch()
@@ -907,7 +937,8 @@ def get_session(sid: str, ip: str, direct: bool = False) -> XSession:
 async def run_session(s: XSession):
     try:
         await relay_session(s.stream, s.send, s.ip, "xhttp",
-                            getattr(s, "direct", False))
+                            getattr(s, "direct", False),
+                            getattr(s, "pid", None))
     except Exception:
         pass
     finally:
@@ -1022,12 +1053,52 @@ async def xhttp_up_direct(session: str, seq: str, request: Request):
     return Response(status_code=200, headers=NOBUF_HEADERS)
 
 
+# ── XHTTP, per-proxy variants ──
+#  "<XHTTP_PATH>-p<id>" always leaves through proxy <id>. Session keys are namespaced
+#  per route, so the same client id on two routes never shares a session.
+
+@app.get("/" + XHTTP_PATH + "-p{pid}/{session}")
+async def xhttp_down_proxy(pid: int, session: str, request: Request):
+    if not SID_RE.match(session) or pid <= 0:
+        raise HTTPException(404)
+    s = get_session("p%d.%s" % (pid, session), client_ip(request), False, pid)
+
+    async def gen():
+        try:
+            while True:
+                item = await s.out.get()
+                if item is None:
+                    break
+                yield item
+        except asyncio.CancelledError:
+            pass
+        finally:
+            s.close()
+
+    return StreamingResponse(gen(), headers=NOBUF_HEADERS)
+
+
+@app.post("/" + XHTTP_PATH + "-p{pid}/{session}/{seq}")
+async def xhttp_up_proxy(pid: int, session: str, seq: str, request: Request):
+    if not SID_RE.match(session) or not seq.isdigit() or pid <= 0:
+        raise HTTPException(404)
+    s = get_session("p%d.%s" % (pid, session), client_ip(request), False, pid)
+    body = await request.body()
+    if body:
+        s.push(int(seq), body)
+    return Response(status_code=200, headers=NOBUF_HEADERS)
+
+
 # ── WebSocket inbound (catch-all, validated inside) ──
 @app.websocket("/{path:path}")
 async def vless_ws(websocket: WebSocket, path: str):
     p = path.strip("/")
     direct = p == WS_PATH + "-d"          # the platform-exit variant
-    if p != WS_PATH and not direct:
+    pid = None
+    m = re.match(r"^" + re.escape(WS_PATH) + r"-p([1-9][0-9]{0,8})$", p)
+    if m:
+        pid = int(m.group(1))             # this route rides one named proxy
+    if p != WS_PATH and not direct and pid is None:
         await websocket.close(code=1008)
         return
     ip = client_ip(websocket)
@@ -1038,7 +1109,7 @@ async def vless_ws(websocket: WebSocket, path: str):
         await websocket.send_bytes(data)
 
     try:
-        await relay_session(stream, send, ip, "ws", direct)
+        await relay_session(stream, send, ip, "ws", direct, pid)
     except PermissionError:
         try:
             await websocket.close(code=1008)
@@ -1086,16 +1157,18 @@ def fmt_bytes(b: int) -> str:
     return f"{n:.1f} {units[i]}" if i else f"{int(n)} {units[i]}"
 
 
-def ws_uri(row, address: str, host: str, label: str, direct: bool = False) -> str:
-    path = WS_PATH + ("-d" if direct else "")
+def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
+           pid: int | None = None) -> str:
+    path = WS_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome&alpn=http%2F1.1"
             f"&type=ws&host={host}&path=%2F{path}"
             f"#{quote(label)}")
 
 
-def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False) -> str:
-    path = XHTTP_PATH + ("-d" if direct else "")
+def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False,
+              pid: int | None = None) -> str:
+    path = XHTTP_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome"
             f"&type=xhttp&host={host}&path=%2F{path}&mode=packet-up"
@@ -1187,36 +1260,40 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     if t in ("xhttp", "both"):
         kinds.append(("XHTTP", xhttp_uri))
 
-    # The host's own exit (Render / Railway) is always offered and flagged with the
-    # server country. With a proxy armed, its entries are listed next to those and
-    # flagged with the proxy's exit country, so the user can pick either route.
+    # Every route sits in the same subscription, side by side: first the host's own
+    # exit (Render / Railway) flagged with the server country, then one route per
+    # healthy proxy flagged with that proxy's exit country. A proxy shows up here as
+    # soon as its health check passes — there is nothing to arm.
     server_flag = main_flag() or "\U0001f310"
-    px = active_proxy()
-    exit_flag = ""
-    if px:
+    by_proxy_flag = (get_setting("flag_source") or "proxy") == "proxy"
+    routes = [(server_flag, "", True, None)]
+    for px in sub_proxies():
         try:
-            exit_flag = proxy_flag() or flag_of(px["country"] or "")
+            pflag = flag_of(px["country"] or "") or flag_of(guess_country(px["remark"] or ""))
         except Exception:
-            exit_flag = ""
-    routes = [(server_flag, "", True)]                     # direct: never proxied
-    if px:
-        routes.append((exit_flag or "\U0001f310", " · PX", False))
+            pflag = ""
+        mark = (pflag or "\U0001f310") if by_proxy_flag else server_flag
+        try:
+            spot = px["city"] or px["country_name"] or px["remark"] or px["host"]
+        except Exception:
+            spot = px["host"]
+        routes.append((mark, " \u00b7 PX " + str(spot or "")[:20], False, px["id"]))
 
     out = []
-    for mark, suffix, direct in routes:
+    for mark, suffix, direct, pid in routes:
         for tag, fn in kinds:
-            title = f"{mark} {row['name']} · {tag}{suffix}"
-            out.append({"label": f"{mark} {row['name']} · {tag}{suffix} · Default",
+            title = f"{mark} {row['name']} \u00b7 {tag}{suffix}"
+            out.append({"label": f"{mark} {row['name']} \u00b7 {tag}{suffix} \u00b7 Default",
                         "transport": tag,
-                        "uri": fn(row, host, host, title, direct)})
+                        "uri": fn(row, host, host, title, direct, pid)})
             for cip in clean_ips:
                 note = cip["remark"] or cip["address"]
                 cmark = (cip_flag(cip) or mark) if direct else mark
-                out.append({"label": f"{cmark} {note} · {tag}{suffix}",
+                out.append({"label": f"{cmark} {note} \u00b7 {tag}{suffix}",
                             "transport": tag,
                             "uri": fn(row, cip["address"], host,
-                                      f"{cmark} {row['name']} · {note} · {tag}{suffix}",
-                                      direct)})
+                                      f"{cmark} {row['name']} \u00b7 {note} \u00b7 {tag}{suffix}",
+                                      direct, pid)})
     return out
 
 
@@ -1684,6 +1761,7 @@ async def list_proxies(_=Depends(require_admin)):
         rows = c.execute("SELECT * FROM proxies ORDER BY id DESC").fetchall()
     act = get_setting("active_proxy") or ""
     return {"proxies": [proxy_out(r) for r in rows],
+            "sub_ids": [r["id"] for r in sub_proxies()],
             "active_id": int(act) if act.isdigit() else 0,
             "strict": proxy_strict(),
             "flag_source": get_setting("flag_source") or "proxy"}
@@ -3018,6 +3096,8 @@ const I18N={
   pxKind:'نوع',pxHost:'هاست / ایپی',pxPort:'پورت',
   pxUser:'یوزرنیم (اختیاری)',pxPass:'پسورد (اختیاری)',
   pxAdd:'افزودن و تست',pxTestAll:'تست همه',
+  pxInSub:'در ساب',
+  pxAutoNote:'هر پروکسی که تستش سالم باشد خودبه‌خود در ساب همه کاربران می‌آید — همه با هم، بدون دکمه. کانفیگ بدون پروکسی همیشه سر جایش هست؛ پروکسی خراب خودبه‌خود حذف می‌شود.',
   pxLineHint:'هر خط یک پروکسی — مانند socks5://1.1.1.1:5866 یا http://user:pass@2.2.2.2:8080',
   pxAddLines:'افزودن لیست و تست',
   pxAdvanced:'ورود دستی فیلدها',
@@ -3088,6 +3168,8 @@ const I18N={
   pxKind:'Type',pxHost:'Host / IP',pxPort:'Port',
   pxUser:'Username (optional)',pxPass:'Password (optional)',
   pxAdd:'Add & test',pxTestAll:'Test all',
+  pxInSub:'in subscriptions',
+  pxAutoNote:'Every proxy that passes its health check joins all subscriptions automatically — all of them at once, no button. The no-proxy config is always there, and a failing proxy drops out on its own.',
   pxLineHint:'One proxy per line — e.g. socks5://1.1.1.1:5866 or http://user:pass@2.2.2.2:8080',
   pxAddLines:'Add list & test',
   pxAdvanced:'Enter fields manually',
@@ -3403,7 +3485,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
   </div>
 
   <div class="card rounded-2xl p-4 space-y-2">
-   <button onclick="armProxy(0)" id="pxDirectBtn" class="w-full rounded-xl soft px-3 py-2 text-xs font-bold text-start" data-t="pxDirect"></button>
+   <p class="text-[11px] dim" data-t="pxAutoNote"></p>
    <div id="pxRows" class="space-y-2"></div>
   </div>
  </section>
@@ -3509,7 +3591,7 @@ var SVG_PING='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24"
   '<path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>';
 var SVG_ARM='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
   '<path d="M13 3L5 14h5l-1 7 8-11h-5z"/></svg>';
-var PROXIES=[],PX_ACTIVE=0,PX_STRICT=true,PX_FLAG='proxy';
+var PROXIES=[],PX_SUB=[],PX_ACTIVE=0,PX_STRICT=true,PX_FLAG='proxy';
 
 /* ─── routing ─── */
 let PAGE=localStorage.getItem('page')||'dash';
@@ -3720,7 +3802,7 @@ async function clearCips(){if(confirm(T('clearAll')+'?')){await api('/api/clean-
 
 async function loadProxies(){
  try{const r=await api('/api/proxies');
-  PROXIES=r.proxies||[];PX_ACTIVE=r.active_id||0;
+  PROXIES=r.proxies||[];PX_SUB=r.sub_ids||[];PX_ACTIVE=r.active_id||0;
   PX_STRICT=!!r.strict;PX_FLAG=r.flag_source||'proxy';
   renderProxies();
  }catch(e){if(pxMsg)pxMsg.textContent=e.message}
@@ -3731,10 +3813,9 @@ function renderProxies(){
  if(sb)sb.classList.toggle('on',PX_STRICT);
  const fs=document.getElementById('pxFlagSel');
  if(fs)fs.value=PX_FLAG;
- const db=document.getElementById('pxDirectBtn');
- if(db)db.classList.toggle('btn-solid',PX_ACTIVE===0);
  pxRows.innerHTML=PROXIES.map(x=>{
-  const on=x.id===PX_ACTIVE;
+  // A healthy, enabled proxy is already in every subscription — nothing to press.
+  const on=PX_SUB.indexOf(x.id)>-1;
   const dot=x.healthy?'var(--ok)':(x.checked_at?'var(--bad)':'var(--dim)');
   const state=x.healthy?T('pxHealthy'):(x.checked_at?T('pxDown'):T('pxUntested'));
   const geo=[x.country_name||'',x.city||''].filter(Boolean).join(' \u00b7 ');
@@ -3744,10 +3825,9 @@ function renderProxies(){
     <span class="text-base">${x.flag||'\u{1F310}'}</span>
     <span class="mono text-[11px] min-w-0 break-all">${x.label}</span>
     ${x.has_auth?'<span class="text-[10px] dim">\u{1F511}</span>':''}
-    ${on?`<span class="text-[10px] font-bold" style="color:var(--a2)">${T('pxActive')}</span>`:''}
+    ${on?`<span class="text-[10px] font-bold" style="color:var(--a2)">${T('pxInSub')}</span>`:''}
     <div class="flex-1"></div>
     <button onclick="testProxy(${x.id})" title="${T('pxTest')}" class="icbox px-2 py-1 rounded-lg soft">${SVG_PING}</button>
-    ${on?'':`<button onclick="armProxy(${x.id})" title="${T('pxArm')}" class="icbox px-2 py-1 rounded-lg soft">${SVG_ARM}</button>`}
     <button onclick="toggleProxy(${x.id},${x.enabled?1:0})" class="icbox px-2 py-1 rounded-lg soft">${x.enabled?SVG_PAUSE:SVG_PLAY}</button>
     <button onclick="delProxy(${x.id})" class="icbox px-2 py-1 rounded-lg" style="color:var(--bad)">${SVG_X}</button>
    </div>
@@ -3798,13 +3878,6 @@ async function testProxy(id){
 async function testAllProxies(){
  pxMsg.textContent=T('pxTesting');
  try{await api('/api/proxies/test-all',{method:'POST'});pxMsg.textContent='';loadProxies();
- }catch(e){pxMsg.textContent=e.message}
-}
-async function armProxy(id){
- pxMsg.textContent=T('pxTesting');
- try{const r=await api('/api/proxies/'+id+'/activate',{method:'POST'});
-  pxMsg.textContent=id?`${T('pxArmed')} ${r.flag||''} ${r.exit_ip||''}`:'';
-  loadProxies();
  }catch(e){pxMsg.textContent=e.message}
 }
 async function toggleProxy(id,on){
