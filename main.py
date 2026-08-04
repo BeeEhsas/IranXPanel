@@ -1264,6 +1264,9 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     # exit (Render / Railway) flagged with the server country, then one route per
     # healthy proxy flagged with that proxy's exit country. A proxy shows up here as
     # soon as its health check passes — there is nothing to arm.
+    #
+    # Names carry only the flag, the account or clean-IP name, and the proxy's
+    # location — no transport tag and no "PX" marker.
     server_flag = main_flag() or "\U0001f310"
     by_proxy_flag = (get_setting("flag_source") or "proxy") == "proxy"
     routes = [(server_flag, "", True, None)]
@@ -1277,22 +1280,26 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
             spot = px["city"] or px["country_name"] or px["remark"] or px["host"]
         except Exception:
             spot = px["host"]
-        routes.append((mark, " \u00b7 PX " + str(spot or "")[:20], False, px["id"]))
+        spot = str(spot or "")[:20]
+        routes.append((mark, (" \u00b7 " + spot) if spot else "", False, px["id"]))
 
     out = []
     for mark, suffix, direct, pid in routes:
         for tag, fn in kinds:
-            title = f"{mark} {row['name']} \u00b7 {tag}{suffix}"
-            out.append({"label": f"{mark} {row['name']} \u00b7 {tag}{suffix} \u00b7 Default",
-                        "transport": tag,
-                        "uri": fn(row, host, host, title, direct, pid)})
+            # The panel domain resolves to the host itself, so it only makes sense for
+            # the server's own exit; proxy routes ride the clean IPs instead.
+            if direct:
+                title = f"{mark} {row['name']}{suffix}"
+                out.append({"label": f"{mark} {row['name']}{suffix} \u00b7 Default",
+                            "transport": tag,
+                            "uri": fn(row, host, host, title, direct, pid)})
             for cip in clean_ips:
                 note = cip["remark"] or cip["address"]
                 cmark = (cip_flag(cip) or mark) if direct else mark
-                out.append({"label": f"{cmark} {note} \u00b7 {tag}{suffix}",
+                out.append({"label": f"{cmark} {note}{suffix}",
                             "transport": tag,
                             "uri": fn(row, cip["address"], host,
-                                      f"{cmark} {row['name']} \u00b7 {note} \u00b7 {tag}{suffix}",
+                                      f"{cmark} {row['name']} \u00b7 {note}{suffix}",
                                       direct, pid)})
     return out
 
