@@ -1,7 +1,3 @@
---------------------------929bea24044f36ee
-Content-Disposition: form-data; name="file"; filename="main_fixed.py"
-Content-Type: application/octet-stream
-
 """
 IranX Panel v3  —  VLESS over WebSocket+TLS  and  VLESS over XHTTP+TLS
 ----------------------------------------------------------------------
@@ -528,9 +524,7 @@ IP_CHECK_PATH = "/json/?fields=status,message,country,countryCode,city,isp,query
 
 
 def proxy_strict() -> bool:
-    # Default to false on Railway (ephemeral environment) to avoid connection refused
-    # when proxies are unreachable. User can override by setting PROXY_STRICT=1
-    return (get_setting("proxy_strict") or "0") == "1"
+    return (get_setting("proxy_strict") or "1") == "1"
 
 
 def active_proxy():
@@ -689,13 +683,11 @@ async def dial_target(host: str, port: int, direct: bool = False,
         try:
             return await open_via_proxy(px, host, port, timeout=15)
         except Exception as exc:
-            audit("proxy-fail", "", "%s %s:%s \\u2192 %s" %
+            audit("proxy-fail", "", "%s %s:%s \u2192 %s" %
                   (px["kind"], px["host"], px["port"], exc))
             mark_proxy_down(px["id"], str(exc))
             if proxy_strict():
                 raise
-            # Non-strict mode: fall back to direct connection
-            pass
     return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=12)
 
 
@@ -4045,5 +4037,3 @@ setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 
 AUTH_HTML  = AUTH_HTML.replace("__THEME__", THEME_CSS).replace("__I18N__", I18N_JS)
 PANEL_HTML = PANEL_HTML.replace("__THEME__", THEME_CSS).replace("__I18N__", I18N_JS)
-
---------------------------929bea24044f36ee--
