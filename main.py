@@ -524,7 +524,9 @@ IP_CHECK_PATH = "/json/?fields=status,message,country,countryCode,city,isp,query
 
 
 def proxy_strict() -> bool:
-    return (get_setting("proxy_strict") or "1") == "1"
+    # Default to false on Railway (ephemeral environment) to avoid connection refused
+    # when proxies are unreachable. User can override by setting PROXY_STRICT=1
+    return (get_setting("proxy_strict") or "0") == "1"
 
 
 def active_proxy():
@@ -683,11 +685,13 @@ async def dial_target(host: str, port: int, direct: bool = False,
         try:
             return await open_via_proxy(px, host, port, timeout=15)
         except Exception as exc:
-            audit("proxy-fail", "", "%s %s:%s \u2192 %s" %
+            audit("proxy-fail", "", "%s %s:%s \\u2192 %s" %
                   (px["kind"], px["host"], px["port"], exc))
             mark_proxy_down(px["id"], str(exc))
             if proxy_strict():
                 raise
+            # Non-strict mode: fall back to direct connection
+            pass
     return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=12)
 
 
