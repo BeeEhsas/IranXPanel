@@ -847,6 +847,14 @@ async def relay_session(stream: ByteStream,
         audit("reject", ip, f"{proto}: {reason}")
         raise PermissionError(reason)
 
+    # VLESS command 0x03 is mux.cool: one session carries many sub-streams, so the
+    # whole tunnel is a single connection (one Cloudflare request) instead of one per
+    # target. The address fields in the header are a placeholder for mux and ignored.
+    if cmd == 3:
+        await send(b"\x00\x00")            # VLESS response header, then mux frames
+        await relay_mux(stream, send, row, ip, direct, pid)
+        return
+
     if cmd != 1:
         raise ValueError("only TCP supported")
     if blocked(host) or port == 0:
@@ -897,6 +905,152 @@ async def relay_session(stream: ByteStream,
         writer.close()
     except Exception:
         pass
+
+
+# ══════════════════════════ mux.cool ══════════════════════════
+#
+#  When a client enables Mux it opens ONE VLESS session (VLESS command 0x02) and rides
+#  every target through it as numbered sub-streams. Behind a Cloudflare Worker relay this
+#  is the whole game: one WebSocket = one Upgrade = one billed request, no matter how many
+#  sites the client visits. Without Mux each destination is its own connection, its own
+#  Upgrade, its own request — which is why request usage climbs during normal browsing.
+#
+#  Frame on the wire (mux.cool, the shape xray/v2ray speak):
+#     2 bytes   metadata length L
+#     L bytes   metadata:  sid(2) status(1) option(1)
+#                          + for New: network(1) port(2) atype(1) addr(..)  [+ 8B XUDP id]
+#     if option & 0x01 (has data):  2 bytes data length  +  data
+#  status: 1 New, 2 Keep, 3 End, 4 KeepAlive.  network: 1 TCP, 2 UDP.
+#  addr type: 1 IPv4, 2 domain(len-prefixed), 3 IPv6.  Ports/addr are port-then-address.
+
+MUX_NEW, MUX_KEEP, MUX_END, MUX_KEEPALIVE = 1, 2, 3, 4
+MUX_OPT_DATA = 0x01
+MUX_MAX_FRAME = 65535          # the data-length field is 2 bytes
+
+
+async def relay_mux(stream: ByteStream,
+                    send: Callable[[bytes], Awaitable[None]],
+                    row, ip: str, direct: bool, pid: int | None) -> None:
+    """Serve a mux.cool tunnel: read framed sub-streams, dial each, pump both ways."""
+    uid = row["id"]
+    subs: dict[int, dict] = {}
+    send_lock = asyncio.Lock()
+
+    async def send_frame(sid: int, status: int, data: bytes | None = None):
+        meta = struct.pack("!HBB", sid, status, MUX_OPT_DATA if data else 0)
+        out = struct.pack("!H", len(meta)) + meta
+        if data:
+            out += struct.pack("!H", len(data)) + data
+        async with send_lock:
+            await send(out)
+
+    async def pump_down(sid: int, reader):
+        """Forward one target's replies back as Keep frames until it closes."""
+        try:
+            while True:
+                chunk = await reader.read(16384)
+                if not chunk:
+                    break
+                await bump(uid, 0, len(chunk))
+                for i in range(0, len(chunk), MUX_MAX_FRAME):
+                    await send_frame(sid, MUX_KEEP, chunk[i:i + MUX_MAX_FRAME])
+        except Exception:
+            pass
+        finally:
+            if subs.pop(sid, None):
+                await send_frame(sid, MUX_END)
+
+    async def close_sub(sid: int):
+        s = subs.pop(sid, None)
+        if not s:
+            return
+        task = s.get("task")
+        if task:
+            task.cancel()
+        try:
+            s["writer"].close()
+        except Exception:
+            pass
+
+    try:
+        while True:
+            hdr = await stream.read_exact(2)
+            if not hdr:
+                break
+            meta_len = struct.unpack("!H", hdr)[0]
+            if meta_len == 0:
+                continue                       # spec allows an empty keepalive tick
+            meta = await stream.read_exact(meta_len)
+            if not meta or len(meta) < 4:
+                break
+            sid = struct.unpack("!H", meta[0:2])[0]
+            status, option = meta[2], meta[3]
+
+            target = None
+            if status == MUX_NEW and len(meta) >= 8:
+                net_type = meta[4]
+                port = struct.unpack("!H", meta[5:7])[0]
+                atype, p = meta[7], 8
+                host = None
+                try:
+                    if atype == 1:
+                        host = str(ipaddress.IPv4Address(meta[p:p + 4]))
+                    elif atype == 2:
+                        ln = meta[p]; p += 1
+                        host = meta[p:p + ln].decode(errors="ignore")
+                    elif atype == 3:
+                        host = str(ipaddress.IPv6Address(meta[p:p + 16]))
+                except Exception:
+                    host = None
+                target = (net_type, host, port)
+
+            data = b""
+            if option & MUX_OPT_DATA:
+                dl = await stream.read_exact(2)
+                if not dl:
+                    break
+                dlen = struct.unpack("!H", dl)[0]
+                if dlen:
+                    data = await stream.read_exact(dlen) or b""
+
+            if status == MUX_NEW:
+                if not target:
+                    await send_frame(sid, MUX_END)
+                    continue
+                net_type, host, port = target
+                # TCP only, same policy as the non-mux path; UDP sub-streams are refused
+                # without tearing the tunnel down.
+                if net_type != 1 or not host or port == 0 or blocked(host):
+                    await send_frame(sid, MUX_END)
+                    continue
+                try:
+                    reader, writer = await dial_target(host, port, direct, pid)
+                except Exception:
+                    await send_frame(sid, MUX_END)
+                    continue
+                subs[sid] = {"writer": writer}
+                if data:
+                    writer.write(data)
+                    await writer.drain()
+                    await bump(uid, len(data), 0)
+                subs[sid]["task"] = asyncio.create_task(pump_down(sid, reader))
+
+            elif status == MUX_KEEP:
+                s = subs.get(sid)
+                if s and data:
+                    try:
+                        s["writer"].write(data)
+                        await s["writer"].drain()
+                        await bump(uid, len(data), 0)
+                    except Exception:
+                        await close_sub(sid)
+
+            elif status == MUX_END:
+                await close_sub(sid)
+            # MUX_KEEPALIVE: nothing to do
+    finally:
+        for sid in list(subs):
+            await close_sub(sid)
 
 
 # ══════════════════════════ XHTTP (packet-up) ══════════════════════════
