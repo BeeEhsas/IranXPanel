@@ -13,12 +13,22 @@ DOMAIN     = "your-app.up.railway.app"  # public domain, no https://
 WS_PATH    = "ws"   # path for VLESS + WebSocket + TLS
 XHTTP_PATH = "xh"   # path for VLESS + XHTTP + TLS  (must differ from WS_PATH)
 
+# Uplink shape advertised in generated XHTTP configs. The server always accepts both,
+# so changing this never breaks links that are already out there.
+#   stream-up   one long-lived POST carries the whole uplink → 2 requests per connection
+#   packet-up   one POST per upload chunk → hundreds of requests a minute per client
+# Behind a Cloudflare Worker relay, packet-up is what drains the daily request quota.
+# WS is cheaper still: 1 request per connection, however long it lasts.
+XHTTP_MODE = "stream-up"
+
 [optional]
 ADMIN_PASSWORD = ""              # pre-seed the password, skips the setup page
 DB_PATH        = "/tmp/panel.db" # use /data/panel.db with a persistent volume
 DEVICE_WINDOW  = "300"           # seconds an IP counts as an active device
 LIVE_WINDOW    = "60"            # seconds an IP shows as "connected right now"
-SESSION_IDLE   = "90"            # seconds before an idle XHTTP session is dropped
+SESSION_IDLE   = "90"            # seconds before a DETACHED XHTTP session is dropped
+                                 # (a session with its uplink/downlink still attached is
+                                 #  never reaped, so long-lived stream-up tunnels survive)
 PANEL_TITLE    = "IranX Panel"
 
 [relay]

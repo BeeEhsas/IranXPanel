@@ -4,8 +4,22 @@ IranX Panel v3  —  VLESS over WebSocket+TLS  and  VLESS over XHTTP+TLS
 Single-file FastAPI panel.  Deploy on Railway / Render / any ASGI host.
 
 The hosting platform terminates TLS, so clients speak:
-    wss://<domain>/<WS_PATH>                    →  type=ws
-    https://<domain>/<XHTTP_PATH>/<session>     →  type=xhttp  (packet-up mode)
+    wss://<domain>/<WS_PATH>                      →  type=ws
+    https://<domain>/<XHTTP_PATH>/<session>       →  type=xhttp
+
+XHTTP uplink shape depends on the client's `mode`, and all of them are served:
+    stream-up   POST /<XHTTP_PATH>/<session>          one long-lived streamed body
+    packet-up   POST /<XHTTP_PATH>/<session>/<seq>    one request per upload chunk
+
+Request cost, when a Cloudflare Worker relay sits in front:
+    ws          1 request per connection, for the whole life of the tunnel
+    stream-up   2 requests per connection (one GET downlink + one POST uplink)
+    packet-up   1 GET plus one POST per uploaded chunk — an active client can be
+                hundreds of requests a minute, which drains a Worker's daily quota
+
+XHTTP_MODE picks what the generated configs advertise; it defaults to stream-up.
+Both uplink shapes stay accepted regardless, so configs already in the wild keep
+working after an upgrade.
 
 Both inbounds are implemented in pure Python and share one VLESS session core.
 
@@ -30,13 +44,14 @@ import sqlite3
 import ipaddress
 from urllib.parse import quote
 from contextlib import asynccontextmanager
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Any
 
 import jwt
 from fastapi import (FastAPI, Request, WebSocket, HTTPException, Depends,
                      Cookie, Body)
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, StreamingResponse, Response)
+from starlette.requests import ClientDisconnect
 from pydantic import BaseModel
 
 # ────────────────────────────── CONFIG ──────────────────────────────
@@ -66,6 +81,20 @@ KEEPALIVE_MINS  = max(1, int(os.getenv("KEEPALIVE_MINUTES", "10")))
 
 JWT_ALG, JWT_TTL, GB = "HS256", 60 * 60 * 12, 1024 ** 3
 TRANSPORTS = ("ws", "xhttp", "both")
+
+# XHTTP uplink shape advertised in generated configs.
+#   stream-up  — the whole uplink is one long-lived POST: 2 requests per connection.
+#   packet-up  — one POST per upload chunk: hundreds of requests a minute per client,
+#                which is what drains a Cloudflare Worker relay's daily quota.
+# The server accepts both shapes no matter what this is set to, so existing configs
+# keep working; this only decides what new links tell clients to use.
+XHTTP_MODES = ("stream-up", "packet-up")
+XHTTP_MODE = os.getenv("XHTTP_MODE", "stream-up").strip().lower()
+if XHTTP_MODE not in XHTTP_MODES:
+    XHTTP_MODE = "stream-up"
+
+# Transports whose request count scales with traffic rather than with connections.
+COSTLY_TRANSPORTS = ("xhttp", "both")
 
 # ────────────────────────────── DATABASE ──────────────────────────────
 
@@ -99,30 +128,8 @@ CREATE TABLE IF NOT EXISTS clean_ips (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     address  TEXT UNIQUE NOT NULL,
     remark   TEXT DEFAULT '',
-    country  TEXT DEFAULT '',
     enabled  INTEGER DEFAULT 1,
     added_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS proxies (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind         TEXT    DEFAULT 'socks5',
-    host         TEXT    NOT NULL,
-    port         INTEGER NOT NULL,
-    username     TEXT    DEFAULT '',
-    password     TEXT    DEFAULT '',
-    remark       TEXT    DEFAULT '',
-    country      TEXT    DEFAULT '',
-    country_name TEXT    DEFAULT '',
-    city         TEXT    DEFAULT '',
-    isp          TEXT    DEFAULT '',
-    exit_ip      TEXT    DEFAULT '',
-    healthy      INTEGER DEFAULT 0,
-    latency_ms   INTEGER DEFAULT 0,
-    last_error   TEXT    DEFAULT '',
-    checked_at   INTEGER DEFAULT 0,
-    enabled      INTEGER DEFAULT 1,
-    added_at     INTEGER NOT NULL,
-    UNIQUE(kind, host, port, username)
 );
 CREATE TABLE IF NOT EXISTS user_ips (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,17 +167,7 @@ def now() -> int:
 def migrate():
     """Add columns that older databases may be missing."""
     wanted = {"users": [("transport", "TEXT DEFAULT 'both'")],
-              "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
-              "clean_ips": [("country", "TEXT DEFAULT ''")],
-              "proxies": [("country", "TEXT DEFAULT ''"),
-                          ("country_name", "TEXT DEFAULT ''"),
-                          ("city", "TEXT DEFAULT ''"),
-                          ("isp", "TEXT DEFAULT ''"),
-                          ("exit_ip", "TEXT DEFAULT ''"),
-                          ("healthy", "INTEGER DEFAULT 0"),
-                          ("latency_ms", "INTEGER DEFAULT 0"),
-                          ("last_error", "TEXT DEFAULT ''"),
-                          ("checked_at", "INTEGER DEFAULT 0")]}
+              "user_ips": [("proto", "TEXT DEFAULT 'ws'")]}
     with db() as c:
         for table, cols in wanted.items():
             have = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
@@ -509,275 +506,6 @@ BLOCKED = [ipaddress.ip_network(x) for x in
             "169.254.0.0/16", "::1/128", "fc00::/7")]
 
 
-# ════════════════════════ OUTBOUND PROXY (socks5 / socks4 / http) ════════════
-#
-#  Every VLESS session dials its target through dial_target(). When a proxy is
-#  marked active, that dial is wrapped in a proxy handshake, so the destination
-#  site sees the proxy's IP instead of the Railway/Render one.
-#
-#  "strict" (the default) means a broken proxy fails the session instead of
-#  silently falling back to the platform IP, which would leak the real exit.
-
-PROXY_KINDS = ("socks5", "socks4", "http")
-IP_CHECK_HOST = "ip-api.com"
-IP_CHECK_PATH = "/json/?fields=status,message,country,countryCode,city,isp,query"
-
-
-def proxy_strict() -> bool:
-    # Default to false on Railway (ephemeral environment) to avoid connection refused
-    # when proxies are unreachable. User can override by setting PROXY_STRICT=1
-    return (get_setting("proxy_strict") or "0") == "1"
-
-
-def active_proxy():
-    """The proxy every outbound connection should ride, or None for direct."""
-    pid = get_setting("active_proxy") or ""
-    if not pid.isdigit():
-        return None
-    with db() as c:
-        return c.execute("SELECT * FROM proxies WHERE id=? AND enabled=1",
-                         (int(pid),)).fetchone()
-
-
-def proxy_by_id(pid: int):
-    """One enabled proxy, looked up by the id carried in the inbound path."""
-    with db() as c:
-        return c.execute("SELECT * FROM proxies WHERE id=? AND enabled=1",
-                         (int(pid),)).fetchone()
-
-
-def sub_proxies():
-    """Every enabled proxy that passed its health check, fastest first.
-
-    These are exactly the proxies a subscription lists, so a working proxy joins
-    the user's config list on its own and a failing one drops out — no arming step.
-    """
-    with db() as c:
-        return c.execute("""SELECT * FROM proxies WHERE enabled=1 AND healthy=1
-                            ORDER BY latency_ms IS NULL, latency_ms, id""").fetchall()
-
-
-def preferred_proxy():
-    """Fallback for the plain inbound path used by older subscriptions."""
-    rows = sub_proxies()
-    return rows[0] if rows else active_proxy()
-
-
-def _addr_bytes(host: str) -> bytes:
-    """SOCKS5 address field: literal IPv4/IPv6 when possible, else a hostname."""
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        h = host.encode()[:255]
-        return b"\x03" + bytes([len(h)]) + h
-    return (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
-
-
-async def _socks5(reader, writer, host, port, user, pwd):
-    writer.write(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")
-    await writer.drain()
-    ver, method = await reader.readexactly(2)
-    if ver != 5:
-        raise OSError("socks5: not a socks5 proxy")
-    if method == 0x02:
-        if not user:
-            raise OSError("socks5: proxy wants a username/password")
-        u, p = user.encode()[:255], (pwd or "").encode()[:255]
-        writer.write(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
-        await writer.drain()
-        if (await reader.readexactly(2))[1] != 0:
-            raise OSError("socks5: username/password rejected")
-    elif method != 0x00:
-        raise OSError("socks5: no shared auth method")
-
-    writer.write(b"\x05\x01\x00" + _addr_bytes(host) + port.to_bytes(2, "big"))
-    await writer.drain()
-    head = await reader.readexactly(4)
-    if head[1] != 0:
-        raise OSError("socks5: target refused (code %d)" % head[1])
-    atyp = head[3]
-    if atyp == 1:
-        await reader.readexactly(4)
-    elif atyp == 4:
-        await reader.readexactly(16)
-    elif atyp == 3:
-        await reader.readexactly((await reader.readexactly(1))[0])
-    await reader.readexactly(2)          # bound port
-
-
-async def _socks4(reader, writer, host, port, user):
-    """SOCKS4, falling back to SOCKS4a when the target is a hostname."""
-    try:
-        packed, tail = ipaddress.IPv4Address(host).packed, b""
-    except ipaddress.AddressValueError:
-        packed, tail = b"\x00\x00\x00\x01", host.encode()[:255] + b"\x00"
-    writer.write(b"\x04\x01" + port.to_bytes(2, "big") + packed +
-                 (user or "").encode()[:255] + b"\x00" + tail)
-    await writer.drain()
-    resp = await reader.readexactly(8)
-    if resp[1] != 0x5a:
-        raise OSError("socks4: target refused (code 0x%02x)" % resp[1])
-
-
-async def _http_connect(reader, writer, host, port, user, pwd):
-    req = "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n" % (host, port, host, port)
-    if user:
-        cred = base64.b64encode(("%s:%s" % (user, pwd or "")).encode()).decode()
-        req += "Proxy-Authorization: Basic %s\r\n" % cred
-    req += "Proxy-Connection: keep-alive\r\n\r\n"
-    writer.write(req.encode())
-    await writer.drain()
-
-    head = b""
-    while b"\r\n\r\n" not in head:
-        chunk = await reader.read(2048)
-        if not chunk:
-            raise OSError("http proxy: connection closed during CONNECT")
-        head += chunk
-        if len(head) > 32768:
-            raise OSError("http proxy: response header too long")
-    first = head.split(b"\r\n", 1)[0].decode("latin1")
-    parts = first.split(" ")
-    if len(parts) < 2 or not parts[1].startswith("2"):
-        raise OSError("http proxy: %s" % first)
-
-
-async def open_via_proxy(px, host: str, port: int, timeout: float = 15.0):
-    """Open a TCP leg to host:port through one proxy row."""
-    kind = (px["kind"] or "socks5").lower()
-    if kind not in PROXY_KINDS:
-        raise OSError("unsupported proxy kind: %s" % kind)
-    user = px["username"] or ""
-    pwd = px["password"] or ""
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(px["host"], int(px["port"])), timeout=timeout)
-    try:
-        if kind == "socks5":
-            await asyncio.wait_for(_socks5(reader, writer, host, port, user, pwd),
-                                   timeout=timeout)
-        elif kind == "socks4":
-            await asyncio.wait_for(_socks4(reader, writer, host, port, user),
-                                   timeout=timeout)
-        else:
-            await asyncio.wait_for(_http_connect(reader, writer, host, port, user, pwd),
-                                   timeout=timeout)
-    except Exception:
-        try:
-            writer.close()
-        except Exception:
-            pass
-        raise
-    return reader, writer
-
-
-async def dial_target(host: str, port: int, direct: bool = False,
-                      pid: int | None = None):
-    """The single outbound path for user traffic.
-
-    The inbound path decides the exit: "-d" leaves from the host's own IP, "-p<id>"
-    leaves through that one proxy, and the plain path follows the fastest healthy
-    proxy so subscriptions handed out earlier keep working.
-    """
-    px = None
-    if not direct:
-        px = proxy_by_id(pid) if pid else preferred_proxy()
-    if px:
-        try:
-            return await open_via_proxy(px, host, port, timeout=15)
-        except Exception as exc:
-            audit("proxy-fail", "", "%s %s:%s \\u2192 %s" %
-                  (px["kind"], px["host"], px["port"], exc))
-            mark_proxy_down(px["id"], str(exc))
-            if proxy_strict():
-                raise
-            # Non-strict mode: fall back to direct connection
-            pass
-    return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=12)
-
-
-def mark_proxy_down(pid: int, err: str):
-    with db() as c:
-        c.execute("UPDATE proxies SET healthy=0, last_error=?, checked_at=? WHERE id=?",
-                  (err[:200], now(), pid))
-
-
-async def probe_proxy(px) -> dict:
-    """Health check: ride the proxy to an IP-echo service and read the exit IP.
-
-    Plain HTTP on purpose \u2014 no TLS stack needed on top of the proxied socket,
-    and the response carries the country, city and ISP of the exit node.
-    """
-    start = time.perf_counter()
-    reader, writer = await open_via_proxy(px, IP_CHECK_HOST, 80, timeout=12)
-    try:
-        writer.write(("GET " + IP_CHECK_PATH + " HTTP/1.1\r\n"
-                      "Host: " + IP_CHECK_HOST + "\r\n"
-                      "User-Agent: IranXPanel/3\r\n"
-                      "Accept: application/json\r\n"
-                      "Connection: close\r\n\r\n").encode())
-        await writer.drain()
-        raw = b""
-        while len(raw) < 65536:
-            try:
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=8)
-            except asyncio.TimeoutError:
-                break            # some proxies never forward the server's close
-            if not chunk:
-                break
-            raw += chunk
-            head, _, body = raw.partition(b"\r\n\r\n")
-            if body.rstrip().endswith(b"}"):
-                break            # the JSON answer is already complete
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-    ms = int((time.perf_counter() - start) * 1000)
-    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else raw
-    data = {}
-    match = re.search(rb"\{.*\}", body, re.S)      # tolerate chunked bodies
-    if match:
-        try:
-            data = json.loads(match.group(0).decode("utf-8", "replace"))
-        except Exception:
-            data = {}
-    if not data:
-        raise OSError("proxy answered, but the IP echo was unreadable")
-    if (data.get("status") or "success") != "success":
-        raise OSError("ip lookup failed: %s" % (data.get("message") or "unknown"))
-
-    return {"latency_ms": ms,
-            "exit_ip": str(data.get("query") or ""),
-            "country": str(data.get("countryCode") or "").upper()[:2],
-            "country_name": str(data.get("country") or ""),
-            "city": str(data.get("city") or ""),
-            "isp": str(data.get("isp") or "")}
-
-
-async def run_proxy_test(pid: int) -> dict:
-    """Probe one stored proxy and persist what came back."""
-    with db() as c:
-        px = c.execute("SELECT * FROM proxies WHERE id=?", (pid,)).fetchone()
-    if not px:
-        raise HTTPException(404, "proxy not found")
-    try:
-        res = await probe_proxy(px)
-    except Exception as exc:
-        msg = str(exc) or exc.__class__.__name__
-        mark_proxy_down(pid, msg)
-        return {"ok": False, "error": msg[:200], "id": pid}
-    with db() as c:
-        c.execute("""UPDATE proxies SET healthy=1, latency_ms=?, exit_ip=?, country=?,
-                            country_name=?, city=?, isp=?, last_error='', checked_at=?
-                     WHERE id=?""",
-                  (res["latency_ms"], res["exit_ip"], res["country"],
-                   res["country_name"], res["city"], res["isp"], now(), pid))
-    res.update({"ok": True, "id": pid, "flag": flag_of(res["country"])})
-    return res
-
-
 def blocked(host: str) -> bool:
     try:
         a = ipaddress.ip_address(host)
@@ -809,8 +537,7 @@ def authorize(uid_str: str, ip: str, proto: str):
 
 async def relay_session(stream: ByteStream,
                         send: Callable[[bytes], Awaitable[None]],
-                        ip: str, proto: str, direct: bool = False,
-                        pid: int | None = None) -> None:
+                        ip: str, proto: str) -> None:
     """Shared VLESS handling: authenticate, dial the target, pump both ways."""
     parsed = await parse_vless(stream)
     if not parsed:
@@ -827,7 +554,8 @@ async def relay_session(stream: ByteStream,
     if blocked(host) or port == 0:
         raise PermissionError("blocked destination")
 
-    reader, writer = await dial_target(host, port, direct, pid)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(host, port), timeout=12)
 
     await send(b"\x00\x00")            # VLESS response header
 
@@ -874,12 +602,16 @@ async def relay_session(stream: ByteStream,
         pass
 
 
-# ══════════════════════════ XHTTP (packet-up) ══════════════════════════
+# ══════════════════════════ XHTTP ══════════════════════════
 #
 #  Downlink :  GET  /<XHTTP_PATH>/<session>          → streamed response body
-#  Uplink   :  POST /<XHTTP_PATH>/<session>/<seq>    → one ordered chunk
+#  Uplink   :  POST /<XHTTP_PATH>/<session>          → one streamed body   (stream-up)
+#              POST /<XHTTP_PATH>/<session>/<seq>    → one ordered chunk   (packet-up)
 #
-#  Chunks may arrive out of order, so each session keeps a reorder buffer.
+#  Both uplink shapes are served side by side: which one a client uses is its own
+#  choice of `mode`, and a panel upgrade must not break links already handed out.
+#  packet-up chunks may arrive out of order, so each session keeps a reorder buffer.
+#  stream-up needs no buffer — the bytes arrive in order on a single request.
 
 class XSession:
     def __init__(self, sid: str, ip: str):
@@ -892,6 +624,8 @@ class XSession:
         self.touched = time.time()
         self.worker: Optional[asyncio.Task] = None
         self.closed = False
+        self.uplink_open = False      # a stream-up POST is currently attached
+        self.downlink_open = False    # the GET downlink is currently attached
 
     def touch(self):
         self.touched = time.time()
@@ -899,8 +633,13 @@ class XSession:
     async def send(self, data: bytes):
         await self.out.put(data)
 
+    def feed(self, data: bytes):
+        """Append in-order uplink bytes (stream-up)."""
+        self.touch()
+        self.stream.feed(data)
+
     def push(self, seq: int, data: bytes):
-        """Insert an uplink chunk, forwarding everything now contiguous."""
+        """Insert an uplink chunk, forwarding everything now contiguous (packet-up)."""
         self.touch()
         if seq < self.next_seq:
             return
@@ -925,13 +664,10 @@ SESSIONS: dict[str, XSession] = {}
 SID_RE = re.compile(r"^[A-Za-z0-9._\-]{4,64}$")
 
 
-def get_session(sid: str, ip: str, direct: bool = False,
-                pid: int | None = None) -> XSession:
+def get_session(sid: str, ip: str) -> XSession:
     s = SESSIONS.get(sid)
     if s is None or s.closed:
         s = XSession(sid, ip)
-        s.direct = direct
-        s.pid = pid
         SESSIONS[sid] = s
         s.worker = asyncio.create_task(run_session(s))
     s.touch()
@@ -940,9 +676,7 @@ def get_session(sid: str, ip: str, direct: bool = False,
 
 async def run_session(s: XSession):
     try:
-        await relay_session(s.stream, s.send, s.ip, "xhttp",
-                            getattr(s, "direct", False),
-                            getattr(s, "pid", None))
+        await relay_session(s.stream, s.send, s.ip, "xhttp")
     except Exception:
         pass
     finally:
@@ -951,10 +685,19 @@ async def run_session(s: XSession):
 
 
 async def reaper():
+    """Drop sessions nothing is attached to any more.
+
+    A stream-up tunnel can sit idle for a long time with its uplink POST and downlink
+    GET still open; reaping those would force a reconnect and undo the whole point of
+    the mode, so only detached sessions are considered.
+    """
     while True:
         await asyncio.sleep(20)
         cutoff = time.time() - SESSION_IDLE
         for sid, s in list(SESSIONS.items()):
+            if s.uplink_open or s.downlink_open:
+                s.touch()
+                continue
             if s.touched < cutoff:
                 s.close()
                 SESSIONS.pop(sid, None)
@@ -992,6 +735,7 @@ async def xhttp_down(session: str, request: Request):
         raise HTTPException(404)
     ip = client_ip(request)
     s = get_session(session, ip)
+    s.downlink_open = True
 
     async def gen():
         try:
@@ -1003,12 +747,44 @@ async def xhttp_down(session: str, request: Request):
         except asyncio.CancelledError:
             pass
         finally:
+            s.downlink_open = False
             s.close()
 
     return StreamingResponse(gen(), headers=NOBUF_HEADERS)
 
 
-# ── XHTTP uplink ──
+# ── XHTTP uplink, stream-up: one long-lived request carries the whole uplink ──
+@app.post("/" + XHTTP_PATH + "/{session}")
+async def xhttp_up_stream(session: str, request: Request):
+    """Read the request body incrementally instead of buffering it.
+
+    This is what makes stream-up cheap: the client opens one POST and keeps writing
+    into it, so a relay in front of the panel sees a single request per connection
+    rather than one per chunk. `request.stream()` hands us each piece as it lands.
+    """
+    if not SID_RE.match(session):
+        raise HTTPException(404)
+    ip = client_ip(request)
+    s = get_session(session, ip)
+    if s.uplink_open:                     # one streamed uplink per session
+        raise HTTPException(409, "uplink already attached")
+    s.uplink_open = True
+    try:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            s.feed(chunk)
+            if s.closed:
+                break
+    except (asyncio.CancelledError, ClientDisconnect):
+        pass
+    finally:
+        s.uplink_open = False
+        s.close()                         # the tunnel dies with its uplink
+    return Response(status_code=200, headers=NOBUF_HEADERS)
+
+
+# ── XHTTP uplink, packet-up: one request per ordered chunk ──
 @app.post("/" + XHTTP_PATH + "/{session}/{seq}")
 async def xhttp_up(session: str, seq: str, request: Request):
     if not SID_RE.match(session) or not seq.isdigit():
@@ -1021,88 +797,10 @@ async def xhttp_up(session: str, seq: str, request: Request):
     return Response(status_code=200, headers=NOBUF_HEADERS)
 
 
-# ── XHTTP, no-proxy variant ──
-#  Same protocol on "<XHTTP_PATH>-d"; session keys are namespaced so a direct and a
-#  proxied session can never collide.
-
-@app.get("/" + XHTTP_PATH + "-d/{session}")
-async def xhttp_down_direct(session: str, request: Request):
-    if not SID_RE.match(session):
-        raise HTTPException(404)
-    s = get_session("d." + session, client_ip(request), True)
-
-    async def gen():
-        try:
-            while True:
-                item = await s.out.get()
-                if item is None:
-                    break
-                yield item
-        except asyncio.CancelledError:
-            pass
-        finally:
-            s.close()
-
-    return StreamingResponse(gen(), headers=NOBUF_HEADERS)
-
-
-@app.post("/" + XHTTP_PATH + "-d/{session}/{seq}")
-async def xhttp_up_direct(session: str, seq: str, request: Request):
-    if not SID_RE.match(session) or not seq.isdigit():
-        raise HTTPException(404)
-    s = get_session("d." + session, client_ip(request), True)
-    body = await request.body()
-    if body:
-        s.push(int(seq), body)
-    return Response(status_code=200, headers=NOBUF_HEADERS)
-
-
-# ── XHTTP, per-proxy variants ──
-#  "<XHTTP_PATH>-p<id>" always leaves through proxy <id>. Session keys are namespaced
-#  per route, so the same client id on two routes never shares a session.
-
-@app.get("/" + XHTTP_PATH + "-p{pid}/{session}")
-async def xhttp_down_proxy(pid: int, session: str, request: Request):
-    if not SID_RE.match(session) or pid <= 0:
-        raise HTTPException(404)
-    s = get_session("p%d.%s" % (pid, session), client_ip(request), False, pid)
-
-    async def gen():
-        try:
-            while True:
-                item = await s.out.get()
-                if item is None:
-                    break
-                yield item
-        except asyncio.CancelledError:
-            pass
-        finally:
-            s.close()
-
-    return StreamingResponse(gen(), headers=NOBUF_HEADERS)
-
-
-@app.post("/" + XHTTP_PATH + "-p{pid}/{session}/{seq}")
-async def xhttp_up_proxy(pid: int, session: str, seq: str, request: Request):
-    if not SID_RE.match(session) or not seq.isdigit() or pid <= 0:
-        raise HTTPException(404)
-    s = get_session("p%d.%s" % (pid, session), client_ip(request), False, pid)
-    body = await request.body()
-    if body:
-        s.push(int(seq), body)
-    return Response(status_code=200, headers=NOBUF_HEADERS)
-
-
 # ── WebSocket inbound (catch-all, validated inside) ──
 @app.websocket("/{path:path}")
 async def vless_ws(websocket: WebSocket, path: str):
-    p = path.strip("/")
-    direct = p == WS_PATH + "-d"          # the platform-exit variant
-    pid = None
-    m = re.match(r"^" + re.escape(WS_PATH) + r"-p([1-9][0-9]{0,8})$", p)
-    if m:
-        pid = int(m.group(1))             # this route rides one named proxy
-    if p != WS_PATH and not direct and pid is None:
+    if path.strip("/") != WS_PATH:
         await websocket.close(code=1008)
         return
     ip = client_ip(websocket)
@@ -1113,7 +811,7 @@ async def vless_ws(websocket: WebSocket, path: str):
         await websocket.send_bytes(data)
 
     try:
-        await relay_session(stream, send, ip, "ws", direct, pid)
+        await relay_session(stream, send, ip, "ws")
     except PermissionError:
         try:
             await websocket.close(code=1008)
@@ -1161,99 +859,18 @@ def fmt_bytes(b: int) -> str:
     return f"{n:.1f} {units[i]}" if i else f"{int(n)} {units[i]}"
 
 
-def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
-           pid: int | None = None) -> str:
-    path = WS_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
+def ws_uri(row, address: str, host: str, label: str) -> str:
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome&alpn=http%2F1.1"
-            f"&type=ws&host={host}&path=%2F{path}"
+            f"&type=ws&host={host}&path=%2F{WS_PATH}"
             f"#{quote(label)}")
 
 
-def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False,
-              pid: int | None = None) -> str:
-    path = XHTTP_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
+def xhttp_uri(row, address: str, host: str, label: str) -> str:
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome"
-            f"&type=xhttp&host={host}&path=%2F{path}&mode=packet-up"
+            f"&type=xhttp&host={host}&path=%2F{XHTTP_PATH}&mode={XHTTP_MODE}"
             f"#{quote(label)}")
-
-
-# ─────────────────────── country flags in config names ───────────────────────
-
-COUNTRY_WORDS = {
-    "germany": "DE", "deutschland": "DE", "\u0622\u0644\u0645\u0627\u0646": "DE", "frankfurt": "DE",
-    "netherlands": "NL", "holland": "NL", "\u0647\u0644\u0646\u062f": "NL", "amsterdam": "NL",
-    "france": "FR", "\u0641\u0631\u0627\u0646\u0633\u0647": "FR", "paris": "FR",
-    "england": "GB", "britain": "GB", "london": "GB", "\u0627\u0646\u06af\u0644\u06cc\u0633": "GB",
-    "finland": "FI", "\u0641\u0646\u0644\u0627\u0646\u062f": "FI", "sweden": "SE", "\u0633\u0648\u0626\u062f": "SE",
-    "poland": "PL", "\u0644\u0647\u0633\u062a\u0627\u0646": "PL", "austria": "AT", "\u0627\u062a\u0631\u06cc\u0634": "AT",
-    "switzerland": "CH", "\u0633\u0648\u0626\u06cc\u0633": "CH", "spain": "ES", "\u0627\u0633\u067e\u0627\u0646\u06cc\u0627": "ES",
-    "italy": "IT", "\u0627\u06cc\u062a\u0627\u0644\u06cc\u0627": "IT", "romania": "RO", "\u0631\u0648\u0645\u0627\u0646\u06cc": "RO",
-    "turkey": "TR", "turkiye": "TR", "\u062a\u0631\u06a9\u06cc\u0647": "TR", "istanbul": "TR",
-    "russia": "RU", "\u0631\u0648\u0633\u06cc\u0647": "RU", "emirates": "AE", "dubai": "AE", "\u0627\u0645\u0627\u0631\u0627\u062a": "AE",
-    "qatar": "QA", "\u0642\u0637\u0631": "QA", "oman": "OM", "\u0639\u0645\u0627\u0646": "OM",
-    "armenia": "AM", "\u0627\u0631\u0645\u0646\u0633\u062a\u0627\u0646": "AM", "georgia": "GE", "\u06af\u0631\u062c\u0633\u062a\u0627\u0646": "GE",
-    "india": "IN", "\u0647\u0646\u062f": "IN", "singapore": "SG", "\u0633\u0646\u06af\u0627\u067e\u0648\u0631": "SG",
-    "japan": "JP", "\u0698\u0627\u067e\u0646": "JP", "korea": "KR", "\u06a9\u0631\u0647": "KR",
-    "canada": "CA", "\u06a9\u0627\u0646\u0627\u062f\u0627": "CA", "america": "US", "usa": "US", "\u0622\u0645\u0631\u06cc\u06a9\u0627": "US",
-    "iran": "IR", "\u0627\u06cc\u0631\u0627\u0646": "IR", "australia": "AU", "\u0627\u0633\u062a\u0631\u0627\u0644\u06cc\u0627": "AU",
-    "brazil": "BR", "\u0628\u0631\u0632\u06cc\u0644": "BR", "denmark": "DK", "\u062f\u0627\u0646\u0645\u0627\u0631\u06a9": "DK",
-    "norway": "NO", "\u0646\u0631\u0648\u0698": "NO", "belgium": "BE", "\u0628\u0644\u0698\u06cc\u06a9": "BE",
-    "czech": "CZ", "\u0686\u06a9": "CZ", "hungary": "HU", "\u0645\u062c\u0627\u0631\u0633\u062a\u0627\u0646": "HU",
-    "lithuania": "LT", "latvia": "LV", "estonia": "EE", "ireland": "IE", "\u0627\u06cc\u0631\u0644\u0646\u062f": "IE",
-    "ukraine": "UA", "\u0627\u0648\u06a9\u0631\u0627\u06cc\u0646": "UA", "kazakhstan": "KZ", "\u0642\u0632\u0627\u0642\u0633\u062a\u0627\u0646": "KZ",
-    "hongkong": "HK", "hong kong": "HK", "\u0647\u0646\u06af\u200c\u06a9\u0646\u06af": "HK",
-    "cloudflare": "", "cdn": "",
-}
-
-ISO2_RE = re.compile(r"(?:^|[\s\-_\[\(#|])([A-Za-z]{2})(?:$|[\s\-_\]\)#|])")
-
-
-def flag_of(code: str) -> str:
-    """ISO-3166 alpha-2 -> regional-indicator flag (e.g. DE -> German flag)."""
-    c = re.sub(r"[^A-Za-z]", "", code or "")[:2].upper()
-    if len(c) != 2:
-        return ""
-    return "".join(chr(0x1F1E6 + ord(ch) - 65) for ch in c)
-
-
-def guess_country(text: str) -> str:
-    """Best-effort country code from a free-text label such as 'DE Frankfurt'."""
-    low = (text or "").strip().lower()
-    if not low:
-        return ""
-    for word, code in COUNTRY_WORDS.items():
-        if word and word in low:
-            return code
-    m = ISO2_RE.search(" " + low + " ")
-    return m.group(1).upper() if m else ""
-
-
-def cip_flag(cip) -> str:
-    """Flag for one clean IP: the stored country wins, otherwise guess it."""
-    try:
-        stored = cip["country"]
-    except (KeyError, IndexError):
-        stored = ""
-    return flag_of(stored) or flag_of(guess_country(cip["remark"] or ""))
-
-
-def main_flag() -> str:
-    return flag_of(get_setting("main_country") or "")
-
-
-def proxy_flag() -> str:
-    """Flag of the active proxy: with one armed, that is the real exit country."""
-    if (get_setting("flag_source") or "proxy") != "proxy":
-        return ""
-    px = active_proxy()
-    if not px:
-        return ""
-    try:
-        return flag_of(px["country"] or "")
-    except Exception:
-        return ""
 
 
 def build_configs(row, host: str, clean_ips) -> list[dict]:
@@ -1264,47 +881,17 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     if t in ("xhttp", "both"):
         kinds.append(("XHTTP", xhttp_uri))
 
-    # Every route sits in the same subscription, side by side: first the host's own
-    # exit (Render / Railway) flagged with the server country, then one route per
-    # healthy proxy flagged with that proxy's exit country. A proxy shows up here as
-    # soon as its health check passes — there is nothing to arm.
-    #
-    # Names carry only the flag, the account or clean-IP name, and the proxy's
-    # location — no transport tag and no "PX" marker.
-    server_flag = main_flag() or "\U0001f310"
-    by_proxy_flag = (get_setting("flag_source") or "proxy") == "proxy"
-    routes = [(server_flag, "", True, None)]
-    for px in sub_proxies():
-        try:
-            pflag = flag_of(px["country"] or "") or flag_of(guess_country(px["remark"] or ""))
-        except Exception:
-            pflag = ""
-        mark = (pflag or "\U0001f310") if by_proxy_flag else server_flag
-        try:
-            spot = px["city"] or px["country_name"] or px["remark"] or px["host"]
-        except Exception:
-            spot = px["host"]
-        spot = str(spot or "")[:20]
-        routes.append((mark, (" \u00b7 " + spot) if spot else "", False, px["id"]))
-
     out = []
-    for mark, suffix, direct, pid in routes:
-        for tag, fn in kinds:
-            # The panel domain resolves to the host itself, so it only makes sense for
-            # the server's own exit; proxy routes ride the clean IPs instead.
-            if direct:
-                title = f"{mark} {row['name']}{suffix}"
-                out.append({"label": f"{mark} {row['name']}{suffix} \u00b7 Default",
-                            "transport": tag,
-                            "uri": fn(row, host, host, title, direct, pid)})
-            for cip in clean_ips:
-                note = cip["remark"] or cip["address"]
-                cmark = (cip_flag(cip) or mark) if direct else mark
-                out.append({"label": f"{cmark} {note}{suffix}",
-                            "transport": tag,
-                            "uri": fn(row, cip["address"], host,
-                                      f"{cmark} {row['name']} \u00b7 {note}{suffix}",
-                                      direct, pid)})
+    for tag, fn in kinds:
+        out.append({"label": f"🌐 {row['name']} · {tag} · Default",
+                    "transport": tag,
+                    "uri": fn(row, host, host, f"🌐 {row['name']} · {tag}")})
+        for cip in clean_ips:
+            note = cip["remark"] or cip["address"]
+            out.append({"label": f"⚡ {note} · {tag}",
+                        "transport": tag,
+                        "uri": fn(row, cip["address"], host,
+                                  f"⚡ {row['name']} · {note} · {tag}")})
     return out
 
 
@@ -1394,35 +981,17 @@ class UserPatch(BaseModel):
 class CleanIpIn(BaseModel):
     address: str
     remark: str = ""
-    country: str = ""
-
-
-class CountryIn(BaseModel):
-    country: str = ""
 
 
 class CleanIpBulkIn(BaseModel):
     text: str
 
 
-class ProxyIn(BaseModel):
-    kind: str = "socks5"
-    host: str
-    port: int
-    username: str = ""
-    password: str = ""
-    remark: str = ""
-
-
-class ProxyPatch(BaseModel):
-    enabled: Optional[bool] = None
-    remark: Optional[str] = None
-    country: Optional[str] = None
-
-
-class ProxyModeIn(BaseModel):
-    strict: Optional[bool] = None
-    flag_source: Optional[str] = None
+class RestoreIn(BaseModel):
+    data: Any                      # the parsed backup object, or the raw JSON text
+    mode: str = "merge"            # merge | replace
+    restore_password: bool = False
+    force: bool = False            # accept a file whose checksum does not match
 
 
 # ────────────────────────────── SETUP & AUTH ──────────────────────────────
@@ -1668,26 +1237,7 @@ def valid_address(a: str) -> bool:
 async def list_clean_ips(_=Depends(require_admin)):
     with db() as c:
         rows = c.execute("SELECT * FROM clean_ips ORDER BY id DESC").fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        d["country"] = (d.get("country") or "").upper()
-        d["flag"] = cip_flag(r)
-        out.append(d)
-    return out
-
-
-@app.get("/api/main-country")
-async def read_main_country(_=Depends(require_admin)):
-    code = (get_setting("main_country") or "").upper()
-    return {"country": code, "flag": flag_of(code)}
-
-
-@app.post("/api/main-country")
-async def write_main_country(body: CountryIn, _=Depends(require_admin)):
-    code = re.sub(r"[^A-Za-z]", "", body.country or "")[:2].upper()
-    set_setting("main_country", code)
-    return {"ok": True, "country": code, "flag": flag_of(code)}
+    return [dict(r) for r in rows]
 
 
 @app.post("/api/clean-ips")
@@ -1696,11 +1246,9 @@ async def add_clean_ip(body: CleanIpIn, _=Depends(require_admin)):
     if not valid_address(addr):
         raise HTTPException(400, "invalid IP or domain")
     try:
-        remark = body.remark.strip()[:40]
-        code = re.sub(r"[^A-Za-z]", "", body.country or "")[:2].upper() or guess_country(remark)
         with db() as c:
-            c.execute("INSERT INTO clean_ips(address,remark,country,enabled,added_at) "
-                      "VALUES(?,?,?,1,?)", (addr, remark, code, now()))
+            c.execute("INSERT INTO clean_ips(address,remark,enabled,added_at) "
+                      "VALUES(?,?,1,?)", (addr, body.remark.strip()[:40], now()))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "already in the list")
     return {"ok": True}
@@ -1720,9 +1268,8 @@ async def bulk_clean_ips(body: CleanIpBulkIn, _=Depends(require_admin)):
                 bad += 1
                 continue
             try:
-                c.execute("INSERT INTO clean_ips(address,remark,country,enabled,added_at) "
-                          "VALUES(?,?,?,1,?)",
-                          (addr, remark, guess_country(remark), now()))
+                c.execute("INSERT INTO clean_ips(address,remark,enabled,added_at) "
+                          "VALUES(?,?,1,?)", (addr, remark, now()))
                 added += 1
             except sqlite3.IntegrityError:
                 dup += 1
@@ -1754,208 +1301,335 @@ async def clear_clean_ips(_=Depends(require_admin)):
     return {"ok": True}
 
 
-# ────────────────────────────── PROXIES ──────────────────────────────
+# ────────────────────────── BACKUP & RESTORE ──────────────────────────
+#
+# One portable file holds everything an admin configured: users (with their UUIDs and
+# subscription tokens, so existing client configs keep working), clean IPs, the panel
+# password hash, and the environment the panel was running under.
+#
+# Format: a single JSON document, extension .ixpbak, wrapped as
+#     {"format": "iranx-panel-backup", "version": 1, "checksum": "...", "payload": {...}}
+# The checksum is a SHA-256 over the canonical payload, so a truncated or edited file is
+# caught before anything is written. Restores are transactional: either the whole payload
+# lands or the database is left exactly as it was.
 
-def proxy_out(r) -> dict:
-    """Public shape of a proxy row \u2014 credentials are never echoed back."""
-    d = dict(r)
-    d.pop("password", None)
-    d["has_auth"] = bool(r["username"])
-    d["flag"] = flag_of(r["country"] or "") or flag_of(guess_country(r["remark"] or ""))
-    d["label"] = "%s://%s:%s" % (r["kind"], r["host"], r["port"])
-    return d
+BACKUP_FORMAT = "iranx-panel-backup"
+BACKUP_VERSION = 1
+
+# Runtime settings that live in the environment, not the database. They are recorded for
+# reference and shown on restore, because a new host needs them set by hand — the panel
+# cannot rewrite its own platform variables.
+ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
+            "DEVICE_WINDOW", "LIVE_WINDOW", "SESSION_IDLE", "PANEL_TITLE",
+            "KEEPALIVE", "KEEPALIVE_MINUTES")
+
+USER_FIELDS = ("name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
+               "used_bytes", "expire_at", "device_limit", "transport", "created_at")
+CIP_FIELDS = ("address", "remark", "enabled", "added_at")
 
 
-@app.get("/api/proxies")
-async def list_proxies(_=Depends(require_admin)):
+def _canon(obj) -> bytes:
+    """Stable serialisation so the checksum does not depend on key order."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode()
+
+
+def _checksum(payload) -> str:
+    return hashlib.sha256(_canon(payload)).hexdigest()
+
+
+def current_env() -> dict:
+    return {
+        "DOMAIN": DOMAIN,
+        "RELAY_DOMAIN": RELAY_DOMAIN,
+        "WS_PATH": WS_PATH,
+        "XHTTP_PATH": XHTTP_PATH,
+        "XHTTP_MODE": XHTTP_MODE,
+        "DEVICE_WINDOW": str(DEVICE_WINDOW),
+        "LIVE_WINDOW": str(LIVE_WINDOW),
+        "SESSION_IDLE": str(SESSION_IDLE),
+        "PANEL_TITLE": PANEL_TITLE,
+        "KEEPALIVE": "1" if KEEPALIVE else "0",
+        "KEEPALIVE_MINUTES": str(KEEPALIVE_MINS),
+    }
+
+
+def build_backup(include_password: bool = True, include_traffic: bool = False) -> dict:
     with db() as c:
-        rows = c.execute("SELECT * FROM proxies ORDER BY id DESC").fetchall()
-    act = get_setting("active_proxy") or ""
-    return {"proxies": [proxy_out(r) for r in rows],
-            "sub_ids": [r["id"] for r in sub_proxies()],
-            "active_id": int(act) if act.isdigit() else 0,
-            "strict": proxy_strict(),
-            "flag_source": get_setting("flag_source") or "proxy"}
+        users = [dict(r) for r in c.execute("SELECT * FROM users ORDER BY id")]
+        cips = [dict(r) for r in c.execute("SELECT * FROM clean_ips ORDER BY id")]
+        settings = {r["key"]: r["value"] for r in c.execute("SELECT * FROM settings")}
+        traffic = ([dict(r) for r in c.execute(
+            "SELECT user_id, ts, up, down FROM traffic_log ORDER BY id")]
+            if include_traffic else [])
+
+    if not include_password:
+        settings = {k: v for k, v in settings.items() if not k.startswith("password")}
+
+    payload = {
+        "created_at": now(),
+        "panel_version": 3,
+        "env": current_env(),
+        "users": [{k: u[k] for k in USER_FIELDS} for u in users],
+        "clean_ips": [{k: ci[k] for k in CIP_FIELDS} for ci in cips],
+        "settings": settings,
+        "traffic_log": traffic,
+    }
+    return {
+        "format": BACKUP_FORMAT,
+        "version": BACKUP_VERSION,
+        "checksum": _checksum(payload),
+        "payload": payload,
+    }
 
 
-@app.post("/api/proxies")
-async def add_proxy(body: ProxyIn, _=Depends(require_admin)):
-    kind = (body.kind or "socks5").strip().lower()
-    if kind not in PROXY_KINDS:
-        raise HTTPException(400, "kind must be socks5, socks4 or http")
-    host = (body.host or "").strip().lstrip("[").rstrip("]")
-    if not host or len(host) > 255 or " " in host:
-        raise HTTPException(400, "invalid proxy host")
-    if not 1 <= int(body.port) <= 65535:
-        raise HTTPException(400, "invalid proxy port")
-    if kind == "socks4" and body.password:
-        raise HTTPException(400, "socks4 has no password field \u2014 leave it empty")
-    with db() as c:
+def parse_backup(raw, force: bool = False) -> dict:
+    """Validate an uploaded backup and return its payload."""
+    if isinstance(raw, (str, bytes)):
         try:
-            cur = c.execute("""INSERT INTO proxies(kind,host,port,username,password,
-                                                   remark,country,added_at)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (kind, host, int(body.port), body.username.strip(),
-                             body.password, body.remark.strip()[:80],
-                             guess_country(body.remark or ""), now()))
-        except sqlite3.IntegrityError:
-            raise HTTPException(409, "this proxy is already in the list")
-        pid = cur.lastrowid
-    audit("proxy-add", "", "%s %s:%s" % (kind, host, body.port))
-    return await run_proxy_test(pid)          # a fresh proxy is tested at once
+            raw = json.loads(raw)
+        except Exception:
+            raise HTTPException(400, "not a valid backup file (JSON could not be parsed)")
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "not a valid backup file")
+    if raw.get("format") != BACKUP_FORMAT:
+        raise HTTPException(400, "this file is not an IranX Panel backup")
+    ver = raw.get("version")
+    if not isinstance(ver, int) or ver > BACKUP_VERSION:
+        raise HTTPException(400, f"backup version {ver} is newer than this panel supports")
+
+    payload = raw.get("payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "backup has no payload")
+
+    supplied = raw.get("checksum")
+    if supplied and supplied != _checksum(payload) and not force:
+        raise HTTPException(400, "checksum mismatch — the file looks corrupted or edited. "
+                                 "Restore again with force to use it anyway.")
+
+    if not isinstance(payload.get("users", []), list) or \
+       not isinstance(payload.get("clean_ips", []), list):
+        raise HTTPException(400, "backup structure is invalid")
+    return payload
 
 
-PROXY_URI_RE = re.compile(
-    r"^(?:(?P<kind>socks5h?|socks4a?|https?)://)?"
-    r"(?:(?P<user>[^:@/\s]*)(?::(?P<pw>[^@/\s]*))?@)?"
-    r"(?P<host>\[[0-9A-Fa-f:]+\]|[^:@/\s]+)[:\s]+(?P<port>\d{1,5})"
-    r"/?$", re.I)
+def _clean_user(u: dict) -> Optional[dict]:
+    """Coerce one backup user row into something safe to insert, or None to skip it."""
+    if not isinstance(u, dict):
+        return None
+    name = str(u.get("name", "")).strip()
+    if not NAME_RE.match(name):
+        return None
+    try:
+        uid = str(uuid.UUID(str(u.get("uuid", "")).strip()))
+    except Exception:
+        return None
 
-KIND_ALIASES = {"socks5h": "socks5", "socks4a": "socks4", "https": "http"}
-
-
-def parse_proxy_uri(line: str) -> dict:
-    """One pasted line -> proxy fields.
-
-    Accepted: socks5://1.2.3.4:1080, socks5://user:pass@host:1080#label,
-    http://host:8080, and a bare 1.2.3.4:1080 (assumed socks5).
-    """
-    raw = (line or "").strip()
-    if not raw or raw.startswith("#") or raw.startswith("//"):
-        return {}
-    remark = ""
-    if "#" in raw:
-        raw, remark = raw.split("#", 1)
-        raw, remark = raw.strip(), remark.strip()[:80]
-    m = PROXY_URI_RE.match(raw)
-    if not m:
-        raise ValueError("unreadable — use kind://host:port")
-    kind = (m.group("kind") or "socks5").lower()
-    kind = KIND_ALIASES.get(kind, kind)
-    if kind not in PROXY_KINDS:
-        raise ValueError("kind must be socks5, socks4 or http")
-    port = int(m.group("port"))
-    if not 1 <= port <= 65535:
-        raise ValueError("port out of range")
-    user, pw = m.group("user") or "", m.group("pw") or ""
-    if kind == "socks4":
-        pw = ""                       # socks4 carries a user id only
-    return {"kind": kind,
-            "host": m.group("host").strip("[]"),
-            "port": port,
-            "username": user,
-            "password": pw,
-            "remark": remark}
-
-
-class ProxyBulkIn(BaseModel):
-    text: str = ""
-
-
-@app.post("/api/proxies/bulk")
-async def add_proxies_bulk(body: ProxyBulkIn, _=Depends(require_admin)):
-    """Adds a pasted list (one proxy per line) and health-tests each entry."""
-    results = []
-    for line in (body.text or "").splitlines()[:50]:
-        if not line.strip():
-            continue
-        shown = line.strip()[:60]
+    def num(key, default=0):
         try:
-            fields = parse_proxy_uri(line)
-        except ValueError as exc:
-            results.append({"ok": False, "label": shown, "error": str(exc)})
+            return max(0, int(u.get(key, default) or 0))
+        except (TypeError, ValueError):
+            return default
+
+    tr = str(u.get("transport", "both")).lower()
+    token = str(u.get("sub_token", "") or "").strip()
+    return {
+        "name": name,
+        "uuid": uid,
+        # A missing or absurd token would break the subscription URL, so mint a new one.
+        "sub_token": token if re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", token) else secrets.token_urlsafe(16),
+        "note": str(u.get("note", "") or "")[:200],
+        "enabled": 1 if u.get("enabled", 1) else 0,
+        "quota_bytes": num("quota_bytes"),
+        "used_bytes": num("used_bytes"),
+        "expire_at": num("expire_at"),
+        "device_limit": num("device_limit", 1),
+        "transport": tr if tr in TRANSPORTS else "both",
+        "created_at": num("created_at") or now(),
+    }
+
+
+def apply_backup(payload: dict, mode: str = "merge",
+                 restore_password: bool = False) -> dict:
+    """Write a validated payload into the database inside one transaction."""
+    users = [x for x in (_clean_user(u) for u in payload.get("users", [])) if x]
+    skipped_users = len(payload.get("users", [])) - len(users)
+
+    cips, skipped_cips = [], 0
+    for ci in payload.get("clean_ips", []):
+        if not isinstance(ci, dict):
+            skipped_cips += 1
             continue
-        if not fields:
+        addr = str(ci.get("address", "")).strip()
+        if not valid_address(addr):
+            skipped_cips += 1
             continue
-        shown = "%s://%s:%s" % (fields["kind"], fields["host"], fields["port"])
         try:
-            res = await add_proxy(ProxyIn(**fields), None)
-            res["label"] = shown
-            results.append(res)
-        except HTTPException as exc:
-            results.append({"ok": False, "label": shown, "error": str(exc.detail)})
-    return {"results": results}
+            added = int(ci.get("added_at") or 0)
+        except (TypeError, ValueError):
+            added = 0
+        cips.append((addr, str(ci.get("remark", "") or "")[:40],
+                     1 if ci.get("enabled", 1) else 0, added or now()))
+
+    stats = {"users_added": 0, "users_updated": 0, "users_skipped": skipped_users,
+             "clean_ips_added": 0, "clean_ips_skipped": skipped_cips,
+             "password_restored": False, "traffic_rows": 0, "mode": mode}
+
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if mode == "replace":
+            conn.execute("DELETE FROM user_ips")
+            conn.execute("DELETE FROM traffic_log")
+            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM clean_ips")
+
+        # name and uuid are both UNIQUE, so a row can collide on either one.
+        for u in users:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE name=? OR uuid=?", (u["name"], u["uuid"])
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE users SET name=?, uuid=?, sub_token=?, note=?, enabled=?,
+                           quota_bytes=?, used_bytes=?, expire_at=?, device_limit=?,
+                           transport=?, created_at=? WHERE id=?""",
+                    (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
+                     u["quota_bytes"], u["used_bytes"], u["expire_at"],
+                     u["device_limit"], u["transport"], u["created_at"], existing["id"]))
+                stats["users_updated"] += 1
+                continue
+            try:
+                conn.execute(
+                    """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
+                                         used_bytes,expire_at,device_limit,transport,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
+                     u["quota_bytes"], u["used_bytes"], u["expire_at"],
+                     u["device_limit"], u["transport"], u["created_at"]))
+                stats["users_added"] += 1
+            except sqlite3.IntegrityError:
+                # sub_token is UNIQUE too; retry once with a fresh one.
+                try:
+                    conn.execute(
+                        """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
+                                             used_bytes,expire_at,device_limit,transport,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (u["name"], u["uuid"], secrets.token_urlsafe(16), u["note"],
+                         u["enabled"], u["quota_bytes"], u["used_bytes"], u["expire_at"],
+                         u["device_limit"], u["transport"], u["created_at"]))
+                    stats["users_added"] += 1
+                except sqlite3.IntegrityError:
+                    stats["users_skipped"] += 1
+
+        for addr, remark, enabled, added in cips:
+            try:
+                conn.execute("INSERT INTO clean_ips(address,remark,enabled,added_at) "
+                             "VALUES(?,?,?,?)", (addr, remark, enabled, added))
+                stats["clean_ips_added"] += 1
+            except sqlite3.IntegrityError:
+                conn.execute("UPDATE clean_ips SET remark=?, enabled=? WHERE address=?",
+                             (remark, enabled, addr))
+
+        settings = payload.get("settings") or {}
+        if isinstance(settings, dict):
+            for k, v in settings.items():
+                if not isinstance(k, str) or not isinstance(v, (str, int, float)):
+                    continue
+                if k.startswith("password") and not restore_password:
+                    continue
+                conn.execute("""INSERT INTO settings(key,value) VALUES(?,?)
+                                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                             (k, str(v)))
+            if restore_password and settings.get("password_hash") and settings.get("password_salt"):
+                stats["password_restored"] = True
+
+        for row in payload.get("traffic_log") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                conn.execute("INSERT INTO traffic_log(user_id,ts,up,down) VALUES(?,?,?,?)",
+                             (int(row["user_id"]), int(row["ts"]),
+                              int(row.get("up", 0)), int(row.get("down", 0))))
+                stats["traffic_rows"] += 1
+            except (KeyError, TypeError, ValueError, sqlite3.Error):
+                pass
+
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"restore failed, nothing was changed: {e}")
+    finally:
+        conn.close()
+    return stats
 
 
-@app.post("/api/proxies/{pid}/test")
-async def test_proxy(pid: int, _=Depends(require_admin)):
-    return await run_proxy_test(pid)
+@app.get("/api/backup")
+async def download_backup(request: Request, password: int = 1, traffic: int = 0,
+                          _=Depends(require_admin)):
+    doc = build_backup(include_password=bool(password), include_traffic=bool(traffic))
+    body = json.dumps(doc, ensure_ascii=False, indent=1).encode()
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    host = (origin_domain(request).split(":")[0] or "panel").replace("/", "")
+    audit("backup_download", client_ip(request),
+          f"{len(doc['payload']['users'])} users, "
+          f"{len(doc['payload']['clean_ips'])} clean ips")
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{host}-{stamp}.ixpbak"',
+                 "Cache-Control": "no-store"})
 
 
-@app.post("/api/proxies/test-all")
-async def test_all_proxies(_=Depends(require_admin)):
+@app.get("/api/backup/info")
+async def backup_info(_=Depends(require_admin)):
+    """What a backup taken right now would contain."""
     with db() as c:
-        ids = [r["id"] for r in c.execute("SELECT id FROM proxies ORDER BY id")]
-    out = await asyncio.gather(*(run_proxy_test(i) for i in ids),
-                               return_exceptions=True)
-    return {"results": [r for r in out if isinstance(r, dict)]}
+        u = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        ci = c.execute("SELECT COUNT(*) n FROM clean_ips").fetchone()["n"]
+        tl = c.execute("SELECT COUNT(*) n FROM traffic_log").fetchone()["n"]
+    return {"users": u, "clean_ips": ci, "traffic_rows": tl,
+            "env": current_env(), "format": BACKUP_FORMAT, "version": BACKUP_VERSION}
 
 
-@app.post("/api/proxies/{pid}/activate")
-async def activate_proxy(pid: int, _=Depends(require_admin)):
-    """Arm one proxy (or pass 0 to go back to the platform IP)."""
-    if pid == 0:
-        set_setting("active_proxy", "")
-        audit("proxy-off", "", "direct outbound")
-        return {"ok": True, "active_id": 0}
-    with db() as c:
-        px = c.execute("SELECT * FROM proxies WHERE id=?", (pid,)).fetchone()
-    if not px:
-        raise HTTPException(404, "proxy not found")
-    if not px["enabled"]:
-        raise HTTPException(400, "enable the proxy before arming it")
-    res = await run_proxy_test(pid)
-    if not res.get("ok"):
-        raise HTTPException(400, "proxy failed its health check: %s" % res.get("error"))
-    set_setting("active_proxy", str(pid))
-    audit("proxy-on", "", "%s %s:%s (%s)" %
-          (px["kind"], px["host"], px["port"], res.get("country") or "?"))
-    return {"ok": True, "active_id": pid, "country": res.get("country"),
-            "flag": res.get("flag"), "exit_ip": res.get("exit_ip")}
+@app.post("/api/restore/preview")
+async def restore_preview(body: RestoreIn, _=Depends(require_admin)):
+    """Validate a file and describe it without touching the database."""
+    payload = parse_backup(body.data, force=body.force)
+    env = payload.get("env") or {}
+    live = current_env()
+    return {
+        "ok": True,
+        "created_at": payload.get("created_at"),
+        "users": len(payload.get("users", [])),
+        "clean_ips": len(payload.get("clean_ips", [])),
+        "traffic_rows": len(payload.get("traffic_log") or []),
+        "has_password": bool((payload.get("settings") or {}).get("password_hash")),
+        "env": env,
+        # Paths and mode are platform variables the panel cannot set for itself; the UI
+        # surfaces the differences so the admin knows what to change on the new host.
+        "env_diff": {k: {"backup": env.get(k), "current": live.get(k)}
+                     for k in ENV_KEYS if env.get(k) not in (None, live.get(k))},
+    }
 
 
-@app.post("/api/proxies/mode")
-async def set_proxy_mode(body: ProxyModeIn, _=Depends(require_admin)):
-    if body.strict is not None:
-        set_setting("proxy_strict", "1" if body.strict else "0")
-    if body.flag_source is not None:
-        src = body.flag_source if body.flag_source in ("proxy", "entry") else "proxy"
-        set_setting("flag_source", src)
-    return {"ok": True, "strict": proxy_strict(),
-            "flag_source": get_setting("flag_source") or "proxy"}
+@app.post("/api/restore")
+async def restore_backup(body: RestoreIn, request: Request, _=Depends(require_admin)):
+    mode = (body.mode or "merge").lower()
+    if mode not in ("merge", "replace"):
+        raise HTTPException(400, "mode must be merge or replace")
+    payload = parse_backup(body.data, force=body.force)
+    stats = apply_backup(payload, mode, body.restore_password)
+    audit("restore", client_ip(request),
+          f"mode={mode} +{stats['users_added']}/~{stats['users_updated']} users, "
+          f"+{stats['clean_ips_added']} clean ips")
+    return {"ok": True, **stats}
 
 
-@app.patch("/api/proxies/{pid}")
-async def patch_proxy(pid: int, body: ProxyPatch, _=Depends(require_admin)):
-    sets, args = [], []
-    if body.enabled is not None:
-        sets.append("enabled=?"); args.append(1 if body.enabled else 0)
-    if body.remark is not None:
-        sets.append("remark=?"); args.append(body.remark.strip()[:80])
-    if body.country is not None:
-        sets.append("country=?")
-        args.append(re.sub(r"[^A-Za-z]", "", body.country)[:2].upper())
-    if not sets:
-        return {"ok": True}
-    args.append(pid)
-    with db() as c:
-        c.execute("UPDATE proxies SET %s WHERE id=?" % ",".join(sets), args)
-    if body.enabled is False and (get_setting("active_proxy") or "") == str(pid):
-        set_setting("active_proxy", "")      # never keep a disabled proxy armed
-    return {"ok": True}
-
-
-@app.delete("/api/proxies/{pid}")
-async def delete_proxy(pid: int, _=Depends(require_admin)):
-    with db() as c:
-        c.execute("DELETE FROM proxies WHERE id=?", (pid,))
-    if (get_setting("active_proxy") or "") == str(pid):
-        set_setting("active_proxy", "")
-    audit("proxy-del", "", "id=%d" % pid)
-    return {"ok": True}
-
-
-# ─────────────────────────────── STATS ──────────────────────────────
+# ────────────────────────────── STATS ──────────────────────────────
 
 @app.get("/api/stats")
 async def stats(_=Depends(require_admin)):
@@ -1983,6 +1657,7 @@ async def stats(_=Depends(require_admin)):
             "xhttp_sessions": len(SESSIONS),
             "series": [dict(r) for r in series],
             "ws_path": WS_PATH, "xhttp_path": XHTTP_PATH,
+            "xhttp_mode": XHTTP_MODE,
             "device_window": DEVICE_WINDOW, "live_window": LIVE_WINDOW,
             "keepalive": KEEPALIVE, "keepalive_mins": KEEPALIVE_MINS,
             "relay_domain": RELAY_DOMAIN}
@@ -2490,9 +2165,6 @@ CLIENTS: list[dict] = [
     {"os": "ios", "name": "V2Box", "repo": "App Store", "accent": "#0ea5e9",
      "logo": "", "scheme": "v2box",
      "builds": [{"label": "iPhone / iPad", "url": APPLE + "/v2box-v2ray-client/id6446814690", "note": "App Store"}]},
-    {"os": "ios", "name": "FoXray", "repo": "App Store", "accent": "#f97316",
-     "logo": "", "scheme": "",
-     "builds": [{"label": "iPhone / iPad", "url": APPLE + "/foxray/id6448898396", "note": "App Store"}]},
     # ─── macOS ───
     {"os": "macos", "name": "Hiddify", "repo": HID, "accent": "#22c55e",
      "logo": LOGO_HID, "scheme": "hiddify",
@@ -2859,6 +2531,7 @@ function paintConfigs(){
   $("#cfgs").innerHTML = D.configs.length ? D.configs.map((c,i)=>`
   <div class="cfg">
     <span class="nm">${esc(c.label)}</span>
+    <span class="tag ${c.transport==="XHTTP"?"x":""}">${esc(c.transport)}</span>
     <button class="ico" data-qr="${i}" title="${esc(t("showQr"))}" aria-label="${esc(t("showQr"))}">${ICON_QR}</button>
     <button class="ico" data-copy="${i}" title="${esc(t("copyCfg"))}" aria-label="${esc(t("copyCfg"))}">${ICON_COPY}</button>
     <div class="cfgqr" data-box="${i}" hidden></div>
@@ -3020,43 +2693,25 @@ async def healthz():
 # ════════════════════════════ FRONTEND ════════════════════════════
 
 THEME_CSS = r"""
-html,body{overflow-x:hidden;max-width:100%}
-/* three themes only: black+blue, white+blue, grey. Buttons are black on white text. */
-:root,[data-theme="dark"]{--bg:#000000;--panel:#07090f;--card:#0b0f17;--line:#1b2537;
-      --txt:#f2f6fc;--dim:#8fa3c0;--a1:#1d4ed8;--a2:#3b82f6;--ok:#34d399;--bad:#fb7185;--info:#38bdf8;
-      --btn:#000000;--btn-tx:#ffffff;--btn-line:#2f4570;--ring:#1d4ed855}
-[data-theme="light"]{--bg:#f3f7ff;--panel:#ffffff;--card:#ffffff;--line:#d3e0f5;
-      --txt:#0b1c38;--dim:#5b7a9c;--a1:#1d4ed8;--a2:#3b82f6;--ok:#15803d;--bad:#b91c1c;--info:#0369a1;
-      --btn:#0b0f17;--btn-tx:#ffffff;--btn-line:#0b0f17;--ring:#1d4ed833}
-[data-theme="gray"]{--bg:#1a1d21;--panel:#22262b;--card:#282d33;--line:#3a424c;
-      --txt:#eef1f5;--dim:#a7b0bc;--a1:#3f6fd1;--a2:#5b8ae6;--ok:#4ade80;--bad:#f87171;--info:#60a5fa;
-      --btn:#0d0f12;--btn-tx:#ffffff;--btn-line:#0d0f12;--ring:#3f6fd155}
+:root{--bg:#020617;--panel:#0b1220;--card:#ffffff0d;--line:#ffffff17;--txt:#e2e8f0;
+      --dim:#94a3b8;--a1:#6366f1;--a2:#d946ef;--ok:#34d399;--bad:#fb7185;--info:#38bdf8}
+[data-theme="ocean"]{--bg:#04121f;--panel:#07203a;--a1:#0ea5e9;--a2:#22d3ee}
+[data-theme="forest"]{--bg:#04160f;--panel:#062718;--a1:#10b981;--a2:#84cc16}
+[data-theme="sunset"]{--bg:#1a0710;--panel:#2b0c1a;--a1:#f97316;--a2:#ec4899}
+[data-theme="violet"]{--bg:#0e0524;--panel:#190a3a;--a1:#8b5cf6;--a2:#c026d3}
+[data-theme="light"]{--bg:#f1f5f9;--panel:#ffffff;--card:#ffffff;--line:#0f172a17;
+                     --txt:#0f172a;--dim:#64748b;--a1:#4f46e5;--a2:#c026d3}
 body{background:var(--bg);color:var(--txt)}
 .card{background:var(--card);border:1px solid var(--line)}
 .grad{background-image:linear-gradient(to right,var(--a1),var(--a2))}
-/* every action button: solid black, white text */
-button.grad,a.grad.btn,.btn-solid{background-image:none;background:var(--btn);color:var(--btn-tx);
-  border:1px solid var(--btn-line)}
-button.grad:hover,.btn-solid:hover{filter:brightness(1.25)}
-button.grad:focus-visible,.btn-solid:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
-.ic{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;
-    stroke-linecap:round;stroke-linejoin:round}
-.ic-lg{width:22px;height:22px}
-.icbox{display:grid;place-items:center}
 .dim{color:var(--dim)}
 .inp{background:color-mix(in srgb,var(--bg) 65%,#8881);border:1px solid var(--line);color:var(--txt)}
 .inp:focus{border-color:var(--a1);outline:none}
 .soft{background:color-mix(in srgb,var(--txt) 8%,transparent)}
-.sw{width:44px;height:24px;background:var(--line);position:relative;transition:.18s;flex:none}
-.sw:after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:18px;height:18px;
-  border-radius:50%;background:var(--txt);transition:.18s}
-.sw.on{background:var(--a1)}
-.sw.on:after{inset-inline-start:23px;background:#fff}
 .navi{display:flex;align-items:center;gap:.6rem;padding:.7rem .9rem;border-radius:.85rem;
       font-size:.85rem;cursor:pointer;transition:.15s}
 .navi:hover{background:color-mix(in srgb,var(--txt) 7%,transparent)}
-.navi.on{background:var(--btn);color:var(--btn-tx);font-weight:700;border:1px solid var(--btn-line)}
-.navi.on .ic{stroke:var(--btn-tx)}
+.navi.on{background-image:linear-gradient(to right,var(--a1),var(--a2));color:#fff;font-weight:700}
 .sheet{background:var(--panel)}
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
@@ -3071,7 +2726,6 @@ const I18N={
   password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخیره و ورود',
   pwRule:'حداقل ۸ کاراکتر شامل حرف بزرگ، حرف کوچک و عدد',netErr:'خطای شبکه',
   navDash:'داشبورد',navUsers:'مدیریت کاربران',navClean:'Clean IP',
-  navProxy:'پروکسی',
   navSettings:'تنظیمات پنل',navLogs:'رخدادها',menu:'منو',
   totalUsers:'کل کاربران',online:'کاربران آنلاین',devices:'دستگاه‌های متصل',
   traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'سشن‌های XHTTP',
@@ -3079,6 +2733,17 @@ const I18N={
   newUser:'ساخت کاربر جدید',users:'کاربران',
   name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',
   transport:'ترنسپورت',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 هر دو',
+  trWarnTitle:'⚠️ مصرف رکوئست XHTTP:',
+  trWarn:'مصرف این ترنسپورت به حالت (mode) بستگی دارد. در stream-up — که پیش‌فرض این پنل '
+        +'است — هر اتصال ۲ رکوئست می‌شود (یک GET برای دانلود و یک POST بلندمدت برای آپلود). '
+        +'در packet-up هر تکه از آپلود یک POST جداگانه است و یک کاربر فعال دقیقه‌ای صدها '
+        +'رکوئست می‌سازد که سهمیه روزانه ورکر کلادفلر (۱۰۰٬۰۰۰) را زود پر می‌کند. WS از همه '
+        +'کم‌مصرف‌تر است: هر اتصال فقط ۱ رکوئست، هر چقدر هم طول بکشد. حالت فعلی در بخش '
+        +'«تنظیمات پنل ← اطلاعات سرور» نشان داده می‌شود و با متغیر محیطی XHTTP_MODE عوض می‌شود.',
+  xhModeLbl:'حالت XHTTP',
+  xhModeHint:'حالت روی packet-up است و برای هر تکه آپلود یک رکوئست جدا می‌فرستد. اگر رله '
+        +'کلادفلر دارید، XHTTP_MODE را به stream-up تغییر دهید تا هر اتصال فقط ۲ رکوئست شود. '
+        +'کانفیگ‌های قبلی همچنان کار می‌کنند، ولی کاربران باید لینک اشتراک را یک بار به‌روز کنند.',
   add:'افزودن',zeroInf:'۰ = بی‌نهایت. «تعداد دستگاه» بر اساس IP یکتای فعال محاسبه می‌شود.',
   search:'جستجو…',noUsers:'کاربری نیست',
   config:'کانفیگ',ipsBtn:'IP ها',edit:'ویرایش',
@@ -3101,35 +2766,35 @@ const I18N={
   addrPh:'مثلا 1.2.3.4 یا cdn.example.com',remarkPh:'برچسب (اختیاری)',
   bulkPh:'چند مورد، هر خط یکی:\n1.2.3.4 # ایرانسل\n5.6.7.8 # همراه اول',
   bulkAdd:'افزودن انبوه',clearAll:'حذف همه',
-  pxTitle:'پروکسی خروجی',
-  pxHint:'با فعال کردن یک پروکسی، تمام ترافیک کاربران از همان مسیر خارج می‌شود و سایت‌ها ایپی پروکسی را می‌بینند.',
-  pxKind:'نوع',pxHost:'هاست / ایپی',pxPort:'پورت',
-  pxUser:'یوزرنیم (اختیاری)',pxPass:'پسورد (اختیاری)',
-  pxAdd:'افزودن و تست',pxTestAll:'تست همه',
-  pxInSub:'در ساب',
-  pxAutoNote:'هر پروکسی که تستش سالم باشد خودبه‌خود در ساب همه کاربران می‌آید — همه با هم، بدون دکمه. کانفیگ بدون پروکسی همیشه سر جایش هست؛ پروکسی خراب خودبه‌خود حذف می‌شود.',
-  pxLineHint:'هر خط یک پروکسی — مانند socks5://1.1.1.1:5866 یا http://user:pass@2.2.2.2:8080',
-  pxAddLines:'افزودن لیست و تست',
-  pxAdvanced:'ورود دستی فیلدها',
-  pxDirect:'اتصال مستقیم (بدون پروکسی)',
-  pxActive:'فعال',pxArm:'فعال کردن',pxTest:'تست سلامت',
-  pxHealthy:'سالم',pxDown:'خراب',pxUntested:'تست نشده',
-  pxExitIp:'ایپی خروجی',pxLatency:'تاخیر',
-  pxNone:'هنوز پروکسی اضافه نشده است',
-  pxStrict:'حالت سختگیرانه',
-  pxStrictHint:'اگر پروکسی قطع شد، اتصال رد می‌شود تا ایپی اصلی سرور لو نرود',
-  pxFlagSrc:'منبع پرچم نام کانفیگ',
-  pxFlagProxy:'کشور پروکسی',pxFlagEntry:'کشور سرور ورودی',
-  pxTesting:'در حال تست...',pxArmed:'پروکسی فعال شد',
-  pxDelWarn:'این پروکسی حذف شود؟',
   addedN:'افزوده شد',dupN:'تکراری',invalidN:'نامعتبر',noCleanIps:'لیست خالی است',
   settings:'تنظیمات',appearance:'ظاهر',theme:'تم',language:'زبان',
-  thDark:'تیره (مشکی و آبی)',thLight:'روشن (سفید و آبی)',thGray:'خاکستری',
-  country:'کشور',autoCountry:'تشخیص خودکار',mainCountry:'کشور سرور اصلی',
-  flagsHint:'پرچم کشور به ابتدای نام کانفیگ‌ها در لینک اشتراک اضافه می‌شود',
-  savedOk:'ذخیره شد',save:'ذخیره',
   changePw:'تغییر رمز عبور',curPw:'رمز فعلی',newPw:'رمز جدید',pwChanged:'رمز تغییر کرد ✓',
   serverInfo:'اطلاعات سرور',wsPathLbl:'مسیر WebSocket',xhPathLbl:'مسیر XHTTP',
+  backupTitle:'📦 پشتیبان‌گیری',
+  backupHint:'یک فایل با پسوند .ixpbak که همهٔ کاربران (با UUID و توکن اشتراکشان)، '
+        +'آی‌پی‌های تمیز، رمز پنل و متغیرهای محیطی را نگه می‌دارد. همین فایل را در پنل '
+        +'جدید وارد کنید تا همه چیز برگردد — کانفیگ‌های دست کاربران هم کار می‌کنند چون '
+        +'UUID و توکن‌ها عوض نمی‌شوند.',
+  bkInclPw:'رمز پنل هم ذخیره شود',
+  bkInclTraffic:'تاریخچهٔ مصرف هم ذخیره شود (حجم فایل بیشتر می‌شود)',
+  btnBackupLbl:'⬇️ دانلود فایل پشتیبان',
+  restoreTitle:'♻️ بازگردانی',
+  restoreHint:'فایل .ixpbak را انتخاب کنید. اول محتوایش نمایش داده می‌شود و تا تأیید '
+        +'نکنید هیچ چیزی در دیتابیس نوشته نمی‌شود.',
+  restoreMode:'نحوهٔ بازگردانی',
+  bkMerge:'ادغام — کاربران موجود به‌روز و بقیه اضافه می‌شوند',
+  bkReplace:'جایگزینی کامل — همهٔ کاربران و آی‌پی‌های فعلی حذف می‌شوند',
+  bkRestorePwLbl:'رمز پنل هم از فایل بازگردانی شود',
+  btnRestoreLbl:'♻️ بازگردانی کن',
+  bkReading:'در حال خواندن فایل…',
+  bkBadFile:'فایل قابل خواندن نیست یا پشتیبان این پنل نیست',
+  bkFrom:'ساخته‌شده در',bkUsersN:'کاربر',bkCipsN:'آی‌پی تمیز',bkTrafficN:'رکورد مصرف',
+  bkHasPw:'شامل رمز پنل',bkNoPw:'بدون رمز پنل',
+  bkEnvDiff:'⚠️ این متغیرها با پنل فعلی تفاوت دارند و باید دستی در Railway/Render ست شوند:',
+  bkReplaceWarn:'همهٔ کاربران و آی‌پی‌های تمیز فعلی حذف و با فایل جایگزین می‌شوند. مطمئنی؟',
+  bkPwChanged:'رمز پنل از فایل بازگردانی شد — دفعهٔ بعد با رمز قدیمیِ همان فایل وارد شوید.',
+  bkDone:'بازگردانی انجام شد',
+  bkAdded:'اضافه‌شده',bkUpdated:'به‌روزشده',bkSkipped:'ردشده',
   relayLbl:'دامنه رله',keepAliveLbl:'جلوگیری از خواب',relayNone:'ندارد',
   onLbl:'فعال',offLbl:'خاموش',
   devWinLbl:'پنجره شمارش دستگاه',seconds:'ثانیه',
@@ -3143,7 +2808,6 @@ const I18N={
   password:'Password',confirm:'Confirm password',enter:'Sign in',save:'Save & enter',
   pwRule:'At least 8 chars with upper case, lower case and a digit',netErr:'Network error',
   navDash:'Dashboard',navUsers:'Users',navClean:'Clean IP',
-  navProxy:'Proxy',
   navSettings:'Panel settings',navLogs:'Events',menu:'Menu',
   totalUsers:'Total users',online:'Online users',devices:'Connected devices',
   traffic:'Total traffic',cleanIps:'Clean IPs',xSessions:'XHTTP sessions',
@@ -3151,6 +2815,17 @@ const I18N={
   newUser:'Create user',users:'Users',
   name:'Name',quota:'Quota (GB)',days:'Days',devLimit:'Devices',
   transport:'Transport',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 Both',
+  trWarnTitle:'⚠️ XHTTP request cost:',
+  trWarn:'Cost depends on the mode. stream-up — this panel\'s default — is 2 requests per '
+        +'connection (a GET downlink plus one long-lived POST uplink). packet-up sends every '
+        +'upload chunk as its own POST, so one active client can be hundreds of requests a '
+        +'minute and will drain a Cloudflare Worker\'s daily quota (100k). WS is cheapest of '
+        +'all: 1 request per connection no matter how long it stays open. The active mode is '
+        +'shown under Panel settings → Server info and is set with the XHTTP_MODE env var.',
+  xhModeLbl:'XHTTP mode',
+  xhModeHint:'The mode is packet-up, which spends one request per upload chunk. Behind a '
+        +'Cloudflare relay, set XHTTP_MODE=stream-up to get 2 requests per connection instead. '
+        +'Existing configs keep working, but users need to refresh their subscription once.',
   add:'Add',zeroInf:'0 = unlimited. Device count is based on distinct active IPs.',
   search:'Search…',noUsers:'No users yet',
   config:'Config',ipsBtn:'IPs',edit:'Edit',
@@ -3173,36 +2848,36 @@ const I18N={
   addrPh:'e.g. 1.2.3.4 or cdn.example.com',remarkPh:'Label (optional)',
   bulkPh:'One per line:\n1.2.3.4 # Irancell\n5.6.7.8 # MCI',
   bulkAdd:'Bulk add',clearAll:'Delete all',
-  pxTitle:'Outbound proxy',
-  pxHint:'Arm a proxy and every user connection leaves through it, so target sites see the proxy IP.',
-  pxKind:'Type',pxHost:'Host / IP',pxPort:'Port',
-  pxUser:'Username (optional)',pxPass:'Password (optional)',
-  pxAdd:'Add & test',pxTestAll:'Test all',
-  pxInSub:'in subscriptions',
-  pxAutoNote:'Every proxy that passes its health check joins all subscriptions automatically — all of them at once, no button. The no-proxy config is always there, and a failing proxy drops out on its own.',
-  pxLineHint:'One proxy per line — e.g. socks5://1.1.1.1:5866 or http://user:pass@2.2.2.2:8080',
-  pxAddLines:'Add list & test',
-  pxAdvanced:'Enter fields manually',
-  pxDirect:'Direct connection (no proxy)',
-  pxActive:'Active',pxArm:'Activate',pxTest:'Health test',
-  pxHealthy:'healthy',pxDown:'down',pxUntested:'untested',
-  pxExitIp:'Exit IP',pxLatency:'Latency',
-  pxNone:'No proxy added yet',
-  pxStrict:'Strict mode',
-  pxStrictHint:'If the proxy breaks, refuse the connection instead of leaking the server IP',
-  pxFlagSrc:'Flag shown in config names',
-  pxFlagProxy:'Proxy country',pxFlagEntry:'Entry server country',
-  pxTesting:'Testing...',pxArmed:'Proxy armed',
-  pxDelWarn:'Delete this proxy?',
   addedN:'added',dupN:'duplicates',invalidN:'invalid',noCleanIps:'List is empty',
   settings:'Settings',appearance:'Appearance',theme:'Theme',language:'Language',
-  thDark:'Dark (black & blue)',thLight:'Light (white & blue)',thGray:'Gray',
-  country:'Country',autoCountry:'Auto detect',mainCountry:'Main server country',
-  flagsHint:'The country flag is prepended to every config name in the subscription.',
-  savedOk:'Saved',save:'Save',
   changePw:'Change password',curPw:'Current password',newPw:'New password',
   pwChanged:'Password changed ✓',
   serverInfo:'Server info',wsPathLbl:'WebSocket path',xhPathLbl:'XHTTP path',
+  backupTitle:'📦 Backup',
+  backupHint:'A single .ixpbak file holding every user (with their UUID and subscription '
+        +'token), your clean IPs, the panel password and the environment variables. Import '
+        +'it into a fresh panel and everything comes back — configs already handed out keep '
+        +'working, because UUIDs and tokens are preserved.',
+  bkInclPw:'include the panel password',
+  bkInclTraffic:'include traffic history (larger file)',
+  btnBackupLbl:'⬇️ Download backup',
+  restoreTitle:'♻️ Restore',
+  restoreHint:'Pick a .ixpbak file. Its contents are shown first and nothing is written '
+        +'to the database until you confirm.',
+  restoreMode:'Restore mode',
+  bkMerge:'Merge — update matching users, add the rest',
+  bkReplace:'Replace — wipe current users and clean IPs first',
+  bkRestorePwLbl:'also restore the panel password from the file',
+  btnRestoreLbl:'♻️ Restore now',
+  bkReading:'Reading file…',
+  bkBadFile:'File cannot be read, or is not a backup from this panel',
+  bkFrom:'Created',bkUsersN:'users',bkCipsN:'clean IPs',bkTrafficN:'traffic rows',
+  bkHasPw:'includes the panel password',bkNoPw:'no panel password',
+  bkEnvDiff:'⚠️ These variables differ from this panel and must be set by hand in Railway/Render:',
+  bkReplaceWarn:'All current users and clean IPs will be deleted and replaced by the file. Continue?',
+  bkPwChanged:'The panel password was restored from the file — sign in with that file\'s password next time.',
+  bkDone:'Restore complete',
+  bkAdded:'added',bkUpdated:'updated',bkSkipped:'skipped',
   relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
   onLbl:'on',offLbl:'off',
   devWinLbl:'Device counting window',seconds:'seconds',
@@ -3212,9 +2887,7 @@ const I18N={
  }
 };
 let LANG=localStorage.getItem('lang')||'fa';
-const THEMES=['dark','light','gray'];
-let THEME=localStorage.getItem('theme')||'dark';
-if(!THEMES.includes(THEME)){THEME='light'===THEME?'light':'dark';localStorage.setItem('theme',THEME)}
+let THEME=localStorage.getItem('theme')||'default';
 const T=k=>I18N[LANG][k]||k;
 function applyChrome(){
  document.documentElement.lang=LANG;
@@ -3242,14 +2915,12 @@ AUTH_HTML = r"""<!DOCTYPE html><html><head>
   <select onchange="setLang(this.value)" id="langSel" class="inp rounded-lg px-2 py-1 text-xs">
    <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select>
   <select onchange="setTheme(this.value)" id="thSel" class="inp rounded-lg px-2 py-1 text-xs">
-   <option value="dark">Dark</option><option value="light">Light</option>
-   <option value="gray">Gray</option></select>
+   <option value="default">🌌 Midnight</option><option value="ocean">🌊 Ocean</option>
+   <option value="forest">🌿 Forest</option><option value="sunset">🌅 Sunset</option>
+   <option value="violet">🔮 Violet</option><option value="light">☀️ Light</option></select>
  </div>
  <div class="mb-6 text-center">
-  <div class="mx-auto mb-3 h-14 w-14 rounded-2xl grad grid place-items-center">
-   <svg viewBox="0 0 24 24" style="width:30px;height:30px;stroke:#fff;fill:none;stroke-width:1.6;stroke-linejoin:round">
-    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
-    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
+  <div class="mx-auto mb-3 h-14 w-14 rounded-2xl grad grid place-items-center text-2xl">⚡</div>
   <h1 id="h1" class="text-xl font-extrabold"></h1>
   <p id="sub" class="text-xs dim mt-1"></p>
  </div>
@@ -3307,12 +2978,8 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
         style="border-color:var(--line);background:color-mix(in srgb,var(--bg) 88%,transparent)">
  <div class="max-w-6xl mx-auto px-3 py-3 flex items-center gap-2">
   <button onclick="toggleNav()" aria-label="menu"
-          class="h-9 w-9 rounded-xl soft grid place-items-center">
-   <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
-  <div class="h-9 w-9 rounded-xl grad grid place-items-center text-white">
-   <svg class="ic" viewBox="0 0 24 24" style="stroke:#fff">
-    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
-    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
+          class="h-9 w-9 rounded-xl soft grid place-items-center text-lg">☰</button>
+  <div class="h-9 w-9 rounded-xl grad grid place-items-center">⚡</div>
   <h1 class="font-extrabold text-sm sm:text-base">{{TITLE}}</h1>
   <span id="crumb" class="text-[11px] dim px-2 py-1 rounded-lg soft hidden sm:inline"></span>
   <div class="flex-1"></div>
@@ -3326,42 +2993,24 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
         transition-transform duration-200 overflow-y-auto"
        style="border-inline-end:1px solid var(--line)">
  <div class="flex items-center gap-2 mb-4">
-  <div class="h-10 w-10 rounded-xl grad grid place-items-center">
-   <svg class="ic ic-lg" viewBox="0 0 24 24" style="stroke:#fff">
-    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
-    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
+  <div class="h-10 w-10 rounded-xl grad grid place-items-center text-lg">⚡</div>
   <div><p class="font-extrabold text-sm">{{TITLE}}</p>
        <p class="text-[10px] dim">admin</p></div>
-  <button onclick="toggleNav()" aria-label="close" class="ms-auto dim icbox h-8 w-8">
-   <svg class="ic" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  <button onclick="toggleNav()" class="ms-auto dim text-lg">✕</button>
  </div>
 
- <div class="navi" data-page="dash" onclick="go('dash')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M4 19V11M9.5 19V5M15 19v-6M20.5 19V8"/>
-   <path d="M3 21h18"/></svg><span data-t="navDash"></span></div>
- <div class="navi" data-page="users" onclick="go('users')">
-  <svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/>
-   <path d="M3.5 19.5c0-3 2.5-4.8 5.5-4.8s5.5 1.8 5.5 4.8"/>
-   <path d="M16.5 5.6a3 3 0 010 5.6M18 14.9c2 .6 3.4 2.2 3.4 4.6"/></svg><span data-t="navUsers"></span></div>
- <div class="navi" data-page="clean" onclick="go('clean')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/>
-   <path d="M9.4 14.6a2.8 2.8 0 002.6 2.6"/></svg><span data-t="navClean"></span></div>
- <div class="navi" data-page="proxy" onclick="go('proxy')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h6.5a3 3 0 013 3v4a3 3 0 003 3H20"/>
-   <path d="M17 4l3 3-3 3M17 14l3 3-3 3"/><circle cx="4" cy="7" r="1.6"/></svg>
-  <span data-t="navProxy"></span></div>
- <div class="navi" data-page="settings" onclick="go('settings')">
-  <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
-   <path d="M19.4 14.5a1.7 1.7 0 00.35 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.35 1.7 1.7 0 00-1.03 1.56V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.55 1.7 1.7 0 00-1.87.35l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.7 1.7 0 00.35-1.87 1.7 1.7 0 00-1.56-1.03H3a2 2 0 110-4h.1a1.7 1.7 0 001.55-1.1 1.7 1.7 0 00-.35-1.87l-.06-.06a2 2 0 112.83-2.83l.06.06a1.7 1.7 0 001.87.35H9a1.7 1.7 0 001-1.56V3a2 2 0 114 0v.1a1.7 1.7 0 001.03 1.56 1.7 1.7 0 001.87-.35l.06-.06a2 2 0 112.83 2.83l-.06.06a1.7 1.7 0 00-.35 1.87V9a1.7 1.7 0 001.56 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1.05z"/></svg><span data-t="navSettings"></span></div>
- <div class="navi" data-page="logs" onclick="go('logs')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M5 4.5h11l3 3V19a1 1 0 01-1 1H5a1 1 0 01-1-1V5.5a1 1 0 011-1z"/>
-   <path d="M15.5 4.5V8H19M7.5 12h9M7.5 15.5h6"/></svg><span data-t="navLogs"></span></div>
+ <div class="navi" data-page="dash"     onclick="go('dash')"><span>📊</span><span data-t="navDash"></span></div>
+ <div class="navi" data-page="users"    onclick="go('users')"><span>👥</span><span data-t="navUsers"></span></div>
+ <div class="navi" data-page="clean"    onclick="go('clean')"><span>🧊</span><span data-t="navClean"></span></div>
+ <div class="navi" data-page="settings" onclick="go('settings')"><span>⚙️</span><span data-t="navSettings"></span></div>
+ <div class="navi" data-page="logs"     onclick="go('logs')"><span>📜</span><span data-t="navLogs"></span></div>
 
  <div class="pt-3 mt-3 border-t space-y-2" style="border-color:var(--line)">
   <div class="flex gap-2">
    <select id="thSel" onchange="setTheme(this.value)" class="inp rounded-lg px-2 py-1.5 text-xs flex-1">
-    <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
-    <option value="gray" data-t="thGray"></option></select>
+    <option value="default">🌌 Midnight</option><option value="ocean">🌊 Ocean</option>
+    <option value="forest">🌿 Forest</option><option value="sunset">🌅 Sunset</option>
+    <option value="violet">🔮 Violet</option><option value="light">☀️ Light</option></select>
    <select id="langSel" onchange="setLang(this.value)" class="inp rounded-lg px-2 py-1.5 text-xs">
     <option value="fa">فا</option><option value="en">EN</option></select>
   </div>
@@ -3403,10 +3052,14 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
     <input id="nQuota" type="number" step="0.5" value="30" class="inp rounded-xl px-3 py-2 text-sm">
     <input id="nDays" type="number" value="30" class="inp rounded-xl px-3 py-2 text-sm">
     <input id="nDev" type="number" value="1" class="inp rounded-xl px-3 py-2 text-sm">
-    <select id="nTr" class="inp rounded-xl px-3 py-2 text-sm">
+    <select id="nTr" onchange="trHint()" class="inp rounded-xl px-3 py-2 text-sm">
      <option value="both"></option><option value="ws"></option><option value="xhttp"></option></select>
    </div>
    <button onclick="createUser()" id="btnAdd" class="grad rounded-xl px-4 py-2 mt-2 text-sm font-bold text-white w-full sm:w-auto"></button>
+   <p id="nTrWarn" class="hidden text-[11px] mt-2 rounded-xl px-3 py-2 leading-relaxed"
+      style="background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent)">
+    <span class="font-bold" style="color:var(--warn)" data-t="trWarnTitle"></span>
+    <span class="dim" data-t="trWarn"></span></p>
    <p class="text-[11px] dim mt-2" data-t="zeroInf"></p>
    <p id="cErr" class="text-xs mt-1" style="color:var(--bad)"></p>
   </div>
@@ -3424,11 +3077,10 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
   <div class="card rounded-2xl p-4">
    <p class="text-sm font-bold" data-t="cleanTitle"></p>
    <p class="text-[11px] dim mt-1 mb-3" data-t="cleanHint"></p>
-   <div class="grid sm:grid-cols-4 gap-2">
+   <div class="grid sm:grid-cols-3 gap-2">
     <input id="cAddr" class="inp rounded-xl px-3 py-2 text-sm">
     <input id="cRem" class="inp rounded-xl px-3 py-2 text-sm">
-    <select id="cCty" class="inp rounded-xl px-3 py-2 text-sm"></select>
-    <button onclick="addCip()" id="btnCipAdd" class="grad rounded-xl px-4 py-2 text-sm font-bold"></button>
+    <button onclick="addCip()" id="btnCipAdd" class="grad rounded-xl px-4 py-2 text-sm font-bold text-white"></button>
    </div>
    <textarea id="cBulk" rows="4" class="inp rounded-xl px-3 py-2 text-sm w-full mt-2 mono"></textarea>
    <div class="grid grid-cols-2 gap-2 mt-2">
@@ -3441,65 +3093,6 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
   <div class="card rounded-2xl p-4"><div id="cipRows" class="grid sm:grid-cols-2 gap-2"></div></div>
  </section>
 
- <!-- ══ PROXY ══ -->
- <section data-pg="proxy" class="space-y-4 hidden">
-  <div class="card rounded-2xl p-4">
-   <p class="text-sm font-bold" data-t="pxTitle"></p>
-   <p class="text-[11px] dim mt-1 mb-3" data-t="pxHint"></p>
-   <textarea id="pBulk" rows="3" spellcheck="false"
-     class="w-full inp rounded-xl px-3 py-2 text-sm mono"
-     placeholder="socks5://1.1.1.1:5866"></textarea>
-   <p class="text-[10px] dim mt-1" data-t="pxLineHint"></p>
-   <button onclick="addBulk()" class="w-full grad rounded-xl px-4 py-2 text-sm font-bold mt-2"
-     data-t="pxAddLines"></button>
-   <details class="mt-3">
-   <summary class="text-[11px] dim cursor-pointer" data-t="pxAdvanced"></summary>
-   <div class="grid sm:grid-cols-3 gap-2 mt-2">
-    <div><label class="text-[11px] dim" data-t="pxKind"></label>
-     <select id="pKind" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-      <option value="socks5">SOCKS5</option><option value="socks4">SOCKS4</option>
-      <option value="http">HTTP</option></select></div>
-    <div><label class="text-[11px] dim" data-t="pxHost"></label>
-     <input id="pHost" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono" placeholder="1.2.3.4"></div>
-    <div><label class="text-[11px] dim" data-t="pxPort"></label>
-     <input id="pPort" type="number" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono" placeholder="1080"></div>
-    <div><label class="text-[11px] dim" data-t="pxUser"></label>
-     <input id="pUser" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono"></div>
-    <div><label class="text-[11px] dim" data-t="pxPass"></label>
-     <input id="pPass" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono"></div>
-    <div><label class="text-[11px] dim" data-t="remarkPh"></label>
-     <input id="pRem" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1"></div>
-   </div>
-   </details>
-   <div class="grid grid-cols-2 gap-2 mt-3">
-    <button onclick="addProxy()" class="grad rounded-xl px-4 py-2 text-sm font-bold" data-t="pxAdd"></button>
-    <button onclick="testAllProxies()" class="rounded-xl soft py-2 text-xs font-bold" data-t="pxTestAll"></button>
-   </div>
-   <p id="pxMsg" class="text-xs dim mt-2"></p>
-  </div>
-
-  <div class="card rounded-2xl p-4 space-y-3">
-   <div class="flex items-center gap-3">
-    <div class="flex-1">
-     <p class="text-sm font-bold" data-t="pxStrict"></p>
-     <p class="text-[10px] dim" data-t="pxStrictHint"></p>
-    </div>
-    <button id="pxStrictBtn" onclick="toggleStrict()" class="sw rounded-full"></button>
-   </div>
-   <div>
-    <label class="text-xs dim" data-t="pxFlagSrc"></label>
-    <select id="pxFlagSel" onchange="saveFlagSource()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-     <option value="proxy" data-t="pxFlagProxy"></option>
-     <option value="entry" data-t="pxFlagEntry"></option></select>
-   </div>
-  </div>
-
-  <div class="card rounded-2xl p-4 space-y-2">
-   <p class="text-[11px] dim" data-t="pxAutoNote"></p>
-   <div id="pxRows" class="space-y-2"></div>
-  </div>
- </section>
-
  <!-- ══ SETTINGS ══ -->
  <section data-pg="settings" class="space-y-4 hidden">
   <div class="card rounded-2xl p-4 space-y-3">
@@ -3507,14 +3100,9 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    <div class="grid sm:grid-cols-2 gap-2">
     <div><label class="text-xs dim" data-t="theme"></label>
      <select id="thSel2" onchange="setTheme(this.value);syncSelects()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-      <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
-      <option value="gray" data-t="thGray"></option></select></div>
-    <div><label class="text-xs dim" data-t="mainCountry"></label>
-     <div class="flex gap-2 mt-1">
-      <select id="mcSel" class="flex-1 inp rounded-xl px-3 py-2 text-sm"></select>
-      <button onclick="saveMainCountry()" id="btnMc" class="grad rounded-xl px-3 py-2 text-xs font-bold"></button>
-     </div>
-     <p class="text-[10px] dim mt-1" data-t="flagsHint"></p></div>
+      <option value="default">🌌 Midnight</option><option value="ocean">🌊 Ocean</option>
+      <option value="forest">🌿 Forest</option><option value="sunset">🌅 Sunset</option>
+      <option value="violet">🔮 Violet</option><option value="light">☀️ Light</option></select></div>
     <div><label class="text-xs dim" data-t="language"></label>
      <select id="langSel2" onchange="setLang(this.value);syncSelects()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
       <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select></div>
@@ -3532,6 +3120,39 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    <p class="text-sm font-bold" data-t="serverInfo"></p>
    <div id="srvBox" class="space-y-1 text-xs"></div>
    <p class="text-[11px] dim pt-1" data-t="envNote"></p>
+  </div>
+
+  <!-- ══ BACKUP & RESTORE ══ -->
+  <div class="card rounded-2xl p-4 space-y-3">
+   <p class="text-sm font-bold" data-t="backupTitle"></p>
+   <p class="text-[11px] dim" data-t="backupHint"></p>
+   <div id="bkInfo" class="text-[11px] space-y-1"></div>
+   <div class="chips flex flex-wrap gap-2 text-xs">
+    <label class="flex items-center gap-1.5 rounded-full soft px-3 py-1.5 cursor-pointer">
+     <input type="checkbox" id="bkPw" checked> <span data-t="bkInclPw"></span></label>
+    <label class="flex items-center gap-1.5 rounded-full soft px-3 py-1.5 cursor-pointer">
+     <input type="checkbox" id="bkTraffic"> <span data-t="bkInclTraffic"></span></label>
+   </div>
+   <button onclick="doBackup()" id="btnBackup"
+     class="grad rounded-xl py-2 px-4 font-bold text-sm text-white w-full sm:w-auto"></button>
+
+   <div class="pt-3 border-t space-y-2" style="border-color:var(--line)">
+    <p class="text-sm font-bold" data-t="restoreTitle"></p>
+    <p class="text-[11px] dim" data-t="restoreHint"></p>
+    <input type="file" id="bkFile" accept=".ixpbak,application/json,.json"
+      onchange="pickBackup()" class="w-full inp rounded-xl px-3 py-2 text-xs">
+    <div id="bkPreview" class="text-[11px] space-y-1"></div>
+    <div id="bkOpts" class="hidden space-y-2">
+     <label class="block text-xs dim" data-t="restoreMode"></label>
+     <select id="bkMode" class="w-full inp rounded-xl px-3 py-2 text-sm">
+      <option value="merge"></option><option value="replace"></option></select>
+     <label class="flex items-center gap-2 text-xs">
+      <input type="checkbox" id="bkRestorePw"> <span data-t="bkRestorePwLbl"></span></label>
+     <button onclick="doRestore()" id="btnRestore"
+       class="grad rounded-xl py-2 px-4 font-bold text-sm text-white w-full"></button>
+    </div>
+    <p id="bkMsg" class="text-xs"></p>
+   </div>
   </div>
  </section>
 
@@ -3559,11 +3180,6 @@ function placeNav(open){
  nav.style.left = rtl?'auto':'0';
  nav.style.right= rtl?'0':'auto';
  nav.style.transform = open?'translateX(0)':(rtl?'translateX(100%)':'translateX(-100%)');
- /* A drawer that is only pushed aside still takes up layout width, so any sideways
-    scroll (long proxy rows caused exactly that) dragged it back into view. Pulling it
-    out of the layout keeps it hidden until it is actually asked for. */
- nav.style.visibility    = open?'visible':'hidden';
- nav.style.pointerEvents = open?'auto':'none';
 }
 let navOpen=false;
 function toggleNav(force){
@@ -3573,36 +3189,6 @@ function toggleNav(force){
 }
 placeNav(false);
 
-/* ─── country flags + inline icons ───
-   `var` and function declarations on purpose: paintStatic() runs during boot, before
-   this point in the script, and `const` would throw a temporal-dead-zone error that
-   aborts the whole panel script. */
-var CC=['DE','NL','FR','GB','FI','SE','PL','AT','CH','ES','IT','RO','TR','RU','AE','QA','OM',
-        'AM','GE','IN','SG','JP','KR','HK','CA','US','BR','AU','DK','NO','BE','CZ','HU','LT',
-        'LV','EE','IE','UA','KZ','IR'];
-function flagOf(c){
- return String(c||'').toUpperCase().replace(/[^A-Z]/g,'').slice(0,2)
-   .replace(/./g,ch=>String.fromCodePoint(0x1F1E6+ch.charCodeAt(0)-65));
-}
-function fillCountry(sel,cur){
- if(!sel)return;
- sel.innerHTML='<option value="">'+T('autoCountry')+'</option>'+
-  CC.map(c=>'<option value="'+c+'">'+flagOf(c)+' '+c+'</option>').join('');
- sel.value=cur||'';
-}
-var SVG_PAUSE='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M9.5 5v14M14.5 5v14"/></svg>';
-var SVG_PLAY='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M7.5 5.2l11 6.8-11 6.8z"/></svg>';
-var SVG_X='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M6 6l12 12M18 6L6 18"/></svg>';
-var MAIN_CC='';
-var SVG_PING='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>';
-var SVG_ARM='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M13 3L5 14h5l-1 7 8-11h-5z"/></svg>';
-var PROXIES=[],PX_SUB=[],PX_ACTIVE=0,PX_STRICT=true,PX_FLAG='proxy';
-
 /* ─── routing ─── */
 let PAGE=localStorage.getItem('page')||'dash';
 function go(p){
@@ -3610,20 +3196,28 @@ function go(p){
  document.querySelectorAll('[data-pg]').forEach(s=>s.classList.toggle('hidden',s.dataset.pg!==p));
  document.querySelectorAll('.navi').forEach(n=>n.classList.toggle('on',n.dataset.page===p));
  crumb.textContent=T({dash:'navDash',users:'navUsers',clean:'navClean',
-   proxy:'navProxy',settings:'navSettings',logs:'navLogs'}[p]);
+   settings:'navSettings',logs:'navLogs'}[p]);
  toggleNav(false);
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
- if(p==='settings')renderServer();
+ if(p==='settings'){renderServer();loadBackupInfo()}
 }
 
 /* ─── helpers ─── */
+const esc=s=>(s==null?'':String(s)).replace(/[<>&"]/g,
+ c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
 const fmt=b=>{if(!b)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0,n=b;
  while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(i?1:0)+' '+u[i]};
 const dt=t=>t?new Date(t*1000).toLocaleString(LANG==='fa'?'fa-IR':'en-GB'):T('never');
 const statusTxt=s=>({disabled:T('statusDisabled'),expired:T('statusExpired'),
  quota:T('statusQuota')}[s]||s);
 const trTxt=t=>({ws:T('trWs'),xhttp:T('trXhttp'),both:T('trBoth')}[t]||t);
+/* XHTTP is packet-up: one POST per upload chunk. Warn whenever it is in play. */
+const trCostly=t=>t==='xhttp'||t==='both';
+function trHint(){
+ const w=document.getElementById('nTrWarn'); if(!w) return;
+ w.classList.toggle('hidden',!trCostly(nTr.value));
+}
 let users=[],cips=[],stats={},logItems=[],chart;
 
 async function api(p,o={}){
@@ -3645,16 +3239,17 @@ function paintStatic(){
  btnOut.textContent=T('logout'); btnAdd.textContent=T('add');
  btnCipAdd.textContent=T('add'); btnBulk.textContent=T('bulkAdd');
  btnClearAll.textContent=T('clearAll'); btnPw.textContent=T('saveBtn');
+ btnBackup.textContent=T('btnBackupLbl'); btnRestore.textContent=T('btnRestoreLbl');
+ bkMode.options[0].textContent=T('bkMerge');
+ bkMode.options[1].textContent=T('bkReplace');
  nName.placeholder=T('name'); nQuota.placeholder=T('quota');
  nDays.placeholder=T('days'); nDev.placeholder=T('devLimit');
  q.placeholder=T('search');
  nTr.options[0].textContent=T('trBoth');
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
+ trHint();
  cAddr.placeholder=T('addrPh'); cRem.placeholder=T('remarkPh'); cBulk.placeholder=T('bulkPh');
- fillCountry(document.getElementById('cCty'),document.getElementById('cCty')?.value||'');
- fillCountry(document.getElementById('mcSel'),MAIN_CC);
- const _mb=document.getElementById('btnMc'); if(_mb)_mb.textContent=T('save');
  pwCur.placeholder=T('curPw'); pwNew.placeholder=T('newPw');
  placeNav(navOpen);
 }
@@ -3691,12 +3286,19 @@ function renderServer(){
  srvBox.innerHTML=[
   [T('wsPathLbl'),'/'+(stats.ws_path||'—')],
   [T('xhPathLbl'),'/'+(stats.xhttp_path||'—')],
+  [T('xhModeLbl'),stats.xhttp_mode||'—'],
   [T('devWinLbl'),(stats.device_window||'—')+' '+T('seconds')],
   [T('xSessions'),stats.xhttp_sessions??'—'],
   [T('relayLbl'),stats.relay_domain||T('relayNone')],
   [T('keepAliveLbl'),stats.keepalive?T('onLbl'):T('offLbl')],
  ].map(([k,v])=>`<div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
-   <span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`).join('');
+   <span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`).join('')
+ +(stats.xhttp_mode==='packet-up'
+   ?`<p class="text-[11px] rounded-xl px-3 py-2 leading-relaxed mt-1"
+       style="background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent)">
+      <span class="font-bold" style="color:var(--warn)">${T('trWarnTitle')}</span>
+      <span class="dim">${T('xhModeHint')}</span></p>`
+   :'');
 }
 
 async function loadStats(){
@@ -3707,23 +3309,10 @@ async function loadStats(){
  sCip.textContent=stats.clean_ips; sXs.textContent=stats.xhttp_sessions;
  pill.textContent='/'+stats.ws_path+' · /'+stats.xhttp_path;
  paintChart(); renderProto();
- if(PAGE==='settings')renderServer();
+ if(PAGE==='settings'){renderServer();loadBackupInfo()}
 }
 async function loadUsers(){users=await api('/api/users');renderUsers()}
 async function loadCips(){cips=await api('/api/clean-ips');renderCips()}
-async function loadMainCountry(){
- try{const r=await api('/api/main-country');MAIN_CC=r.country||'';
-      fillCountry(document.getElementById('mcSel'),MAIN_CC);}catch(e){}
-}
-async function saveMainCountry(){
- const sel=document.getElementById('mcSel');if(!sel)return;
- try{const r=await api('/api/main-country',{method:'POST',
-      body:JSON.stringify({country:sel.value})});
-  MAIN_CC=r.country||'';
-  const b=document.getElementById('btnMc');
-  if(b){const old=b.textContent;b.textContent=T('savedOk');setTimeout(()=>{b.textContent=old},1500)}
- }catch(e){alert(e.message)}
-}
 async function loadLogs(){logItems=await api('/api/logs');renderLogs()}
 
 function renderUsers(){
@@ -3758,12 +3347,11 @@ function renderCips(){
  cipRows.innerHTML=cips.map(x=>`
   <div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
    <span class="h-2 w-2 rounded-full" style="background:${x.enabled?'var(--ok)':'var(--dim)'}"></span>
-   ${x.flag?`<span class="text-sm">${x.flag}</span>`:''}
    <span class="mono text-[11px]">${x.address}</span>
    ${x.remark?`<span class="text-[10px] dim">${x.remark}</span>`:''}
    <div class="flex-1"></div>
-   <button onclick="toggleCip(${x.id})" class="icbox px-2 py-1 rounded-lg soft">${x.enabled?SVG_PAUSE:SVG_PLAY}</button>
-   <button onclick="delCip(${x.id})" class="icbox px-2 py-1 rounded-lg" style="color:var(--bad)">${SVG_X}</button>
+   <button onclick="toggleCip(${x.id})" class="text-[10px] px-2 py-0.5 rounded-lg soft">${x.enabled?'⏸':'▶️'}</button>
+   <button onclick="delCip(${x.id})" class="text-[10px] px-2 py-0.5 rounded-lg" style="color:var(--bad)">✕</button>
   </div>`).join('')||`<p class="text-xs dim">${T('noCleanIps')}</p>`;
 }
 
@@ -3792,9 +3380,8 @@ async function createUser(){
 async function addCip(){
  cipMsg.textContent='';
  try{await api('/api/clean-ips',{method:'POST',
-  body:JSON.stringify({address:cAddr.value.trim(),remark:cRem.value.trim(),
-                       country:(cCty&&cCty.value)||''})});
-  cAddr.value='';cRem.value='';if(cCty)cCty.value='';loadCips();loadStats();
+  body:JSON.stringify({address:cAddr.value.trim(),remark:cRem.value.trim()})});
+  cAddr.value='';cRem.value='';loadCips();loadStats();
  }catch(e){cipMsg.textContent=e.message}
 }
 async function bulkCip(){
@@ -3808,108 +3395,6 @@ async function bulkCip(){
 async function toggleCip(id){await api('/api/clean-ips/'+id,{method:'PATCH'});loadCips();loadStats()}
 async function delCip(id){await api('/api/clean-ips/'+id,{method:'DELETE'});loadCips();loadStats()}
 async function clearCips(){if(confirm(T('clearAll')+'?')){await api('/api/clean-ips',{method:'DELETE'});loadCips();loadStats()}}
-
-
-async function loadProxies(){
- try{const r=await api('/api/proxies');
-  PROXIES=r.proxies||[];PX_SUB=r.sub_ids||[];PX_ACTIVE=r.active_id||0;
-  PX_STRICT=!!r.strict;PX_FLAG=r.flag_source||'proxy';
-  renderProxies();
- }catch(e){if(pxMsg)pxMsg.textContent=e.message}
-}
-function renderProxies(){
- if(!window.pxRows)return;
- const sb=document.getElementById('pxStrictBtn');
- if(sb)sb.classList.toggle('on',PX_STRICT);
- const fs=document.getElementById('pxFlagSel');
- if(fs)fs.value=PX_FLAG;
- pxRows.innerHTML=PROXIES.map(x=>{
-  // A healthy, enabled proxy is already in every subscription — nothing to press.
-  const on=PX_SUB.indexOf(x.id)>-1;
-  const dot=x.healthy?'var(--ok)':(x.checked_at?'var(--bad)':'var(--dim)');
-  const state=x.healthy?T('pxHealthy'):(x.checked_at?T('pxDown'):T('pxUntested'));
-  const geo=[x.country_name||'',x.city||''].filter(Boolean).join(' \u00b7 ');
-  return `<div class="rounded-xl soft px-3 py-2 ${on?'ring-2':''}" style="${on?'outline:2px solid var(--a1)':''}">
-   <div class="flex items-center gap-2 flex-wrap">
-    <span class="h-2 w-2 rounded-full" style="background:${dot}"></span>
-    <span class="text-base">${x.flag||'\u{1F310}'}</span>
-    <span class="mono text-[11px] min-w-0 break-all">${x.label}</span>
-    ${x.has_auth?'<span class="text-[10px] dim">\u{1F511}</span>':''}
-    ${on?`<span class="text-[10px] font-bold" style="color:var(--a2)">${T('pxInSub')}</span>`:''}
-    <div class="flex-1"></div>
-    <button onclick="testProxy(${x.id})" title="${T('pxTest')}" class="icbox px-2 py-1 rounded-lg soft">${SVG_PING}</button>
-    <button onclick="toggleProxy(${x.id},${x.enabled?1:0})" class="icbox px-2 py-1 rounded-lg soft">${x.enabled?SVG_PAUSE:SVG_PLAY}</button>
-    <button onclick="delProxy(${x.id})" class="icbox px-2 py-1 rounded-lg" style="color:var(--bad)">${SVG_X}</button>
-   </div>
-   <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1 text-[10px] dim">
-    <span>${state}</span>
-    ${x.latency_ms?`<span>${T('pxLatency')}: ${x.latency_ms} ms</span>`:''}
-    ${x.exit_ip?`<span class="mono">${T('pxExitIp')}: ${x.exit_ip}</span>`:''}
-    ${geo?`<span>${geo}</span>`:''}
-    ${x.isp?`<span>${x.isp}</span>`:''}
-    ${x.remark?`<span>${x.remark}</span>`:''}
-    ${x.last_error?`<span style="color:var(--bad)">${x.last_error}</span>`:''}
-   </div>
-  </div>`}).join('')||`<p class="text-xs dim">${T('pxNone')}</p>`;
-}
-async function addProxy(){
- pxMsg.textContent=T('pxTesting');
- try{const r=await api('/api/proxies',{method:'POST',body:JSON.stringify({
-   kind:pKind.value,host:pHost.value.trim(),port:parseInt(pPort.value||'0',10),
-   username:pUser.value.trim(),password:pPass.value,remark:pRem.value.trim()})});
-  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} \u00b7 ${r.exit_ip||''} \u00b7 ${r.latency_ms}ms`
-                       :`${T('pxDown')}: ${r.error||''}`;
-  pHost.value='';pPort.value='';pUser.value='';pPass.value='';pRem.value='';
-  loadProxies();
- }catch(e){pxMsg.textContent=e.message}
-}
-async function addBulk(){
- const text=pBulk.value.trim();
- if(!text){pxMsg.textContent=T('pxLineHint');return}
- pxMsg.textContent=T('pxTesting');
- try{const r=await api('/api/proxies/bulk',{method:'POST',body:JSON.stringify({text:text})});
-  const rows=r.results||[], good=rows.filter(x=>x.ok).length;
-  pxMsg.innerHTML=rows.map(x=>x.ok
-    ?`<span style="color:var(--ok)">${x.flag||''} ${x.label} · ${x.country_name||''} ${x.latency_ms||0}ms</span>`
-    :`<span style="color:var(--bad)">${x.label}: ${x.error||''}</span>`).join('<br>')+
-   `<br>${good}/${rows.length}`;
-  if(good)pBulk.value='';
-  loadProxies();
- }catch(e){pxMsg.textContent=e.message}
-}
-async function testProxy(id){
- pxMsg.textContent=T('pxTesting');
- try{const r=await api('/api/proxies/'+id+'/test',{method:'POST'});
-  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} \u00b7 ${r.exit_ip||''} \u00b7 ${r.latency_ms}ms`
-                       :`${T('pxDown')}: ${r.error||''}`;
-  loadProxies();
- }catch(e){pxMsg.textContent=e.message}
-}
-async function testAllProxies(){
- pxMsg.textContent=T('pxTesting');
- try{await api('/api/proxies/test-all',{method:'POST'});pxMsg.textContent='';loadProxies();
- }catch(e){pxMsg.textContent=e.message}
-}
-async function toggleProxy(id,on){
- try{await api('/api/proxies/'+id,{method:'PATCH',body:JSON.stringify({enabled:!on})});loadProxies();
- }catch(e){pxMsg.textContent=e.message}
-}
-async function delProxy(id){
- if(!confirm(T('pxDelWarn')))return;
- try{await api('/api/proxies/'+id,{method:'DELETE'});loadProxies();
- }catch(e){pxMsg.textContent=e.message}
-}
-async function toggleStrict(){
- PX_STRICT=!PX_STRICT;renderProxies();
- try{await api('/api/proxies/mode',{method:'POST',body:JSON.stringify({strict:PX_STRICT})});
- }catch(e){pxMsg.textContent=e.message;loadProxies()}
-}
-async function saveFlagSource(){
- const v=document.getElementById('pxFlagSel').value;
- try{await api('/api/proxies/mode',{method:'POST',body:JSON.stringify({flag_source:v})});
-  PX_FLAG=v;pxMsg.textContent=T('savedOk');
- }catch(e){pxMsg.textContent=e.message}
-}
 
 function openModal(t,h){mTitle.textContent=t;mBody.innerHTML=h;
  modal.classList.remove('hidden');modal.classList.add('flex')}
@@ -3996,7 +3481,11 @@ function showEdit(id){
   <label class="block text-xs dim">${T('allowedDev')}</label>
   <input id="eV" type="number" value="${u.device_limit}" class="w-full inp rounded-xl px-3 py-2">
   <label class="block text-xs dim">${T('transport')}</label>
-  <select id="eT" class="w-full inp rounded-xl px-3 py-2">${opt('both')}${opt('ws')}${opt('xhttp')}</select>
+  <select id="eT" onchange="eTrHint()" class="w-full inp rounded-xl px-3 py-2">${opt('both')}${opt('ws')}${opt('xhttp')}</select>
+  <p id="eTrWarn" class="hidden text-[11px] rounded-xl px-3 py-2 leading-relaxed"
+     style="background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent)">
+   <span class="font-bold" style="color:var(--warn)">${T('trWarnTitle')}</span>
+   <span class="dim">${T('trWarn')}</span></p>
   <label class="block text-xs dim">${T('customUuid')}</label>
   <input id="eU" value="${u.uuid}" class="w-full inp rounded-xl px-3 py-2 mono text-[11px]">
   <label class="flex items-center gap-2 text-xs"><input id="eE" type="checkbox" ${u.enabled?'checked':''}> ${T('active')}</label>
@@ -4007,6 +3496,12 @@ function showEdit(id){
    <button onclick="delUser(${id})" class="rounded-xl py-2 text-[11px]" style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${T('del')}</button>
   </div>
   <p id="eErr" class="text-xs" style="color:var(--bad)"></p>`);
+ eTrHint();
+}
+function eTrHint(){
+ const s=document.getElementById('eT'),w=document.getElementById('eTrWarn');
+ if(!s||!w) return;
+ w.classList.toggle('hidden',!trCostly(s.value));
 }
 async function saveEdit(id){
  try{
@@ -4031,11 +3526,97 @@ async function doChangePw(){
  }catch(e){pwMsg.style.color='var(--bad)';pwMsg.textContent=e.message}
 }
 
+/* ─── backup & restore ─── */
+let BK=null;                       // the parsed file waiting to be restored
+
+const bkRow=(k,v)=>`<div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
+ <span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`;
+
+async function loadBackupInfo(){
+ try{
+  const i=await api('/api/backup/info');
+  bkInfo.innerHTML=bkRow(T('bkUsersN'),i.users)+bkRow(T('bkCipsN'),i.clean_ips)
+    +bkRow(T('bkTrafficN'),i.traffic_rows);
+ }catch(e){bkInfo.innerHTML=''}
+}
+
+function doBackup(){
+ // A plain link download keeps the browser's Save dialog and the server-side filename.
+ const qs='password='+(bkPw.checked?1:0)+'&traffic='+(bkTraffic.checked?1:0);
+ const a=document.createElement('a');
+ a.href='/api/backup?'+qs; a.rel='noopener';
+ document.body.appendChild(a); a.click(); a.remove();
+ bkMsg.style.color='var(--ok)'; bkMsg.textContent='✓';
+ setTimeout(()=>{bkMsg.textContent=''},2000);
+}
+
+async function pickBackup(){
+ BK=null; bkOpts.classList.add('hidden'); bkPreview.innerHTML='';
+ bkMsg.style.color='var(--dim)'; bkMsg.textContent='';
+ const f=bkFile.files&&bkFile.files[0];
+ if(!f) return;
+ bkMsg.textContent=T('bkReading');
+ let text;
+ try{ text=await f.text(); }
+ catch(e){ bkMsg.style.color='var(--bad)'; bkMsg.textContent=T('bkBadFile'); return }
+
+ let parsed;
+ try{ parsed=JSON.parse(text); }
+ catch(e){ bkMsg.style.color='var(--bad)'; bkMsg.textContent=T('bkBadFile'); return }
+
+ try{
+  // The server validates format, version and checksum; nothing is written yet.
+  const p=await api('/api/restore/preview',{method:'POST',
+    body:JSON.stringify({data:parsed})});
+  BK=parsed;
+  bkMsg.textContent='';
+  let html=bkRow(T('bkFrom'),dt(p.created_at))+bkRow(T('bkUsersN'),p.users)
+    +bkRow(T('bkCipsN'),p.clean_ips);
+  if(p.traffic_rows) html+=bkRow(T('bkTrafficN'),p.traffic_rows);
+  html+=bkRow('🔐',p.has_password?T('bkHasPw'):T('bkNoPw'));
+  const diff=Object.entries(p.env_diff||{});
+  if(diff.length){
+   html+=`<p class="text-[11px] rounded-xl px-3 py-2 leading-relaxed mt-1"
+     style="background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent)">
+     <span class="font-bold" style="color:var(--warn)">${T('bkEnvDiff')}</span><br>`
+     +diff.map(([k,v])=>`<span class="mono">${esc(k)}</span>: <span class="mono">${esc(v.current||'—')}</span> → <span class="mono">${esc(v.backup||'—')}</span>`).join('<br>')
+     +`</p>`;
+  }
+  bkPreview.innerHTML=html;
+  bkRestorePw.checked=false;
+  bkRestorePw.parentElement.classList.toggle('hidden',!p.has_password);
+  bkOpts.classList.remove('hidden');
+ }catch(e){
+  bkMsg.style.color='var(--bad)'; bkMsg.textContent=e.message||T('bkBadFile');
+ }
+}
+
+async function doRestore(){
+ if(!BK) return;
+ const mode=bkMode.value;
+ if(mode==='replace'&&!confirm(T('bkReplaceWarn'))) return;
+ btnRestore.disabled=true;
+ bkMsg.style.color='var(--dim)'; bkMsg.textContent='…';
+ try{
+  const r=await api('/api/restore',{method:'POST',body:JSON.stringify({
+    data:BK,mode,restore_password:bkRestorePw.checked})});
+  bkMsg.style.color='var(--ok)';
+  bkMsg.textContent=`${T('bkDone')} — ${T('bkAdded')}: ${r.users_added}, `
+    +`${T('bkUpdated')}: ${r.users_updated}, ${T('bkSkipped')}: ${r.users_skipped} · `
+    +`${T('bkCipsN')}: +${r.clean_ips_added}`;
+  BK=null; bkFile.value=''; bkOpts.classList.add('hidden'); bkPreview.innerHTML='';
+  loadUsers(); loadCips(); loadStats(); loadBackupInfo();
+  // A restored password invalidates nothing server-side, but the admin must know.
+  if(r.password_restored) alert(T('bkPwChanged'));
+ }catch(e){ bkMsg.style.color='var(--bad)'; bkMsg.textContent=e.message }
+ finally{ btnRestore.disabled=false }
+}
+
 function copy(btn,t){navigator.clipboard.writeText(t);
  const old=btn.textContent;btn.textContent=T('copied');setTimeout(()=>btn.textContent=old,1200)}
 
 go(PAGE);
-loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();
+loadStats();loadUsers();loadCips();
 setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 </script></body></html>"""
 

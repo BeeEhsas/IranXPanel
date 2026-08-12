@@ -14,5 +14,9 @@ services:
         value: ws
       - key: XHTTP_PATH
         value: xh
+      # stream-up keeps the uplink on one long-lived request: 2 requests per connection
+      # instead of one per chunk, which matters when a Cloudflare Worker relay is in front.
+      - key: XHTTP_MODE
+        value: stream-up
       - key: DB_PATH
         value: /tmp/panel.db

@@ -160,7 +160,7 @@ unreachable from your network.
 
 ### 🔀 Transports
 - `VLESS + WS + TLS`
-- `VLESS + XHTTP + TLS` *(packet-up)*
+- `VLESS + XHTTP + TLS` *(stream-up by default, packet-up available)*
 - Chosen per user: one, the other, or both
 - Wrong transport for a user is refused
 
@@ -212,6 +212,7 @@ unreachable from your network.
 | `DOMAIN` | `myapp.up.railway.app` | **required** |
 | `WS_PATH` | `ws` | optional |
 | `XHTTP_PATH` | `xh` | optional |
+| `XHTTP_MODE` | `stream-up` | optional, `stream-up` or `packet-up` |
 | `DEVICE_WINDOW` | `300` | optional |
 | `SESSION_IDLE` | `90` | optional |
 | `DB_PATH` | `/tmp/panel.db` | optional |
@@ -272,7 +273,7 @@ Each user is set to one mode:
 | Mode | What lands in their subscription |
 |:--|:--|
 | `WS + TLS` | only `type=ws` configs |
-| `XHTTP + TLS` | only `type=xhttp` configs, `mode=packet-up` |
+| `XHTTP + TLS` | only `type=xhttp` configs, at the mode `XHTTP_MODE` selects |
 | **Both** | both kinds, plus one of each per Clean IP |
 
 ```
@@ -282,11 +283,61 @@ XHTTP       https://<domain>/<XHTTP_PATH>/…   default /xh
 
 The two paths must differ.
 
+### Request cost — this matters behind a Cloudflare relay
+
+A Worker in front of the panel is billed per request, and the transports differ wildly:
+
+| Route | Requests per connection |
+|---|---|
+| `ws` | **1**, for the whole life of the tunnel however long it lasts |
+| `xhttp` `mode=stream-up` | **2** — one streamed `GET` down, one long-lived `POST` up |
+| `xhttp` `mode=packet-up` | **1 + one per uploaded chunk** — hundreds a minute per active client |
+
+`XHTTP_MODE` picks what generated configs advertise and defaults to `stream-up`. The
+server accepts **both** uplink shapes no matter how it is set, so links already handed
+out keep working after an upgrade; users only need to refresh their subscription to move
+onto the cheaper mode. The active mode is shown under **Panel settings → Server info**.
+
 > [!WARNING]
-> **XHTTP is experimental.** It is implemented as `packet-up`: numbered `POST` requests
-> for the uplink, one streamed `GET` for the downlink, with a reorder buffer for
-> out-of-order chunks. If any proxy or CDN in the path buffers responses, the downlink
-> stalls. **WS is the reliable route** — if a user has trouble, switch them to WS.
+> **XHTTP is experimental.** `stream-up` keeps the uplink on one request whose body is
+> read incrementally; `packet-up` uses numbered `POST`s with a reorder buffer. Either way
+> the downlink is a streamed `GET`, so if any proxy or CDN in the path buffers responses
+> the downlink stalls. `stream-up` additionally needs the path not to buffer *request*
+> bodies. **WS is the reliable route** — if a user has trouble, switch them to WS.
+
+---
+
+## 📦 Backup & restore
+
+**Panel settings → Backup** downloads one `.ixpbak` file (JSON) holding every user with
+their **UUID and subscription token**, all clean IPs with their remarks and enabled flags,
+the panel password hash, and the environment the panel was running under. Two toggles let
+you exclude the password or include traffic history.
+
+**Panel settings → Restore** takes that file back. Picking a file only *previews* it —
+counts, creation date, and any environment variables that differ from the current host —
+and writes nothing until you confirm. Two modes:
+
+| Mode | Effect |
+|---|---|
+| Merge | users matching by name or UUID are updated, the rest are added |
+| Replace | current users and clean IPs are wiped first |
+
+Because UUIDs and subscription tokens are preserved, **configs already installed on your
+users' devices keep working** after a migration — they only need the new host's paths if
+`WS_PATH`/`XHTTP_PATH` changed, which the preview points out.
+
+The file carries a SHA-256 checksum over its payload; a truncated or hand-edited file is
+refused unless you restore with `force`. Every restore runs in a single transaction, so a
+failure leaves the database untouched. Malformed rows are skipped and counted rather than
+aborting the whole import.
+
+Environment variables (`DOMAIN`, `WS_PATH`, `XHTTP_PATH`, `XHTTP_MODE`, `RELAY_DOMAIN`, …)
+are recorded for reference only — a panel cannot rewrite its own platform variables, so set
+those by hand on the new host.
+
+API: `GET /api/backup?password=1&traffic=0`, `GET /api/backup/info`,
+`POST /api/restore/preview`, `POST /api/restore`.
 
 ---
 
