@@ -1392,14 +1392,22 @@ def fmt_bytes(b: int) -> str:
 def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
            pid: int | None = None) -> str:
     path = WS_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
+    # Mux is advertised here (and only here): VLESS over WS carries mux.cool fine,
+    # so a client opens ONE connection for all its browsing = ONE Cloudflare Worker
+    # request no matter how many sites it visits. XHTTP below deliberately omits it
+    # because standard clients (v2rayNG/NekoBox/Streisand) reject mux on xhttp and
+    # silently fail to connect when it is forced on.
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome&alpn=http%2F1.1"
-            f"&type=ws&host={host}&path=%2F{path}"
+            f"&type=ws&host={host}&path=%2F{path}&mux=1"
             f"#{quote(label)}")
 
 
 def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False,
               pid: int | None = None) -> str:
+    # NOTE: deliberately NO &mux=1 here. mux.cool is not supported on xhttp by the
+    # common clients; adding it makes the config refuse to connect. Keep mux on the
+    # WS variant only (see ws_uri).
     path = XHTTP_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&fp=chrome"
