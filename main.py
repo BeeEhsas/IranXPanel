@@ -847,6 +847,30 @@ async def relay_session(stream: ByteStream,
         audit("reject", ip, f"{proto}: {reason}")
         raise PermissionError(reason)
 
+    # Register this tunnel in the live dashboard registry. The key is the client IP plus
+    # the VLESS uuid so each concurrent connection shows up as its own row; removed on
+    # every exit path below via finally.
+    _live_key = f"{ip}:{row['uuid']}:{id(stream)}"
+    proxy_tag = f"proxy#{pid}" if pid is not None else ("direct" if direct else "host")
+    await live_register(_live_key, {
+        "ip": ip,
+        "user": row["name"],
+        "uuid": row["uuid"],
+        "transport": proto,
+        "route": proxy_tag,
+        "mux": cmd == 3,
+        "since": int(time.time()),
+    })
+    try:
+        return await _relay_session_body(stream, send, row, ip, proto, direct, pid, cmd, host, port)
+    finally:
+        await live_unregister(_live_key)
+
+
+
+async def _relay_session_body(stream, send, row, ip, proto, direct, pid, cmd, host, port):
+    """The authenticated relay work, pulled out so relay_session can wrap it in a
+    try/finally that keeps the live registry accurate on every exit path."""
     # VLESS command 0x03 is mux.cool: one session carries many sub-streams, so the
     # whole tunnel is a single connection (one Cloudflare request) instead of one per
     # target. The address fields in the header are a placeholder for mux and ignored.
@@ -905,7 +929,6 @@ async def relay_session(stream: ByteStream,
         writer.close()
     except Exception:
         pass
-
 
 # ══════════════════════════ mux.cool ══════════════════════════
 #
@@ -1113,6 +1136,26 @@ class XSession:
 
 
 SESSIONS: dict[str, XSession] = {}
+SID_RE = re.compile(r"^[A-Za-z0-9._\-]{4,64}$")
+
+# ── Live connection registry (both WS and XHTTP) ──
+# Every active tunnel registers here on connect and removes itself on close, so a
+# single endpoint can show who is online right now (IP, transport, which proxy, and
+# the user behind it) without polling the session dicts separately.
+LIVE: dict[str, dict] = {}
+_live_lock = asyncio.Lock()
+
+async def live_register(key: str, info: dict):
+    async with _live_lock:
+        LIVE[key] = info
+
+async def live_unregister(key: str):
+    async with _live_lock:
+        LIVE.pop(key, None)
+
+def live_snapshot() -> list[dict]:
+    """A cheap, lock-free copy for the dashboard endpoint."""
+    return list(LIVE.values())
 SID_RE = re.compile(r"^[A-Za-z0-9._\-]{4,64}$")
 
 
@@ -2661,6 +2704,27 @@ async def restore_backup(body: RestoreIn, request: Request, _=Depends(require_ad
 
 # ─────────────────────────────── STATS ──────────────────────────────
 
+
+@app.get("/api/live")
+async def live_dashboard(_=Depends(require_admin)):
+    """Live connections right now: every WS and XHTTP tunnel currently open,
+    with the user, transport, route, and how long it has been up."""
+    now = int(time.time())
+    rows = []
+    for c in live_snapshot():
+        rows.append({
+            "ip": c.get("ip"),
+            "user": c.get("user"),
+            "uuid": c.get("uuid"),
+            "transport": c.get("transport"),
+            "route": c.get("route"),
+            "mux": bool(c.get("mux")),
+            "connected_for": now - int(c.get("since", now)),
+        })
+    # relay_session already registers both WS and XHTTP tunnels in LIVE, so the
+    # registry alone is the source of truth — no need to also walk SESSIONS.
+    return {"count": len(rows), "connections": rows}
+
 @app.get("/api/stats")
 async def stats(_=Depends(require_admin)):
     with db() as c:
@@ -3776,10 +3840,10 @@ const I18N={
   password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخیره و ورود',
   pwRule:'حداقل ۸ کاراکتر شامل حرف بزرگ، حرف کوچک و عدد',netErr:'خطای شبکه',
   navDash:'داشبورد',navUsers:'مدیریت کاربران',navClean:'Clean IP',
-  navProxy:'پروکسی',
+  navProxy:'پروکسی',navLive:'اتصالات زنده',
   navSettings:'تنظیمات پنل',navLogs:'رخدادها',menu:'منو',
   totalUsers:'کل کاربران',online:'کاربران آنلاین',devices:'دستگاه‌های متصل',
-  traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'سشن‌های XHTTP',
+  traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'سشن‌های XHTTP',liveTitle:'اتصالات زنده',liveEmpty:'هیچ اتصالی فعال نیست',
   chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تقسیم بر اساس ترنسپورت',
   newUser:'ساخت کاربر جدید',users:'کاربران',
   name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',
@@ -3887,10 +3951,10 @@ const I18N={
   password:'Password',confirm:'Confirm password',enter:'Sign in',save:'Save & enter',
   pwRule:'At least 8 chars with upper case, lower case and a digit',netErr:'Network error',
   navDash:'Dashboard',navUsers:'Users',navClean:'Clean IP',
-  navProxy:'Proxy',
+  navProxy:'Proxy',navLive:'Live connections',
   navSettings:'Panel settings',navLogs:'Events',menu:'Menu',
   totalUsers:'Total users',online:'Online users',devices:'Connected devices',
-  traffic:'Total traffic',cleanIps:'Clean IPs',xSessions:'XHTTP sessions',
+  traffic:'Total traffic',cleanIps:'Clean IPs',xSessions:'XHTTP sessions',liveTitle:'Live connections',liveEmpty:'No active connections',
   chart24:'Last 24 hours',protoSplit:'Split by transport',
   newUser:'Create user',users:'Users',
   name:'Name',quota:'Quota (GB)',days:'Days',devLimit:'Devices',
@@ -4131,8 +4195,12 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    <path d="M9.4 14.6a2.8 2.8 0 002.6 2.6"/></svg><span data-t="navClean"></span></div>
  <div class="navi" data-page="proxy" onclick="go('proxy')">
   <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h6.5a3 3 0 013 3v4a3 3 0 003 3H20"/>
-   <path d="M17 4l3 3-3 3M17 14l3 3-3 3"/><circle cx="4" cy="7" r="1.6"/></svg>
+  <path d="M17 4l3 3-3 3M17 14l3 3-3 3"/><circle cx="4" cy="7" r="1.6"/></svg>
   <span data-t="navProxy"></span></div>
+ <div class="navi" data-page="live" onclick="go('live')">
+  <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
+  <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
+  <span data-t="navLive"></span></div>
  <div class="navi" data-page="settings" onclick="go('settings')">
   <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
    <path d="M19.4 14.5a1.7 1.7 0 00.35 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.35 1.7 1.7 0 00-1.03 1.56V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.55 1.7 1.7 0 00-1.87.35l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.7 1.7 0 00.35-1.87 1.7 1.7 0 00-1.56-1.03H3a2 2 0 110-4h.1a1.7 1.7 0 001.55-1.1 1.7 1.7 0 00-.35-1.87l-.06-.06a2 2 0 112.83-2.83l.06.06a1.7 1.7 0 001.87.35H9a1.7 1.7 0 001-1.56V3a2 2 0 114 0v.1a1.7 1.7 0 001.03 1.56 1.7 1.7 0 001.87-.35l.06-.06a2 2 0 112.83 2.83l-.06.06a1.7 1.7 0 00-.35 1.87V9a1.7 1.7 0 001.56 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1.05z"/></svg><span data-t="navSettings"></span></div>
@@ -4363,6 +4431,18 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    <div id="logRows" class="space-y-1"></div>
   </div>
  </section>
+
+ <!-- ══ LIVE CONNECTIONS ══ -->
+ <section data-pg="live" class="hidden">
+  <p class="text-sm font-bold mb-3 flex items-center gap-2">
+   <span data-t="liveTitle"></span>
+   <span id="liveCount" class="text-xs font-normal" style="color:var(--dim)"></span>
+  </p>
+  <div class="card rounded-2xl p-0 overflow-hidden">
+   <div id="liveRows" class="divide-y" style="border-color:var(--line)"></div>
+   <div id="liveEmpty" class="p-6 text-center text-sm" style="color:var(--dim)" data-t="liveEmpty"></div>
+  </div>
+ </section>
 </main>
 
 <div id="modal" class="fixed inset-0 z-[60] hidden items-center justify-center bg-black/70 p-4">
@@ -4431,11 +4511,12 @@ function go(p){
  document.querySelectorAll('[data-pg]').forEach(s=>s.classList.toggle('hidden',s.dataset.pg!==p));
  document.querySelectorAll('.navi').forEach(n=>n.classList.toggle('on',n.dataset.page===p));
  crumb.textContent=T({dash:'navDash',users:'navUsers',clean:'navClean',
-   proxy:'navProxy',settings:'navSettings',logs:'navLogs'}[p]);
+   proxy:'navProxy',live:'navLive',settings:'navSettings',logs:'navLogs'}[p]);
  toggleNav(false);
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
  if(p==='settings'){renderServer();loadBackupInfo()}
+ if(p==='live')loadLive(); else stopLive();
 }
 
 /* ─── helpers ─── */
@@ -4556,6 +4637,30 @@ async function saveMainCountry(){
  }catch(e){alert(e.message)}
 }
 async function loadLogs(){logItems=await api('/api/logs');renderLogs()}
+
+let liveTimer=null;
+async function loadLive(){
+  try{
+    const d=await api('/api/live');
+    const rows=d.connections||[];
+    liveCount.textContent=rows.length?`(${rows.length})`:'';
+    if(!rows.length){liveRows.innerHTML='';liveEmpty.style.display='';return}
+    liveEmpty.style.display='none';
+    const fmtDur=s=>{s=Math.max(0,Math.floor(s));const m=Math.floor(s/60),sec=s%60;
+      return m?`${m}m ${sec}s`:`${sec}s`};
+    liveRows.innerHTML=rows.map(c=>`<div class="p-3 flex items-center gap-3 text-sm">
+      <span class="text-[10px] px-2 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--info) 16%,transparent);color:var(--info)">${(c.transport||'').toUpperCase()}</span>
+      <div class="flex-1 min-w-0">
+        <p class="font-bold truncate">${esc(c.user||'—')}</p>
+        <p class="text-xs truncate" style="color:var(--dim)">${esc(c.ip||'')} · ${esc(c.route||'')}${c.mux?' · mux':''}</p>
+      </div>
+      <span class="text-xs font-mono" style="color:var(--dim)">${fmtDur(c.connected_for)}</span>
+    </div>`).join('');
+  }catch(e){/* keep last render on transient error */}
+  clearTimeout(liveTimer);
+  liveTimer=setTimeout(loadLive,4000);   // auto-refresh every 4s
+}
+function stopLive(){clearTimeout(liveTimer);liveTimer=null}
 
 function renderUsers(){
  const term=(q.value||'').toLowerCase();
