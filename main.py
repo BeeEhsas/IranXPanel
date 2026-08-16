@@ -5065,20 +5065,14 @@ setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 
 AUTH_HTML  = AUTH_HTML.replace("__THEME__", THEME_CSS).replace("__I18N__", I18N_JS)
 PANEL_HTML = PANEL_HTML.replace("__THEME__", THEME_CSS).replace("__I18N__", I18N_JS)
-# ════════════ IranX Panel — fragment / CDN obfuscation add-on ════════════
-# مشکل: روی Render هم onrender.com فیلتر است و هم رله workers.dev؛ دامنه شخصی
-# پشت کلادفلر هم روی بسیاری از آی‌پی‌ها بالا نمی‌آید.
-# راه‌حل: همان مبهم‌سازی cf-optimizor — fp=unsafe + cs (لیست سایفر) + fm (FinalMask
-# با دو لایه fragment) و در صورت تمایل، دیال روی آی‌پی تمیز کلادفلر.
-# host / sni / path / type / mode / نام کانفیگ دست نمی‌خورند. روی Railway خاموش است.
-
-from urllib.parse import parse_qsl as _parse_qsl
-
-FRAG_MODE = (os.getenv("FRAG_MODE", "auto") or "auto").strip().lower()      # off | auto | on
-FRAG_STYLE = (os.getenv("FRAG_STYLE", "extra") or "extra").strip().lower()   # extra | only
-FRAG_FP = (os.getenv("FRAG_FP", "unsafe") or "unsafe").strip()
-FRAG_IP = (os.getenv("FRAG_IP", "") or "").strip()
-FRAG_MARK = os.getenv("FRAG_MARK", "\u26a1")
+# ───────────── fragment / CDN obfuscation (cf-optimizor compatible) ─────────────
+# روی Render دامنه onrender و رله workers.dev فیلتر شده‌اند و آی‌پی‌های کلادفلر هم
+# اغلب بسته‌اند؛ با fragment روی tlshello + لیست سایفر دستی + fp=unsafe اتصال
+# دوباره برقرار می‌شود. روی Railway لازم نیست و به‌صورت پیش‌فرض خاموش می‌ماند.
+FRAG_MODE  = (os.getenv("FRAG_MODE", "auto") or "auto").strip().lower()   # off | auto | on
+FRAG_STYLE = (os.getenv("FRAG_STYLE", "extra") or "extra").strip().lower()  # extra | only
+FRAG_FP    = (os.getenv("FRAG_FP", "unsafe") or "unsafe").strip()
+FRAG_IP    = (os.getenv("FRAG_IP", "") or "").strip()
 
 FRAG_CS = (os.getenv("FRAG_CS", "") or ":".join([
     "TLS_AES_256_GCM_SHA384",
@@ -5096,163 +5090,47 @@ FRAG_CS = (os.getenv("FRAG_CS", "") or ":".join([
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
 ])).strip()
 
+# شکل رسمی FinalMask در Xray: هر ماسک باید {"type": "fragment", "settings": {...}} باشد.
+# شکل تخت قدیمی ({"fragment": ...}) باعث می‌شد کانفیگ در کلاینت دیده شود ولی اتصال رد شود.
 _FRAG_FM_DEFAULT = {
     "tcp": [
-        {"fragment": "tlshello", "lengths": ["5", "94", "1"], "delays": ["0"], "maxSplit": "0"},
-        {"fragment": "1-1", "lengths": ["109", "1"], "delays": ["1"], "maxSplit": "355"},
+        {"type": "fragment", "settings": {"packets": "tlshello", "lengths": ["5", "94", "1"], "delays": ["0"], "maxSplit": "0"}},
+        {"type": "fragment", "settings": {"packets": "1-1", "lengths": ["109", "1"], "delays": ["1"], "maxSplit": "355"}},
     ]
 }
+
+
+def _frag_mask(entry):
+    """یک ماسک را به شکل رسمی type/settings تبدیل می‌کند."""
+    if not isinstance(entry, dict):
+        return entry
+    if "type" in entry or "settings" in entry:
+        return entry
+    e = dict(entry)
+    packets = e.pop("fragment", None) or e.pop("packets", None) or "tlshello"
+    return {"type": "fragment", "settings": {"packets": packets, **e}}
+
+
+def _frag_norm_fm(fm):
+    """شکل قدیمی یا دستیِ FRAG_FM را هم به شکل درست نرمال می‌کند."""
+    if not isinstance(fm, dict):
+        return _FRAG_FM_DEFAULT
+    out = {}
+    for k in ("tcp", "udp"):
+        if isinstance(fm.get(k), list):
+            out[k] = [_frag_mask(x) for x in fm[k]]
+    if isinstance(fm.get("quicParams"), dict):
+        out["quicParams"] = fm["quicParams"]
+    return out or _FRAG_FM_DEFAULT
+
+
 try:
     _fm_env = (os.getenv("FRAG_FM", "") or "").strip()
-    FRAG_FM = json.dumps(json.loads(_fm_env) if _fm_env else _FRAG_FM_DEFAULT,
+    FRAG_FM = json.dumps(_frag_norm_fm(json.loads(_fm_env) if _fm_env else _FRAG_FM_DEFAULT),
                          separators=(",", ":"), ensure_ascii=False)
 except Exception:
     FRAG_FM = json.dumps(_FRAG_FM_DEFAULT, separators=(",", ":"), ensure_ascii=False)
 
+# ترتیب ثابت پارامترها، مثل خروجی cf-optimizor؛ هر کلید ناشناسی آخر می‌آید.
 FRAG_PARAM_ORDER = ["cs", "path", "security", "alpn", "encryption", "fm", "insecure",
                     "host", "fp", "type", "allowInsecure", "sni", "mode", "mux"]
-
-
-def frag_wanted(host: str = "") -> bool:
-    """فقط جایی که لازم است: رله یا میزبان Render. Railway دست‌نخورده."""
-    if FRAG_MODE == "on":
-        return True
-    if FRAG_MODE == "off":
-        return False
-    h = (host or "").lower()
-    if RELAY_DOMAIN:
-        return True
-    if "onrender.com" in h or "workers.dev" in h:
-        return True
-    if os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"):
-        return True
-    return False
-
-
-def _frag_split_hostport(hostport: str):
-    """جدا کردن هاست و پورت، با پشتیبانی IPv6 مانند [::1]:443."""
-    if hostport.startswith("["):
-        end = hostport.find("]")
-        if end != -1:
-            return hostport[:end + 1], hostport[end + 1:]
-    if ":" in hostport:
-        h, _, p = hostport.rpartition(":")
-        return h, ":" + p
-    return hostport, ""
-
-
-def optimize_vless(uri: str, cdn_ip: str = "") -> str:
-    """یک لینک vless را مبهم می‌کند: fp/cs/fm و در صورت نیاز آی‌پی تمیز."""
-    if not isinstance(uri, str) or not uri.startswith("vless://"):
-        return uri
-    head, sep, frag = uri.partition("#")
-    rest = head[len("vless://"):]
-    userinfo, at, hostpart = rest.partition("@")
-    if not at:
-        return uri
-    hostport, _, query = hostpart.partition("?")
-    host, port = _frag_split_hostport(hostport)
-
-    ip = (cdn_ip or FRAG_IP).strip()
-    if ip:
-        host = "[" + ip + "]" if (":" in ip and not ip.startswith("[")) else ip
-
-    merged, order = {}, []
-    for k, v in _parse_qsl(query, keep_blank_values=True):
-        if k not in merged:
-            order.append(k)
-        merged[k] = v
-    for k, v in (("fp", FRAG_FP), ("cs", FRAG_CS), ("fm", FRAG_FM)):
-        if k not in merged:
-            order.append(k)
-        merged[k] = v
-
-    keys = [k for k in FRAG_PARAM_ORDER if k in merged]
-    keys += [k for k in order if k not in FRAG_PARAM_ORDER]
-    query_out = "&".join(quote(k, safe="") + "=" + quote(merged[k], safe="") for k in keys)
-    out = "vless://" + userinfo + "@" + host + port + "?" + query_out
-    return out + (("#" + frag) if sep else "")
-
-
-def _frag_uri_key(item: dict):
-    """کلیدی که متن کانفیگ درونش است — بدون فرض کردن اسم خاص."""
-    for k in ("uri", "link", "url", "config", "vless", "value"):
-        v = item.get(k)
-        if isinstance(v, str) and v.startswith("vless://"):
-            return k
-    for k, v in item.items():
-        if isinstance(v, str) and v.startswith("vless://"):
-            return k
-    return None
-
-
-def _frag_rename(uri: str, name: str) -> str:
-    """نشان ⚡ را به انتهای نام کانفیگ می‌چسباند."""
-    if not FRAG_MARK:
-        return uri
-    base, sep, _ = uri.partition("#")
-    label = (name or "").strip()
-    if not sep and not label:
-        return uri
-    return base + "#" + quote((label + " " + FRAG_MARK).strip())
-
-
-def frag_apply(configs, host: str = "", want=None):
-    """کانفیگ مبهم را کنار کانفیگ عادی می‌گذارد (extra) یا جایش می‌نشاند (only)."""
-    if want is None:
-        want = frag_wanted(host)
-    if not want or not configs:
-        return configs
-
-    out = []
-    for c in configs:
-        if isinstance(c, str):
-            if not c.startswith("vless://") or "security=none" in c:
-                out.append(c)
-                continue
-            opt = optimize_vless(c)
-            out.append(opt) if FRAG_STYLE == "only" else out.extend([c, opt])
-            continue
-
-        if not isinstance(c, dict):
-            out.append(c)
-            continue
-
-        key = _frag_uri_key(c)
-        uri = c.get(key) if key else ""
-        # کانفیگ اطلاعاتی بالای لیست (security=none) دست‌نخورده می‌ماند
-        if not key or "security=none" in uri:
-            out.append(c)
-            continue
-
-        name = ""
-        for nk in ("name", "label", "remark", "title", "tag"):
-            if isinstance(c.get(nk), str) and c[nk]:
-                name = c[nk]
-                break
-
-        opt = dict(c)
-        opt[key] = _frag_rename(optimize_vless(uri), name)
-        if name and FRAG_MARK:
-            for nk in ("name", "label", "remark", "title", "tag"):
-                if isinstance(opt.get(nk), str) and opt[nk] == name:
-                    opt[nk] = (name + " " + FRAG_MARK).strip()
-        if FRAG_STYLE == "only":
-            out.append(opt)
-        else:
-            out.append(c)
-            out.append(opt)
-    return out
-
-
-# خروجی build_configs بدون دست زدن به خود تابع، از فیلتر مبهم‌سازی رد می‌شود.
-_frag_build_configs_plain = build_configs
-
-
-def build_configs(*args, **kwargs):
-    host = kwargs.get("host", args[1] if len(args) > 1 else "")
-    return frag_apply(_frag_build_configs_plain(*args, **kwargs), host)
-
-
-print("frag: mode=%s style=%s fp=%s cdn_ip=%s" % (FRAG_MODE, FRAG_STYLE, FRAG_FP, FRAG_IP or "-"))
-# ══════════════════════ end of add-on ══════════════════════
