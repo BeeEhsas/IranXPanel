@@ -574,13 +574,15 @@ def proxy_by_id(pid: int):
 
 
 def sub_proxies():
-    """Every enabled proxy that passed its health check, fastest first.
+    """Every enabled proxy, fastest first.
 
-    These are exactly the proxies a subscription lists, so a working proxy joins
-    the user's config list on its own and a failing one drops out — no arming step.
+    These are exactly the proxies a subscription lists. Membership depends only on
+    `enabled`: a proxy leaves the users' subscriptions when the admin disables or
+    deletes it in the panel, never because a health check failed or a live
+    connection broke. Health is reported in the UI, but it no longer filters here.
     """
     with db() as c:
-        return c.execute("""SELECT * FROM proxies WHERE enabled=1 AND healthy=1
+        return c.execute("""SELECT * FROM proxies WHERE enabled=1
                             ORDER BY latency_ms IS NULL, latency_ms, id""").fetchall()
 
 
@@ -702,7 +704,7 @@ async def dial_target(host: str, port: int, direct: bool = False,
     """The single outbound path for user traffic.
 
     The inbound path decides the exit: "-d" leaves from the host's own IP, "-p<id>"
-    leaves through that one proxy, and the plain path follows the fastest healthy
+    leaves through that one proxy, and the plain path follows the fastest enabled
     proxy so subscriptions handed out earlier keep working.
     """
     px = None
@@ -721,8 +723,14 @@ async def dial_target(host: str, port: int, direct: bool = False,
 
 
 def mark_proxy_down(pid: int, err: str):
+    """Record a failure without dropping the proxy from anyone's subscription.
+
+    `healthy` is deliberately left untouched: a temporary outage used to remove the
+    proxy from every user's config list, and only an admin disabling or deleting it
+    should do that now. The error text and timestamp still land in the panel.
+    """
     with db() as c:
-        c.execute("UPDATE proxies SET healthy=0, last_error=?, checked_at=? WHERE id=?",
+        c.execute("UPDATE proxies SET last_error=?, checked_at=? WHERE id=?",
                   (err[:200], now(), pid))
 
 
@@ -1545,8 +1553,9 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
 
     # Every route sits in the same subscription, side by side: first the host's own
     # exit (Render / Railway) flagged with the server country, then one route per
-    # healthy proxy flagged with that proxy's exit country. A proxy shows up here as
-    # soon as its health check passes — there is nothing to arm.
+    # enabled proxy flagged with that proxy's exit country. A proxy shows up here as
+    # soon as it is added and stays until it is disabled or deleted — a failed health
+    # check or a dropped connection never removes it.
     #
     # Names carry only the flag, the account or clean-IP name, and the proxy's
     # location — no transport tag and no "PX" marker.
@@ -1633,7 +1642,7 @@ def row_out(r) -> dict:
     return d
 
 
-# ────────────────────────────── MODELS ──────────────────────────────
+# ────────────���───────────────── MODELS ──────────────────────────────
 
 class SetupIn(BaseModel):
     password: str
@@ -3749,7 +3758,7 @@ async def subscription(token: str, request: Request):
     return PlainTextResponse(body, headers=headers)
 
 
-# ────────────────────────────── PAGES ──────────────────────────────
+# ─────────��──────────────────── PAGES ──────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def index(session: Optional[str] = Cookie(default=None)):
@@ -3876,7 +3885,7 @@ const I18N={
   pxUser:'یوزرنیم (اختیاری)',pxPass:'پسورد (اختیاری)',
   pxAdd:'افزودن و تست',pxTestAll:'تست همه',
   pxInSub:'در ساب',
-  pxAutoNote:'هر پروکسی که تستش سالم باشد خودبه‌خود در ساب همه کاربران می‌آید — همه با هم، بدون دکمه. کانفیگ بدون پروکسی همیشه سر جایش هست؛ پروکسی خراب خودبه‌خود حذف می‌شود.',
+  pxAutoNote:'هر پروکسی که اضافه شود خودبه‌خود در ساب همه کاربران می‌آید — همه با هم، بدون دکمه. کانفیگ بدون پروکسی همیشه سر جایش هست؛ قطعی یا ناموفق بودن تست، پروکسی را از ساب حذف نمی‌کند و فقط با غیرفعال کردن یا حذف از پنل بیرون می‌رود.',
   pxLineHint:'هر خط یک پروکسی — مانند socks5://1.1.1.1:5866 یا http://user:pass@2.2.2.2:8080',
   pxAddLines:'افزودن لیست و تست',
   pxAdvanced:'ورود دستی فیلدها',
@@ -3987,7 +3996,7 @@ const I18N={
   pxUser:'Username (optional)',pxPass:'Password (optional)',
   pxAdd:'Add & test',pxTestAll:'Test all',
   pxInSub:'in subscriptions',
-  pxAutoNote:'Every proxy that passes its health check joins all subscriptions automatically — all of them at once, no button. The no-proxy config is always there, and a failing proxy drops out on its own.',
+  pxAutoNote:'Every proxy you add joins all subscriptions automatically — all of them at once, no button. The no-proxy config is always there, and a failed health check or a dropped connection never removes a proxy: only disabling or deleting it in the panel does.',
   pxLineHint:'One proxy per line — e.g. socks5://1.1.1.1:5866 or http://user:pass@2.2.2.2:8080',
   pxAddLines:'Add list & test',
   pxAdvanced:'Enter fields manually',
@@ -4760,7 +4769,7 @@ function renderProxies(){
  const fs=document.getElementById('pxFlagSel');
  if(fs)fs.value=PX_FLAG;
  pxRows.innerHTML=PROXIES.map(x=>{
-  // A healthy, enabled proxy is already in every subscription — nothing to press.
+  // An enabled proxy is already in every subscription — nothing to press.
   const on=PX_SUB.indexOf(x.id)>-1;
   const dot=x.healthy?'var(--ok)':(x.checked_at?'var(--bad)':'var(--dim)');
   const state=x.healthy?T('pxHealthy'):(x.checked_at?T('pxDown'):T('pxUntested'));
