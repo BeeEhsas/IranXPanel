@@ -40,6 +40,7 @@ import asyncio
 import hashlib
 import secrets
 import struct
+import socket
 import sqlite3
 import ipaddress
 from urllib.parse import quote
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS users (
     expire_at    INTEGER DEFAULT 0,
     device_limit INTEGER DEFAULT 1,
     transport    TEXT    DEFAULT 'both',
+    obfuscate    INTEGER DEFAULT 0,
     created_at   INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS clean_ips (
@@ -188,7 +190,8 @@ def now() -> int:
 
 def migrate():
     """Add columns that older databases may be missing."""
-    wanted = {"users": [("transport", "TEXT DEFAULT 'both'")],
+    wanted = {"users": [("transport", "TEXT DEFAULT 'both'"),
+                        ("obfuscate", "INTEGER DEFAULT 0")],
               "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
               "clean_ips": [("country", "TEXT DEFAULT ''")],
               "proxies": [("country", "TEXT DEFAULT ''"),
@@ -699,6 +702,91 @@ async def open_via_proxy(px, host: str, port: int, timeout: float = 15.0):
     return reader, writer
 
 
+# ───────────────────────── DNS & direct dialing ─────────────────────────
+#
+# Two things used to break "the site does not open / DNS_PROBE_FINISHED" style
+# pages even though the tunnel itself was up:
+#
+#   1. The host resolved a target to an IPv6 address it could not actually reach
+#      (common on Render/Railway) and the single open_connection() call just hung
+#      until it timed out. resolve_addrs() caches the lookup and orders IPv4
+#      first, and dial_direct() walks every candidate instead of only the first.
+#   2. DNS itself is UDP, and UDP was refused outright, so the client got no
+#      answer at all for names it wanted to resolve through the tunnel.
+#      dns_forward() relays those queries upstream over TCP:53, which uses the
+#      very same wire format with a 2-byte length prefix.
+
+_DNS_TTL = 300.0
+_dns_cache: dict[tuple[str, int], tuple[float, list]] = {}
+
+DNS_UPSTREAMS = [h.strip() for h in
+                 os.getenv("DNS_UPSTREAM", "1.1.1.1,8.8.8.8,9.9.9.9").split(",")
+                 if h.strip()]
+
+
+async def resolve_addrs(host: str, port: int) -> list:
+    """Resolve once, cache for _DNS_TTL, and put IPv4 before IPv6."""
+    key = (host, port)
+    hit = _dns_cache.get(key)
+    if hit and (time.time() - hit[0]) < _DNS_TTL:
+        return hit[1]
+    loop = asyncio.get_running_loop()
+    infos = await asyncio.wait_for(
+        loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=6)
+    infos = sorted(infos, key=lambda i: 0 if i[0] == socket.AF_INET else 1)
+    addrs = [(i[0], i[4]) for i in infos]
+    if addrs:
+        _dns_cache[key] = (time.time(), addrs)
+    return addrs
+
+
+async def dial_direct(host: str, port: int, timeout: float = 12):
+    """Open a TCP connection, trying each resolved address (IPv4 first)."""
+    try:
+        addrs = await resolve_addrs(host, port)
+    except Exception:
+        addrs = []
+    if not addrs:
+        # Resolution failed here; let asyncio try its own way before giving up.
+        return await asyncio.wait_for(asyncio.open_connection(host, port),
+                                      timeout=timeout)
+    tries = addrs[:4]
+    per_try = max(3.0, timeout / len(tries))
+    last = None
+    for family, sockaddr in tries:
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection(sockaddr[0], sockaddr[1], family=family),
+                timeout=per_try)
+        except Exception as exc:
+            last = exc
+    raise last or OSError("connect failed %s:%s" % (host, port))
+
+
+async def dns_forward(payload: bytes, timeout: float = 6):
+    """Answer one tunnelled DNS query by relaying it upstream over TCP:53."""
+    framed = struct.pack("!H", len(payload)) + payload
+    for up in (DNS_UPSTREAMS or ["1.1.1.1"]):
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(up, 53), timeout=timeout)
+            writer.write(framed)
+            await writer.drain()
+            head = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
+            ln = struct.unpack("!H", head)[0]
+            return await asyncio.wait_for(reader.readexactly(ln), timeout=timeout)
+        except Exception:
+            continue
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+    return None
+
+
 async def dial_target(host: str, port: int, direct: bool = False,
                       pid: int | None = None):
     """The single outbound path for user traffic.
@@ -719,7 +807,7 @@ async def dial_target(host: str, port: int, direct: bool = False,
             mark_proxy_down(px["id"], str(exc))
             if proxy_strict():
                 raise
-    return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=12)
+    return await dial_direct(host, port, timeout=12)
 
 
 def mark_proxy_down(pid: int, err: str):
@@ -876,6 +964,26 @@ async def relay_session(stream: ByteStream,
 
 
 
+async def relay_dns(stream: ByteStream, send, row) -> None:
+    """Serve tunnelled DNS: each datagram arrives length-prefixed on the stream."""
+    uid = row["id"]
+    while True:
+        hdr = await stream.read_exact(2)
+        if not hdr:
+            return
+        ln = struct.unpack("!H", hdr)[0]
+        if ln == 0:
+            continue
+        query = await stream.read_exact(ln)
+        if not query:
+            return
+        await bump(uid, ln, 0)
+        answer = await dns_forward(query)
+        if answer:
+            await send(struct.pack("!H", len(answer)) + answer)
+            await bump(uid, 0, len(answer))
+
+
 async def _relay_session_body(stream, send, row, ip, proto, direct, pid, cmd, host, port):
     """The authenticated relay work, pulled out so relay_session can wrap it in a
     try/finally that keeps the live registry accurate on every exit path."""
@@ -885,6 +993,15 @@ async def _relay_session_body(stream, send, row, ip, proto, direct, pid, cmd, ho
     if cmd == 3:
         await send(b"\x00\x00")            # VLESS response header, then mux frames
         await relay_mux(stream, send, row, ip, direct, pid)
+        return
+
+    if cmd == 2:
+        # UDP. Full UDP is still out of scope, but DNS is what actually breaks
+        # browsing, so :53 is answered here instead of being refused.
+        if port != 53:
+            raise ValueError("only TCP and UDP/53 are supported")
+        await send(b"\x00\x00")           # VLESS response header
+        await relay_dns(stream, send, row)
         return
 
     if cmd != 1:
@@ -991,6 +1108,17 @@ async def relay_mux(stream: ByteStream,
             if subs.pop(sid, None):
                 await send_frame(sid, MUX_END)
 
+    async def mux_dns(sid: int, query: bytes):
+        """Answer a DNS query that arrived on a UDP sub-stream."""
+        try:
+            await bump(uid, len(query), 0)
+            answer = await dns_forward(query)
+            if answer and sid in subs:
+                await send_frame(sid, MUX_KEEP, answer)
+                await bump(uid, 0, len(answer))
+        except Exception:
+            pass
+
     async def close_sub(sid: int):
         s = subs.pop(sid, None)
         if not s:
@@ -1049,8 +1177,15 @@ async def relay_mux(stream: ByteStream,
                     await send_frame(sid, MUX_END)
                     continue
                 net_type, host, port = target
-                # TCP only, same policy as the non-mux path; UDP sub-streams are refused
-                # without tearing the tunnel down.
+                if net_type == 2 and port == 53:
+                    # Tunnelled DNS: answer it instead of refusing it, otherwise the
+                    # client reports a DNS failure for every site it opens.
+                    subs[sid] = {"writer": None, "dns": True}
+                    if data:
+                        asyncio.create_task(mux_dns(sid, data))
+                    continue
+                # Any other UDP sub-stream is still refused, without tearing the
+                # tunnel down.
                 if net_type != 1 or not host or port == 0 or blocked(host):
                     await send_frame(sid, MUX_END)
                     continue
@@ -1068,7 +1203,9 @@ async def relay_mux(stream: ByteStream,
 
             elif status == MUX_KEEP:
                 s = subs.get(sid)
-                if s and data:
+                if s and data and s.get("dns"):
+                    asyncio.create_task(mux_dns(sid, data))
+                elif s and data:
                     try:
                         s["writer"].write(data)
                         await s["writer"].drain()
@@ -1454,6 +1591,61 @@ def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
             f"#{quote(label)}")
 
 
+# ───────────────── optional per-user obfuscation (cs + fm) ─────────────────
+#
+# Users with obfuscate = 1 get this link shape instead of the plain one: a
+# cipher-suite mask (cs=), a two-stage TLS-hello fragmenter (fm=) and fp=unsafe.
+# The structure below is kept byte-for-byte as specified — do not "tidy" it, the
+# parameter order and the exact JSON spacing are part of what clients expect.
+# Everyone else keeps the plain config, so links handed out earlier never change.
+
+OBF_CIPHERS = (
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+)
+OBF_CS = ":".join(OBF_CIPHERS)
+
+# Written out literally (not via json.dumps) so the spacing matches the reference
+# link exactly: ", " and ": " inside each object, no space between the two stages.
+OBF_FM = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", '
+          '"lengths": ["5", "94", "1"], "delays": ["0"], "maxSplit": "0"}},'
+          '{"type": "fragment", "settings": {"packets": "1-1", "lengths": '
+          '["109", "1"], "delays": ["1"], "maxSplit": "355"}}]}')
+
+
+def obf_on(row) -> bool:
+    """True when this user asked for the obfuscated link shape."""
+    try:
+        return bool(row["obfuscate"])
+    except Exception:
+        return False
+
+
+def ws_uri_obf(row, address: str, host: str, label: str, direct: bool = False,
+               pid: int | None = None) -> str:
+    """The obfuscated WS link. No mux here: fragmenting plus mux confuses clients."""
+    path = WS_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
+    return (f"vless://{row['uuid']}@{address}:443"
+            f"?cs={quote(OBF_CS, safe='')}"
+            f"&path={quote('/' + path, safe='')}"
+            f"&security=tls&encryption=none"
+            f"&fm={quote(OBF_FM, safe='')}"
+            f"&insecure=0&host={host}&fp=unsafe&type=ws&allowInsecure=0"
+            f"&sni={host}"
+            f"#{quote(label)}")
+
+
 def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False,
               pid: int | None = None) -> str:
     # NOTE: deliberately NO &mux=1 here. mux.cool is not supported on xhttp by the
@@ -1546,8 +1738,9 @@ def proxy_flag() -> str:
 def build_configs(row, host: str, clean_ips) -> list[dict]:
     t = (row["transport"] or "both").lower()
     kinds = []
+    ws_builder = ws_uri_obf if obf_on(row) else ws_uri
     if t in ("ws", "both"):
-        kinds.append(("WS", ws_uri))
+        kinds.append(("WS", ws_builder))
     if t in ("xhttp", "both"):
         kinds.append(("XHTTP", xhttp_uri))
 
@@ -1666,6 +1859,7 @@ class UserIn(BaseModel):
     transport: str = "both"
     note: str = ""
     enabled: bool = True
+    obfuscate: bool = False
 
 
 class UserPatch(BaseModel):
@@ -1676,6 +1870,7 @@ class UserPatch(BaseModel):
     transport: Optional[str] = None
     note: Optional[str] = None
     enabled: Optional[bool] = None
+    obfuscate: Optional[bool] = None
     uuid: Optional[str] = None
 
 
@@ -1804,11 +1999,13 @@ async def create_user(body: UserIn, _=Depends(require_admin)):
         with db() as c:
             cur = c.execute(
                 """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
-                                     used_bytes,expire_at,device_limit,transport,created_at)
-                   VALUES(?,?,?,?,?,?,0,?,?,?,?)""",
+                                     used_bytes,expire_at,device_limit,transport,
+                                     obfuscate,created_at)
+                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?)""",
                 (name, str(uuid.uuid4()), secrets.token_urlsafe(16), body.note,
                  1 if body.enabled else 0, int(body.quota_gb * GB), expire,
-                 max(0, body.device_limit), tr, now()))
+                 max(0, body.device_limit), tr,
+                 1 if body.obfuscate else 0, now()))
             row = c.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
     except sqlite3.IntegrityError:
         raise HTTPException(409, "this name already exists")
@@ -1842,6 +2039,8 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
             sets.append("note=?"); vals.append(body.note)
         if body.enabled is not None:
             sets.append("enabled=?"); vals.append(1 if body.enabled else 0)
+        if body.obfuscate is not None:
+            sets.append("obfuscate=?"); vals.append(1 if body.obfuscate else 0)
         if body.uuid is not None:
             try:
                 clean = str(uuid.UUID(body.uuid.strip()))
@@ -2264,7 +2463,7 @@ async def delete_proxy(pid: int, _=Depends(require_admin)):
 # lands or the database is left exactly as it was.
 
 BACKUP_FORMAT = "iranx-panel-backup"
-BACKUP_VERSION = 2          # v1 had no proxies table
+BACKUP_VERSION = 3          # v1 had no proxies table, v2 no obfuscate flag
 
 # Runtime settings that live in the environment, not the database. They are recorded for
 # reference and shown on restore, because a new host needs them set by hand — the panel
@@ -2274,7 +2473,8 @@ ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
             "KEEPALIVE", "KEEPALIVE_MINUTES")
 
 USER_FIELDS = ("name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
-               "used_bytes", "expire_at", "device_limit", "transport", "created_at")
+               "used_bytes", "expire_at", "device_limit", "transport",
+               "obfuscate", "created_at")
 CIP_FIELDS = ("address", "remark", "country", "enabled", "added_at")
 # Health columns are deliberately included: a restore then shows the same list state the
 # old panel had, and the next test run refreshes it anyway.
@@ -2411,6 +2611,8 @@ def _clean_user(u: dict) -> Optional[dict]:
         "expire_at": num("expire_at"),
         "device_limit": num("device_limit", 1),
         "transport": tr if tr in TRANSPORTS else "both",
+        # Missing in v2 backups: default off, exactly like a fresh user.
+        "obfuscate": 1 if u.get("obfuscate") else 0,
         "created_at": num("created_at") or now(),
     }
 
@@ -2511,31 +2713,36 @@ def apply_backup(payload: dict, mode: str = "merge",
                 conn.execute(
                     """UPDATE users SET name=?, uuid=?, sub_token=?, note=?, enabled=?,
                            quota_bytes=?, used_bytes=?, expire_at=?, device_limit=?,
-                           transport=?, created_at=? WHERE id=?""",
+                           transport=?, obfuscate=?, created_at=? WHERE id=?""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
-                     u["device_limit"], u["transport"], u["created_at"], existing["id"]))
+                     u["device_limit"], u["transport"], u["obfuscate"],
+                     u["created_at"], existing["id"]))
                 stats["users_updated"] += 1
                 continue
             try:
                 conn.execute(
                     """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
-                                         used_bytes,expire_at,device_limit,transport,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                         used_bytes,expire_at,device_limit,transport,
+                                         obfuscate,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
-                     u["device_limit"], u["transport"], u["created_at"]))
+                     u["device_limit"], u["transport"], u["obfuscate"],
+                     u["created_at"]))
                 stats["users_added"] += 1
             except sqlite3.IntegrityError:
                 # sub_token is UNIQUE too; retry once with a fresh one.
                 try:
                     conn.execute(
                         """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
-                                             used_bytes,expire_at,device_limit,transport,created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                             used_bytes,expire_at,device_limit,transport,
+                                             obfuscate,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (u["name"], u["uuid"], secrets.token_urlsafe(16), u["note"],
                          u["enabled"], u["quota_bytes"], u["used_bytes"], u["expire_at"],
-                         u["device_limit"], u["transport"], u["created_at"]))
+                         u["device_limit"], u["transport"], u["obfuscate"],
+                         u["created_at"]))
                     stats["users_added"] += 1
                 except sqlite3.IntegrityError:
                     stats["users_skipped"] += 1
@@ -3873,6 +4080,7 @@ const I18N={
   editUser:'ویرایش',remainDays:'مدت باقی‌مانده (روز)',allowedDev:'تعداد دستگاه مجاز',
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
+  obfLbl:'مبهم‌ساز (Fragment + Cipher mask)',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
   cleanTitle:'مدیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
@@ -3984,6 +4192,7 @@ const I18N={
   editUser:'Edit',remainDays:'Days remaining',allowedDev:'Allowed devices',
   active:'Enabled',saveBtn:'Save',resetTraffic:'Reset traffic',newUuid:'New UUID',
   customUuid:'Custom UUID',del:'Delete',
+  obfLbl:'Obfuscation (Fragment + Cipher mask)',
   uuidWarn:'Rotate UUID? Existing configs will stop working.',delWarn:'Delete this user?',
   cleanTitle:'Clean IP manager',
   cleanHint:'Clean IPs or domains. Added to every subscription as extra configs.',
@@ -4266,6 +4475,8 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
     <select id="nTr" class="inp rounded-xl px-3 py-2 text-sm">
      <option value="both"></option><option value="ws"></option><option value="xhttp"></option></select>
    </div>
+   <label class="flex items-center gap-2 text-xs mt-2">
+    <input id="nObf" type="checkbox"><span data-t="obfLbl"></span></label>
    <button onclick="createUser()" id="btnAdd" class="grad rounded-xl px-4 py-2 mt-2 text-sm font-bold text-white w-full sm:w-auto"></button>
    <p class="text-[11px] dim mt-2" data-t="zeroInf"></p>
    <p id="cErr" class="text-xs mt-1" style="color:var(--bad)"></p>
@@ -4730,7 +4941,7 @@ async function createUser(){
   await api('/api/users',{method:'POST',body:JSON.stringify({
    name:nName.value.trim(),quota_gb:parseFloat(nQuota.value||0),
    expire_days:parseInt(nDays.value||0),device_limit:parseInt(nDev.value||0),
-   transport:nTr.value})});
+   transport:nTr.value,obfuscate:nObf.checked})});
   nName.value='';loadUsers();loadStats();
  }catch(e){cErr.textContent=e.message}
 }
@@ -4942,6 +5153,7 @@ function showEdit(id){
   <input id="eV" type="number" value="${u.device_limit}" class="w-full inp rounded-xl px-3 py-2">
   <label class="block text-xs dim">${T('transport')}</label>
   <select id="eT" class="w-full inp rounded-xl px-3 py-2">${opt('both')}${opt('ws')}${opt('xhttp')}</select>
+  <label class="flex items-center gap-2 text-xs pt-1"><input id="eObf" type="checkbox" ${u.obfuscate?'checked':''}> ${T('obfLbl')}</label>
   <label class="block text-xs dim">${T('customUuid')}</label>
   <input id="eU" value="${u.uuid}" class="w-full inp rounded-xl px-3 py-2 mono text-[11px]">
   <label class="flex items-center gap-2 text-xs"><input id="eE" type="checkbox" ${u.enabled?'checked':''}> ${T('active')}</label>
@@ -4957,7 +5169,8 @@ async function saveEdit(id){
  try{
   const u=users.find(x=>x.id===id);
   const payload={quota_gb:parseFloat(eQ.value||0),expire_days:parseInt(eD.value||0),
-   device_limit:parseInt(eV.value||0),transport:eT.value,enabled:eE.checked};
+   device_limit:parseInt(eV.value||0),transport:eT.value,enabled:eE.checked,
+   obfuscate:eObf.checked};
   if(eU.value.trim()&&eU.value.trim()!==u.uuid)payload.uuid=eU.value.trim();
   await api('/api/users/'+id,{method:'PATCH',body:JSON.stringify(payload)});
   closeModal();loadUsers();loadStats();
