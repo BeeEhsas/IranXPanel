@@ -1624,8 +1624,19 @@ OBF_FM = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", '
           '["109", "1"], "delays": ["1"], "maxSplit": "355"}}]}')
 
 
+def obf_enabled() -> bool:
+    """The panel-wide master switch. Off by default.
+
+    With it off nobody gets an obfuscated link, no matter what their own flag
+    says, so the subscription goes back to plain configs with one click.
+    """
+    return (get_setting("obf_enabled") or "0") == "1"
+
+
 def obf_on(row) -> bool:
-    """True when this user asked for the obfuscated link shape."""
+    """True when the panel allows obfuscation AND this user asked for it."""
+    if not obf_enabled():
+        return False
     try:
         return bool(row["obfuscate"])
     except Exception:
@@ -2406,6 +2417,22 @@ async def activate_proxy(pid: int, _=Depends(require_admin)):
           (px["kind"], px["host"], px["port"], res.get("country") or "?"))
     return {"ok": True, "active_id": pid, "country": res.get("country"),
             "flag": res.get("flag"), "exit_ip": res.get("exit_ip")}
+
+
+class ObfModeIn(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/obfuscation")
+async def get_obf_mode(_=Depends(require_admin)):
+    return {"enabled": obf_enabled()}
+
+
+@app.post("/api/obfuscation")
+async def set_obf_mode(body: ObfModeIn, _=Depends(require_admin)):
+    set_setting("obf_enabled", "1" if body.enabled else "0")
+    audit("obfuscation", "", "on" if body.enabled else "off")
+    return {"enabled": obf_enabled()}
 
 
 @app.post("/api/proxies/mode")
@@ -3954,7 +3981,7 @@ async def subscription(token: str, request: Request):
 
     body = base64.b64encode("\n".join(lines).encode()).decode()
     headers = {
-        "profile-title": "base64:" + base64.b64encode(f"⚡ {row['name']}".encode()).decode(),
+        "profile-title": "base64:" + base64.b64encode(f"{row['name']}".encode()).decode(),
         "profile-update-interval": "12",
         "profile-web-page-url": f"https://{origin_domain(request)}/",
         "subscription-userinfo":
@@ -4081,6 +4108,9 @@ const I18N={
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
   obfLbl:'مبهم‌ساز (Fragment + Cipher mask)',
+  obfTitle:'مبهم‌ساز کانفیگ',
+  obfMasterLbl:'مبهم‌ساز روشن باشد',
+  obfHint:'تا وقتی خاموش است، هیچ کاربری کانفیگ مبهم‌شده نمی‌گیرد. با روشن کردن، فقط کاربرانی که تیک مبهم‌ساز دارند کانفیگ مبهم می‌گیرند.',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
   cleanTitle:'مدیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
@@ -4193,6 +4223,9 @@ const I18N={
   active:'Enabled',saveBtn:'Save',resetTraffic:'Reset traffic',newUuid:'New UUID',
   customUuid:'Custom UUID',del:'Delete',
   obfLbl:'Obfuscation (Fragment + Cipher mask)',
+  obfTitle:'Config obfuscation',
+  obfMasterLbl:'Enable obfuscation',
+  obfHint:'While this is off no user gets an obfuscated config. Turn it on and only users with the obfuscation box ticked get the obfuscated link.',
   uuidWarn:'Rotate UUID? Existing configs will stop working.',delWarn:'Delete this user?',
   cleanTitle:'Clean IP manager',
   cleanHint:'Clean IPs or domains. Added to every subscription as extra configs.',
@@ -4592,6 +4625,14 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    </div>
   </div>
   <div class="card rounded-2xl p-4 space-y-2">
+   <p class="text-sm font-bold" data-t="obfTitle"></p>
+   <p class="text-[11px] dim" data-t="obfHint"></p>
+   <label class="flex items-center gap-2 text-xs">
+    <input type="checkbox" id="obfMaster" onchange="saveObfMode()">
+    <span data-t="obfMasterLbl"></span></label>
+   <p id="obfMsg" class="text-xs"></p>
+  </div>
+  <div class="card rounded-2xl p-4 space-y-2">
    <p class="text-sm font-bold" data-t="changePw"></p>
    <input id="pwCur" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm">
    <input id="pwNew" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm">
@@ -4735,7 +4776,7 @@ function go(p){
  toggleNav(false);
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
- if(p==='settings'){renderServer();loadBackupInfo()}
+ if(p==='settings'){renderServer();loadBackupInfo();loadObfMode()}
  if(p==='live')loadLive(); else stopLive();
 }
 
@@ -5180,6 +5221,24 @@ async function resetTraffic(id){await api('/api/users/'+id+'/reset-traffic',{met
 async function newUuid(id){if(confirm(T('uuidWarn'))){await api('/api/users/'+id+'/new-uuid',{method:'POST'});closeModal();loadUsers()}}
 async function delUser(id){if(confirm(T('delWarn'))){await api('/api/users/'+id,{method:'DELETE'});closeModal();loadUsers();loadStats()}}
 
+let OBF_ON=false;
+async function loadObfMode(){
+ try{const r=await api('/api/obfuscation');OBF_ON=!!r.enabled;
+  const b=document.getElementById('obfMaster');if(b)b.checked=OBF_ON;
+ }catch(e){}
+}
+async function saveObfMode(){
+ const b=document.getElementById('obfMaster');if(!b)return;
+ const m=document.getElementById('obfMsg');
+ try{const r=await api('/api/obfuscation',{method:'POST',
+   body:JSON.stringify({enabled:b.checked})});
+  OBF_ON=!!r.enabled;b.checked=OBF_ON;
+  if(m){m.style.color='var(--ok)';m.textContent=T('savedOk');
+   setTimeout(()=>{m.textContent=''},2000)}
+  loadUsers();
+ }catch(e){b.checked=OBF_ON;if(m){m.style.color='var(--bad)';m.textContent=e.message}}
+}
+
 async function doChangePw(){
  pwMsg.textContent='';
  try{await api('/api/change-password',{method:'POST',
@@ -5281,7 +5340,7 @@ function copy(btn,t){navigator.clipboard.writeText(t);
  const old=btn.textContent;btn.textContent=T('copied');setTimeout(()=>btn.textContent=old,1200)}
 
 go(PAGE);
-loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();
+loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();loadObfMode();
 setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 </script></body></html>"""
 
