@@ -1625,12 +1625,24 @@ OBF_FM = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", '
 
 
 def obf_enabled() -> bool:
-    """The panel-wide master switch. Off by default.
+    """Panel-wide obfuscation master switch. Off by default.
 
-    With it off nobody gets an obfuscated link, no matter what their own flag
-    says, so the subscription goes back to plain configs with one click.
+    With it off nobody gets an obfuscated link no matter what their own flag says,
+    so one click puts every subscription back to plain configs.
     """
     return (get_setting("obf_enabled") or "0") == "1"
+
+
+def xhttp_enabled() -> bool:
+    """Whether the XHTTP variants are published in subscriptions at all.
+
+    Off by default. XHTTP entries are the ones clients mark with a bolt/rocket
+    badge, they are unaffected by the obfuscation switch (that one only shapes the
+    WS link), and on a free Render dyno they burn far more requests than WS. The
+    inbound keeps serving them, so links already handed out never break — they
+    just stop being listed.
+    """
+    return (get_setting("xhttp_enabled") or "0") == "1"
 
 
 def obf_on(row) -> bool:
@@ -1750,11 +1762,11 @@ BOLTS = ("\u26a1\ufe0f", "\u26a1", "\U0001f5f2\ufe0f", "\U0001f5f2")
 
 
 def clean_label(text: str) -> str:
-    """Strip lightning bolts out of any name the panel emits.
+    """Strip lightning bolts from every name the panel emits.
 
-    They used to come from the subscription profile title and could also be
-    inherited from a proxy remark or a clean-IP note, and clients then show that
-    bolt on every config in the group.
+    They came from the subscription profile title, and can also be inherited from
+    a proxy remark or a clean-IP note; clients then paint that bolt on the whole
+    group. Nothing this panel hands out carries one any more.
     """
     out = str(text or "")
     for b in BOLTS:
@@ -1768,7 +1780,7 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     ws_builder = ws_uri_obf if obf_on(row) else ws_uri
     if t in ("ws", "both"):
         kinds.append(("WS", ws_builder))
-    if t in ("xhttp", "both"):
+    if t in ("xhttp", "both") and xhttp_enabled():
         kinds.append(("XHTTP", xhttp_uri))
 
     # Every route sits in the same subscription, side by side: first the host's own
@@ -2435,20 +2447,25 @@ async def activate_proxy(pid: int, _=Depends(require_admin)):
             "flag": res.get("flag"), "exit_ip": res.get("exit_ip")}
 
 
-class ObfModeIn(BaseModel):
-    enabled: bool
+class SubModeIn(BaseModel):
+    obfuscation: Optional[bool] = None
+    xhttp: Optional[bool] = None
 
 
-@app.get("/api/obfuscation")
-async def get_obf_mode(_=Depends(require_admin)):
-    return {"enabled": obf_enabled()}
+@app.get("/api/sub-mode")
+async def get_sub_mode(_=Depends(require_admin)):
+    return {"obfuscation": obf_enabled(), "xhttp": xhttp_enabled()}
 
 
-@app.post("/api/obfuscation")
-async def set_obf_mode(body: ObfModeIn, _=Depends(require_admin)):
-    set_setting("obf_enabled", "1" if body.enabled else "0")
-    audit("obfuscation", "", "on" if body.enabled else "off")
-    return {"enabled": obf_enabled()}
+@app.post("/api/sub-mode")
+async def set_sub_mode(body: SubModeIn, _=Depends(require_admin)):
+    if body.obfuscation is not None:
+        set_setting("obf_enabled", "1" if body.obfuscation else "0")
+        audit("obfuscation", "", "on" if body.obfuscation else "off")
+    if body.xhttp is not None:
+        set_setting("xhttp_enabled", "1" if body.xhttp else "0")
+        audit("xhttp-configs", "", "on" if body.xhttp else "off")
+    return {"obfuscation": obf_enabled(), "xhttp": xhttp_enabled()}
 
 
 @app.post("/api/proxies/mode")
@@ -4125,9 +4142,11 @@ const I18N={
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
   obfLbl:'مبهم‌ساز (Fragment + Cipher mask)',
-  obfTitle:'مبهم‌ساز کانفیگ',
+  subModeTitle:'کانفیگ‌های اشتراک',
   obfMasterLbl:'مبهم‌ساز روشن باشد',
-  obfHint:'تا وقتی خاموش است، هیچ کاربری کانفیگ مبهم‌شده نمی‌گیرد. با روشن کردن، فقط کاربرانی که تیک مبهم‌ساز دارند کانفیگ مبهم می‌گیرند.',
+  obfHint:'تا وقتی خاموش است هیچ کاربری کانفیگ مبهم‌شده نمی‌گیرد؛ با روشن کردن، فقط کاربرانی که تیک مبهم‌ساز دارند. فقط روی کانفیگ WS اعمال می‌شود.',
+  xhMasterLbl:'کانفیگ‌های XHTTP در ساب نمایش داده شوند',
+  xhHint:'اگر در برنامه کانفیگ‌هایی با علامت رعد/موشک می‌بینی همین‌ها هستند و با مبهم‌ساز تغییر نمی‌کنند. خاموش کردن این گزینه از ساب حذفشان می‌کند بدون اینکه لینک‌های قبلی ‌از کار بیفتند.',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
   cleanTitle:'مدیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
@@ -4240,9 +4259,11 @@ const I18N={
   active:'Enabled',saveBtn:'Save',resetTraffic:'Reset traffic',newUuid:'New UUID',
   customUuid:'Custom UUID',del:'Delete',
   obfLbl:'Obfuscation (Fragment + Cipher mask)',
-  obfTitle:'Config obfuscation',
+  subModeTitle:'Subscription configs',
   obfMasterLbl:'Enable obfuscation',
-  obfHint:'While this is off no user gets an obfuscated config. Turn it on and only users with the obfuscation box ticked get the obfuscated link.',
+  obfHint:'While this is off no user gets an obfuscated config; turn it on and only users with the obfuscation box ticked do. It only shapes the WS link.',
+  xhMasterLbl:'List XHTTP configs in subscriptions',
+  xhHint:'These are the entries clients badge with a bolt/rocket and they are not affected by the obfuscation switch. Turning this off removes them from every subscription without breaking links already handed out.',
   uuidWarn:'Rotate UUID? Existing configs will stop working.',delWarn:'Delete this user?',
   cleanTitle:'Clean IP manager',
   cleanHint:'Clean IPs or domains. Added to every subscription as extra configs.',
@@ -4642,12 +4663,16 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    </div>
   </div>
   <div class="card rounded-2xl p-4 space-y-2">
-   <p class="text-sm font-bold" data-t="obfTitle"></p>
-   <p class="text-[11px] dim" data-t="obfHint"></p>
+   <p class="text-sm font-bold" data-t="subModeTitle"></p>
    <label class="flex items-center gap-2 text-xs">
-    <input type="checkbox" id="obfMaster" onchange="saveObfMode()">
+    <input type="checkbox" id="obfMaster" onchange="saveSubMode()">
     <span data-t="obfMasterLbl"></span></label>
-   <p id="obfMsg" class="text-xs"></p>
+   <p class="text-[11px] dim" data-t="obfHint"></p>
+   <label class="flex items-center gap-2 text-xs pt-1">
+    <input type="checkbox" id="xhMaster" onchange="saveSubMode()">
+    <span data-t="xhMasterLbl"></span></label>
+   <p class="text-[11px] dim" data-t="xhHint"></p>
+   <p id="subModeMsg" class="text-xs"></p>
   </div>
   <div class="card rounded-2xl p-4 space-y-2">
    <p class="text-sm font-bold" data-t="changePw"></p>
@@ -4793,7 +4818,7 @@ function go(p){
  toggleNav(false);
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
- if(p==='settings'){renderServer();loadBackupInfo();loadObfMode()}
+ if(p==='settings'){renderServer();loadBackupInfo();loadSubMode()}
  if(p==='live')loadLive(); else stopLive();
 }
 
@@ -5238,22 +5263,25 @@ async function resetTraffic(id){await api('/api/users/'+id+'/reset-traffic',{met
 async function newUuid(id){if(confirm(T('uuidWarn'))){await api('/api/users/'+id+'/new-uuid',{method:'POST'});closeModal();loadUsers()}}
 async function delUser(id){if(confirm(T('delWarn'))){await api('/api/users/'+id,{method:'DELETE'});closeModal();loadUsers();loadStats()}}
 
-let OBF_ON=false;
-async function loadObfMode(){
- try{const r=await api('/api/obfuscation');OBF_ON=!!r.enabled;
-  const b=document.getElementById('obfMaster');if(b)b.checked=OBF_ON;
- }catch(e){}
+let SUBMODE={obfuscation:false,xhttp:false};
+function paintSubMode(){
+ const a=document.getElementById('obfMaster'),b=document.getElementById('xhMaster');
+ if(a)a.checked=!!SUBMODE.obfuscation;
+ if(b)b.checked=!!SUBMODE.xhttp;
 }
-async function saveObfMode(){
- const b=document.getElementById('obfMaster');if(!b)return;
- const m=document.getElementById('obfMsg');
- try{const r=await api('/api/obfuscation',{method:'POST',
-   body:JSON.stringify({enabled:b.checked})});
-  OBF_ON=!!r.enabled;b.checked=OBF_ON;
+async function loadSubMode(){
+ try{SUBMODE=await api('/api/sub-mode');paintSubMode()}catch(e){}
+}
+async function saveSubMode(){
+ const a=document.getElementById('obfMaster'),b=document.getElementById('xhMaster');
+ const m=document.getElementById('subModeMsg');
+ try{SUBMODE=await api('/api/sub-mode',{method:'POST',body:JSON.stringify(
+   {obfuscation:!!(a&&a.checked),xhttp:!!(b&&b.checked)})});
+  paintSubMode();
   if(m){m.style.color='var(--ok)';m.textContent=T('savedOk');
    setTimeout(()=>{m.textContent=''},2000)}
   loadUsers();
- }catch(e){b.checked=OBF_ON;if(m){m.style.color='var(--bad)';m.textContent=e.message}}
+ }catch(e){paintSubMode();if(m){m.style.color='var(--bad)';m.textContent=e.message}}
 }
 
 async function doChangePw(){
@@ -5357,7 +5385,7 @@ function copy(btn,t){navigator.clipboard.writeText(t);
  const old=btn.textContent;btn.textContent=T('copied');setTimeout(()=>btn.textContent=old,1200)}
 
 go(PAGE);
-loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();loadObfMode();
+loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();loadSubMode();
 setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 </script></body></html>"""
 
