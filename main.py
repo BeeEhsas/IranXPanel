@@ -1746,6 +1746,22 @@ def proxy_flag() -> str:
         return ""
 
 
+BOLTS = ("\u26a1\ufe0f", "\u26a1", "\U0001f5f2\ufe0f", "\U0001f5f2")
+
+
+def clean_label(text: str) -> str:
+    """Strip lightning bolts out of any name the panel emits.
+
+    They used to come from the subscription profile title and could also be
+    inherited from a proxy remark or a clean-IP note, and clients then show that
+    bolt on every config in the group.
+    """
+    out = str(text or "")
+    for b in BOLTS:
+        out = out.replace(b, "")
+    return " ".join(out.split())
+
+
 def build_configs(row, host: str, clean_ips) -> list[dict]:
     t = (row["transport"] or "both").lower()
     kinds = []
@@ -1785,17 +1801,17 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
             # The panel domain resolves to the host itself, so it only makes sense for
             # the server's own exit; proxy routes ride the clean IPs instead.
             if direct:
-                title = f"{mark} {row['name']}{suffix}"
-                out.append({"label": f"{mark} {row['name']}{suffix} \u00b7 Default",
+                title = clean_label(f"{mark} {row['name']}{suffix}")
+                out.append({"label": clean_label(f"{mark} {row['name']}{suffix} \u00b7 Default"),
                             "transport": tag,
                             "uri": fn(row, host, host, title, direct, pid)})
             for cip in clean_ips:
                 note = cip["remark"] or cip["address"]
                 cmark = (cip_flag(cip) or mark) if direct else mark
-                out.append({"label": f"{cmark} {note}{suffix}",
+                out.append({"label": clean_label(f"{cmark} {note}{suffix}"),
                             "transport": tag,
                             "uri": fn(row, cip["address"], host,
-                                      f"{cmark} {row['name']} \u00b7 {note}{suffix}",
+                                      clean_label(f"{cmark} {row['name']} \u00b7 {note}{suffix}"),
                                       direct, pid)})
     return out
 
@@ -1834,7 +1850,7 @@ def info_label(row) -> str:
 
 
 def build_info_lines(row, host: str) -> list[str]:
-    return [info_uri(info_label(row), host)]
+    return [info_uri(clean_label(info_label(row)), host)]
 
 
 def row_out(r) -> dict:
@@ -3981,7 +3997,8 @@ async def subscription(token: str, request: Request):
 
     body = base64.b64encode("\n".join(lines).encode()).decode()
     headers = {
-        "profile-title": "base64:" + base64.b64encode(f"{row['name']}".encode()).decode(),
+        "profile-title": "base64:" + base64.b64encode(
+            clean_label(row["name"]).encode()).decode(),
         "profile-update-interval": "12",
         "profile-web-page-url": f"https://{origin_domain(request)}/",
         "subscription-userinfo":
