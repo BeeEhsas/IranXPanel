@@ -1624,31 +1624,8 @@ OBF_FM = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", '
           '["109", "1"], "delays": ["1"], "maxSplit": "355"}}]}')
 
 
-def obf_enabled() -> bool:
-    """Panel-wide obfuscation master switch. Off by default.
-
-    With it off nobody gets an obfuscated link no matter what their own flag says,
-    so one click puts every subscription back to plain configs.
-    """
-    return (get_setting("obf_enabled") or "0") == "1"
-
-
-def xhttp_enabled() -> bool:
-    """Whether the XHTTP variants are published in subscriptions at all.
-
-    Off by default. XHTTP entries are the ones clients mark with a bolt/rocket
-    badge, they are unaffected by the obfuscation switch (that one only shapes the
-    WS link), and on a free Render dyno they burn far more requests than WS. The
-    inbound keeps serving them, so links already handed out never break — they
-    just stop being listed.
-    """
-    return (get_setting("xhttp_enabled") or "0") == "1"
-
-
 def obf_on(row) -> bool:
-    """True when the panel allows obfuscation AND this user asked for it."""
-    if not obf_enabled():
-        return False
+    """True when this user asked for the obfuscated link shape."""
     try:
         return bool(row["obfuscate"])
     except Exception:
@@ -1780,7 +1757,7 @@ def build_configs(row, host: str, clean_ips) -> list[dict]:
     ws_builder = ws_uri_obf if obf_on(row) else ws_uri
     if t in ("ws", "both"):
         kinds.append(("WS", ws_builder))
-    if t in ("xhttp", "both") and xhttp_enabled():
+    if t in ("xhttp", "both"):
         kinds.append(("XHTTP", xhttp_uri))
 
     # Every route sits in the same subscription, side by side: first the host's own
@@ -2445,27 +2422,6 @@ async def activate_proxy(pid: int, _=Depends(require_admin)):
           (px["kind"], px["host"], px["port"], res.get("country") or "?"))
     return {"ok": True, "active_id": pid, "country": res.get("country"),
             "flag": res.get("flag"), "exit_ip": res.get("exit_ip")}
-
-
-class SubModeIn(BaseModel):
-    obfuscation: Optional[bool] = None
-    xhttp: Optional[bool] = None
-
-
-@app.get("/api/sub-mode")
-async def get_sub_mode(_=Depends(require_admin)):
-    return {"obfuscation": obf_enabled(), "xhttp": xhttp_enabled()}
-
-
-@app.post("/api/sub-mode")
-async def set_sub_mode(body: SubModeIn, _=Depends(require_admin)):
-    if body.obfuscation is not None:
-        set_setting("obf_enabled", "1" if body.obfuscation else "0")
-        audit("obfuscation", "", "on" if body.obfuscation else "off")
-    if body.xhttp is not None:
-        set_setting("xhttp_enabled", "1" if body.xhttp else "0")
-        audit("xhttp-configs", "", "on" if body.xhttp else "off")
-    return {"obfuscation": obf_enabled(), "xhttp": xhttp_enabled()}
 
 
 @app.post("/api/proxies/mode")
@@ -4142,11 +4098,6 @@ const I18N={
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
   obfLbl:'مبهم‌ساز (Fragment + Cipher mask)',
-  subModeTitle:'کانفیگ‌های اشتراک',
-  obfMasterLbl:'مبهم‌ساز روشن باشد',
-  obfHint:'تا وقتی خاموش است هیچ کاربری کانفیگ مبهم‌شده نمی‌گیرد؛ با روشن کردن، فقط کاربرانی که تیک مبهم‌ساز دارند. فقط روی کانفیگ WS اعمال می‌شود.',
-  xhMasterLbl:'کانفیگ‌های XHTTP در ساب نمایش داده شوند',
-  xhHint:'اگر در برنامه کانفیگ‌هایی با علامت رعد/موشک می‌بینی همین‌ها هستند و با مبهم‌ساز تغییر نمی‌کنند. خاموش کردن این گزینه از ساب حذفشان می‌کند بدون اینکه لینک‌های قبلی ‌از کار بیفتند.',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
   cleanTitle:'مدیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
@@ -4259,11 +4210,6 @@ const I18N={
   active:'Enabled',saveBtn:'Save',resetTraffic:'Reset traffic',newUuid:'New UUID',
   customUuid:'Custom UUID',del:'Delete',
   obfLbl:'Obfuscation (Fragment + Cipher mask)',
-  subModeTitle:'Subscription configs',
-  obfMasterLbl:'Enable obfuscation',
-  obfHint:'While this is off no user gets an obfuscated config; turn it on and only users with the obfuscation box ticked do. It only shapes the WS link.',
-  xhMasterLbl:'List XHTTP configs in subscriptions',
-  xhHint:'These are the entries clients badge with a bolt/rocket and they are not affected by the obfuscation switch. Turning this off removes them from every subscription without breaking links already handed out.',
   uuidWarn:'Rotate UUID? Existing configs will stop working.',delWarn:'Delete this user?',
   cleanTitle:'Clean IP manager',
   cleanHint:'Clean IPs or domains. Added to every subscription as extra configs.',
@@ -4663,18 +4609,6 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    </div>
   </div>
   <div class="card rounded-2xl p-4 space-y-2">
-   <p class="text-sm font-bold" data-t="subModeTitle"></p>
-   <label class="flex items-center gap-2 text-xs">
-    <input type="checkbox" id="obfMaster" onchange="saveSubMode()">
-    <span data-t="obfMasterLbl"></span></label>
-   <p class="text-[11px] dim" data-t="obfHint"></p>
-   <label class="flex items-center gap-2 text-xs pt-1">
-    <input type="checkbox" id="xhMaster" onchange="saveSubMode()">
-    <span data-t="xhMasterLbl"></span></label>
-   <p class="text-[11px] dim" data-t="xhHint"></p>
-   <p id="subModeMsg" class="text-xs"></p>
-  </div>
-  <div class="card rounded-2xl p-4 space-y-2">
    <p class="text-sm font-bold" data-t="changePw"></p>
    <input id="pwCur" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm">
    <input id="pwNew" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm">
@@ -4818,7 +4752,7 @@ function go(p){
  toggleNav(false);
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
- if(p==='settings'){renderServer();loadBackupInfo();loadSubMode()}
+ if(p==='settings'){renderServer();loadBackupInfo()}
  if(p==='live')loadLive(); else stopLive();
 }
 
@@ -5263,27 +5197,6 @@ async function resetTraffic(id){await api('/api/users/'+id+'/reset-traffic',{met
 async function newUuid(id){if(confirm(T('uuidWarn'))){await api('/api/users/'+id+'/new-uuid',{method:'POST'});closeModal();loadUsers()}}
 async function delUser(id){if(confirm(T('delWarn'))){await api('/api/users/'+id,{method:'DELETE'});closeModal();loadUsers();loadStats()}}
 
-let SUBMODE={obfuscation:false,xhttp:false};
-function paintSubMode(){
- const a=document.getElementById('obfMaster'),b=document.getElementById('xhMaster');
- if(a)a.checked=!!SUBMODE.obfuscation;
- if(b)b.checked=!!SUBMODE.xhttp;
-}
-async function loadSubMode(){
- try{SUBMODE=await api('/api/sub-mode');paintSubMode()}catch(e){}
-}
-async function saveSubMode(){
- const a=document.getElementById('obfMaster'),b=document.getElementById('xhMaster');
- const m=document.getElementById('subModeMsg');
- try{SUBMODE=await api('/api/sub-mode',{method:'POST',body:JSON.stringify(
-   {obfuscation:!!(a&&a.checked),xhttp:!!(b&&b.checked)})});
-  paintSubMode();
-  if(m){m.style.color='var(--ok)';m.textContent=T('savedOk');
-   setTimeout(()=>{m.textContent=''},2000)}
-  loadUsers();
- }catch(e){paintSubMode();if(m){m.style.color='var(--bad)';m.textContent=e.message}}
-}
-
 async function doChangePw(){
  pwMsg.textContent='';
  try{await api('/api/change-password',{method:'POST',
@@ -5385,235 +5298,9 @@ function copy(btn,t){navigator.clipboard.writeText(t);
  const old=btn.textContent;btn.textContent=T('copied');setTimeout(()=>btn.textContent=old,1200)}
 
 go(PAGE);
-loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();loadSubMode();
+loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();
 setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
 </script></body></html>"""
 
 AUTH_HTML  = AUTH_HTML.replace("__THEME__", THEME_CSS).replace("__I18N__", I18N_JS)
 PANEL_HTML = PANEL_HTML.replace("__THEME__", THEME_CSS).replace("__I18N__", I18N_JS)
-# ── مبهم‌سازی کانفیگ ساب (Fragment + CS + FinalMask) — خودکفا، بدون فایل جدید ──
-import json as _fjson
-import os as _fos
-from urllib.parse import quote as _fquote, parse_qsl as _fparse
-
-
-def _fenv(name, default=""):
-    return (_fos.getenv(name, default) or default).strip()
-
-
-FRAG_MODE = _fenv("FRAG_MODE", "auto").lower()     # off | auto | on
-FRAG_STYLE = _fenv("FRAG_STYLE", "extra").lower()  # extra | only
-FRAG_FP = _fenv("FRAG_FP", "unsafe")
-FRAG_IP = _fenv("FRAG_IP", "")
-FRAG_MARK = _fos.getenv("FRAG_MARK", "\u26a1")
-
-_FRAG_CS_DEFAULT = ":".join([
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_CHACHA20_POLY1305_SHA256",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-])
-FRAG_CS = _fenv("FRAG_CS") or _FRAG_CS_DEFAULT
-
-# شکل رسمی FinalMask در Xray: هر ماسک = {"type": "fragment", "settings": {...}}
-_FRAG_FM_DEFAULT = {
-    "tcp": [
-        {"type": "fragment", "settings": {"packets": "tlshello", "lengths": ["5", "94", "1"], "delays": ["0"], "maxSplit": "0"}},
-        {"type": "fragment", "settings": {"packets": "1-1", "lengths": ["109", "1"], "delays": ["1"], "maxSplit": "355"}},
-    ]
-}
-
-
-def _frag_mask(entry):
-    if not isinstance(entry, dict):
-        return entry
-    if "type" in entry or "settings" in entry:
-        return entry
-    e = dict(entry)
-    packets = e.pop("fragment", None) or e.pop("packets", None) or "tlshello"
-    return {"type": "fragment", "settings": dict({"packets": packets}, **e)}
-
-
-def _frag_norm_fm(fm):
-    if not isinstance(fm, dict):
-        return _FRAG_FM_DEFAULT
-    out = {}
-    for k in ("tcp", "udp"):
-        if isinstance(fm.get(k), list):
-            out[k] = [_frag_mask(x) for x in fm[k]]
-    if isinstance(fm.get("quicParams"), dict):
-        out["quicParams"] = fm["quicParams"]
-    return out or _FRAG_FM_DEFAULT
-
-
-try:
-    _fm_raw = _fenv("FRAG_FM")
-    FRAG_FM = _fjson.dumps(
-        _frag_norm_fm(_fjson.loads(_fm_raw) if _fm_raw else _FRAG_FM_DEFAULT),
-        separators=(",", ":"), ensure_ascii=False)
-except Exception:
-    FRAG_FM = _fjson.dumps(_FRAG_FM_DEFAULT, separators=(",", ":"), ensure_ascii=False)
-
-FRAG_PARAM_ORDER = ["cs", "path", "security", "alpn", "encryption", "fm",
-                    "insecure", "host", "fp", "type", "allowInsecure",
-                    "sni", "mode"]
-_FRAG_DROP = ("mux",)          # mux با fragment جمع نمی‌شود
-_FRAG_NAME_KEYS = ("name", "label", "remark", "title", "tag")
-_FRAG_URI_KEYS = ("uri", "link", "url", "config", "vless", "value")
-
-
-def frag_wanted(host=""):
-    if FRAG_MODE == "on":
-        return True
-    if FRAG_MODE == "off":
-        return False
-    if (globals().get("RELAY_DOMAIN") or ""):
-        return True
-    h = (host or "").lower()
-    if "onrender.com" in h or "workers.dev" in h:
-        return True
-    if _fos.getenv("RENDER") or _fos.getenv("RENDER_SERVICE_ID"):
-        return True
-    return False
-
-
-def _frag_split_hostport(hostport):
-    if hostport.startswith("["):
-        end = hostport.find("]")
-        if end != -1:
-            return hostport[:end + 1], hostport[end + 1:]
-    if ":" in hostport:
-        h, _, p = hostport.rpartition(":")
-        return h, ":" + p
-    return hostport, ""
-
-
-def optimize_vless(uri, cdn_ip=""):
-    if not isinstance(uri, str) or not uri.startswith("vless://"):
-        return uri
-    head, sep, frag = uri.partition("#")
-    rest = head[len("vless://"):]
-    userinfo, at, hostpart = rest.partition("@")
-    if not at:
-        return uri
-    hostport, _, query = hostpart.partition("?")
-    host, port = _frag_split_hostport(hostport)
-
-    ip = (cdn_ip or FRAG_IP).strip()
-    if ip:
-        host = "[" + ip + "]" if (":" in ip and not ip.startswith("[")) else ip
-
-    merged, order = {}, []
-    for k, v in _fparse(query, keep_blank_values=True):
-        if k in _FRAG_DROP:
-            continue
-        if k not in merged:
-            order.append(k)
-        merged[k] = v
-    for k, v in (("fp", FRAG_FP), ("cs", FRAG_CS), ("fm", FRAG_FM)):
-        if k not in merged:
-            order.append(k)
-        merged[k] = v
-
-    keys = [k for k in FRAG_PARAM_ORDER if k in merged]
-    keys += [k for k in order if k not in FRAG_PARAM_ORDER]
-    q = "&".join(_fquote(k, safe="") + "=" + _fquote(merged[k], safe="") for k in keys)
-    out = "vless://" + userinfo + "@" + host + port + "?" + q
-    return out + (("#" + frag) if sep else "")
-
-
-def _frag_uri_key(item):
-    for k in _FRAG_URI_KEYS:
-        v = item.get(k)
-        if isinstance(v, str) and v.startswith("vless://"):
-            return k
-    for k, v in item.items():
-        if isinstance(v, str) and v.startswith("vless://"):
-            return k
-    return None
-
-
-def _frag_rename(uri, name):
-    if not FRAG_MARK:
-        return uri
-    base, sep, tail = uri.partition("#")
-    label = (name or "").strip()
-    if not label and sep:
-        return base + "#" + tail + "%20" + _fquote(FRAG_MARK)
-    if not label:
-        return uri
-    return base + "#" + _fquote((label + " " + FRAG_MARK).strip())
-
-
-def frag_apply(configs, host="", want=None):
-    if want is None:
-        want = frag_wanted(host)
-    if not want or not configs:
-        return configs
-
-    out = []
-    for c in configs:
-        if isinstance(c, str):
-            if not c.startswith("vless://") or "security=none" in c:
-                out.append(c)
-                continue
-            opt = optimize_vless(c)
-            if FRAG_STYLE == "only":
-                out.append(opt)
-            else:
-                out.append(c)
-                out.append(opt)
-            continue
-
-        if not isinstance(c, dict):
-            out.append(c)
-            continue
-
-        key = _frag_uri_key(c)
-        uri = c.get(key) if key else ""
-        if not key or "security=none" in uri:
-            out.append(c)
-            continue
-
-        name = ""
-        for nk in _FRAG_NAME_KEYS:
-            if isinstance(c.get(nk), str) and c[nk]:
-                name = c[nk]
-                break
-
-        opt_item = dict(c)
-        opt_item[key] = _frag_rename(optimize_vless(uri), name)
-        if name and FRAG_MARK:
-            for nk in _FRAG_NAME_KEYS:
-                if isinstance(opt_item.get(nk), str) and opt_item[nk] == name:
-                    opt_item[nk] = (name + " " + FRAG_MARK).strip()
-
-        if FRAG_STYLE == "only":
-            out.append(opt_item)
-        else:
-            out.append(c)
-            out.append(opt_item)
-    return out
-
-
-try:
-    _frag_plain_build_configs = build_configs
-    if not getattr(_frag_plain_build_configs, "_frag", False):
-        def build_configs(*args, **kwargs):
-            host = kwargs.get("host", args[1] if len(args) > 1 else "")
-            return frag_apply(_frag_plain_build_configs(*args, **kwargs), host)
-        build_configs._frag = True
-        print("frag: installed (mode=%s style=%s fp=%s cdn_ip=%s)"
-              % (FRAG_MODE, FRAG_STYLE, FRAG_FP, FRAG_IP or "-"))
-except Exception as _frag_err:
-    print("frag: disabled -", _frag_err)
-# ── پایان بلوک مبهم‌سازی ────────────────────────────────────────────────
