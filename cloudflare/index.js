@@ -3772,8 +3772,7 @@ async function claimInitialPassword(db, env, provided = "") {
 }
 __name(claimInitialPassword, "claimInitialPassword");
 async function setupPassword(db, env, provided = "", confirm = "") {
-  const seeded = await claimInitialPassword(db, env, provided);
-  if (seeded) return seeded;
+  if (env.ADMIN_PASSWORD) return claimInitialPassword(db, env, provided);
   if (await passwordSet(db)) return false;
   if (provided !== confirm || !passwordPolicy(provided)) throw new Error("passwords must match and meet password policy");
   const h = await hashPassword(provided), sessionKey = env.SECRET_KEY || randomSecret(), writes = [db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("password_hash", JSON.stringify(h))];
