@@ -645,7 +645,7 @@ const I18N={
   bkProxCreds:'\u067E\u0631\u0648\u06A9\u0633\u06CC \u0628\u0627 \u06CC\u0648\u0632\u0631/\u067E\u0633\u0648\u0631\u062F',
   bkEnvDiff:'\u26A0\uFE0F \u0627\u06CC\u0646 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627 \u0628\u0627 \u067E\u0646\u0644 \u0641\u0639\u0644\u06CC \u062A\u0641\u0627\u0648\u062A \u062F\u0627\u0631\u0646\u062F \u0648 \u0628\u0627\u06CC\u062F \u062F\u0633\u062A\u06CC \u062F\u0631 Railway/Render \u0633\u062A \u0634\u0648\u0646\u062F:',
   bkReplaceWarn:'\u0647\u0645\u0647\u0654 \u06A9\u0627\u0631\u0628\u0631\u0627\u0646\u060C \u0622\u06CC\u200C\u067E\u06CC\u200C\u0647\u0627\u06CC \u062A\u0645\u06CC\u0632 \u0648 \u067E\u0631\u0648\u06A9\u0633\u06CC\u200C\u0647\u0627\u06CC \u0641\u0639\u0644\u06CC \u062D\u0630\u0641 \u0648 \u0628\u0627 \u0641\u0627\u06CC\u0644 \u062C\u0627\u06CC\u06AF\u0632\u06CC\u0646 \u0645\u06CC\u200C\u0634\u0648\u0646\u062F. \u0645\u0637\u0645\u0626\u0646\u06CC\u061F',
-  bkPwChanged:'\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.',
+  bkPwChanged:"\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.",
   bkDone:'\u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0627\u0646\u062C\u0627\u0645 \u0634\u062F',
   bkAdded:'\u0627\u0636\u0627\u0641\u0647\u200C\u0634\u062F\u0647',bkUpdated:'\u0628\u0647\u200C\u0631\u0648\u0632\u0634\u062F\u0647',bkSkipped:'\u0631\u062F\u0634\u062F\u0647',
   relayLbl:'\u062F\u0627\u0645\u0646\u0647 \u0631\u0644\u0647',keepAliveLbl:'\u062C\u0644\u0648\u06AF\u06CC\u0631\u06CC \u0627\u0632 \u062E\u0648\u0627\u0628',relayNone:'\u0646\u062F\u0627\u0631\u062F',
@@ -727,11 +727,11 @@ const I18N={
         +'Cloudflare relay, set XHTTP_MODE=stream-up to get 2 requests per connection instead. '
         +'Existing configs keep working, but users need to refresh their subscription once.',
   trWarnTitle:'\u26A0\uFE0F XHTTP request cost:',
-  trWarn:'Cost depends on the mode. stream-up \u2014 this panel\\'s default \u2014 is 2 requests per '
-        +'connection (a GET downlink plus one long-lived POST uplink). packet-up sends every '
-        +'upload chunk as its own POST, so one active client can be hundreds of requests a '
-        +'minute and will drain a Cloudflare Worker\\'s daily quota (100k). WS is cheapest of '
-        +'all: 1 request per connection no matter how long it stays open.',
+  trWarn:"Cost depends on the mode. stream-up \u2014 this panel's default \u2014 is 2 requests per "
+       +"connection (one GET downlink plus one long-lived POST uplink). packet-up sends every "
+       +"upload chunk as its own POST, so one active client can be hundreds of requests a "
+       +"minute and will drain a Cloudflare Worker's daily quota (100k). WS is cheapest of "
+       +"all: 1 request per connection no matter how long it stays open.",
   backupTitle:'\u{1F4E6} Backup',
   backupHint:'A single .ixpbak file holding every user (with their UUID and subscription '
         +'token), your clean IPs, your proxies, the panel password and its settings. Import '
@@ -758,7 +758,7 @@ const I18N={
   bkProxCreds:'proxies with credentials',
   bkEnvDiff:'\u26A0\uFE0F These variables differ from this panel and must be set by hand in Railway/Render:',
   bkReplaceWarn:'All current users, clean IPs and proxies will be deleted and replaced by the file. Continue?',
-  bkPwChanged:'The panel password was restored from the file \u2014 sign in with that file\\'s password next time.',
+  bkPwChanged:"The panel password was restored from the file \u2014 sign in with that file's password next time.",
   bkDone:'Restore complete',
   bkAdded:'added',bkUpdated:'updated',bkSkipped:'skipped',
   relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
@@ -989,7 +989,7 @@ const I18N={
   bkProxCreds:'\u067E\u0631\u0648\u06A9\u0633\u06CC \u0628\u0627 \u06CC\u0648\u0632\u0631/\u067E\u0633\u0648\u0631\u062F',
   bkEnvDiff:'\u26A0\uFE0F \u0627\u06CC\u0646 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627 \u0628\u0627 \u067E\u0646\u0644 \u0641\u0639\u0644\u06CC \u062A\u0641\u0627\u0648\u062A \u062F\u0627\u0631\u0646\u062F \u0648 \u0628\u0627\u06CC\u062F \u062F\u0633\u062A\u06CC \u062F\u0631 Railway/Render \u0633\u062A \u0634\u0648\u0646\u062F:',
   bkReplaceWarn:'\u0647\u0645\u0647\u0654 \u06A9\u0627\u0631\u0628\u0631\u0627\u0646\u060C \u0622\u06CC\u200C\u067E\u06CC\u200C\u0647\u0627\u06CC \u062A\u0645\u06CC\u0632 \u0648 \u067E\u0631\u0648\u06A9\u0633\u06CC\u200C\u0647\u0627\u06CC \u0641\u0639\u0644\u06CC \u062D\u0630\u0641 \u0648 \u0628\u0627 \u0641\u0627\u06CC\u0644 \u062C\u0627\u06CC\u06AF\u0632\u06CC\u0646 \u0645\u06CC\u200C\u0634\u0648\u0646\u062F. \u0645\u0637\u0645\u0626\u0646\u06CC\u061F',
-  bkPwChanged:'\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.',
+  bkPwChanged:"\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.",
   bkDone:'\u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0627\u0646\u062C\u0627\u0645 \u0634\u062F',
   bkAdded:'\u0627\u0636\u0627\u0641\u0647\u200C\u0634\u062F\u0647',bkUpdated:'\u0628\u0647\u200C\u0631\u0648\u0632\u0634\u062F\u0647',bkSkipped:'\u0631\u062F\u0634\u062F\u0647',
   relayLbl:'\u062F\u0627\u0645\u0646\u0647 \u0631\u0644\u0647',keepAliveLbl:'\u062C\u0644\u0648\u06AF\u06CC\u0631\u06CC \u0627\u0632 \u062E\u0648\u0627\u0628',relayNone:'\u0646\u062F\u0627\u0631\u062F',
@@ -1071,11 +1071,11 @@ const I18N={
         +'Cloudflare relay, set XHTTP_MODE=stream-up to get 2 requests per connection instead. '
         +'Existing configs keep working, but users need to refresh their subscription once.',
   trWarnTitle:'\u26A0\uFE0F XHTTP request cost:',
-  trWarn:'Cost depends on the mode. stream-up \u2014 this panel\\\\'s default \u2014 is 2 requests per '
-        +'connection (a GET downlink plus one long-lived POST uplink). packet-up sends every '
-        +'upload chunk as its own POST, so one active client can be hundreds of requests a '
-        +'minute and will drain a Cloudflare Worker\\\\'s daily quota (100k). WS is cheapest of '
-        +'all: 1 request per connection no matter how long it stays open.',
+  trWarn:"Cost depends on the mode. stream-up \u2014 this panel's default \u2014 is 2 requests per "
+       +"connection (one GET downlink plus one long-lived POST uplink). packet-up sends every "
+       +"upload chunk as its own POST, so one active client can be hundreds of requests a "
+       +"minute and will drain a Cloudflare Worker's daily quota (100k). WS is cheapest of "
+       +"all: 1 request per connection no matter how long it stays open.",
   backupTitle:'\u{1F4E6} Backup',
   backupHint:'A single .ixpbak file holding every user (with their UUID and subscription '
         +'token), your clean IPs, your proxies, the panel password and its settings. Import '
@@ -1102,7 +1102,7 @@ const I18N={
   bkProxCreds:'proxies with credentials',
   bkEnvDiff:'\u26A0\uFE0F These variables differ from this panel and must be set by hand in Railway/Render:',
   bkReplaceWarn:'All current users, clean IPs and proxies will be deleted and replaced by the file. Continue?',
-  bkPwChanged:'The panel password was restored from the file \u2014 sign in with that file\\\\'s password next time.',
+  bkPwChanged:"The panel password was restored from the file \u2014 sign in with that file's password next time.",
   bkDone:'Restore complete',
   bkAdded:'added',bkUpdated:'updated',bkSkipped:'skipped',
   relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
@@ -1336,7 +1336,7 @@ const I18N={
   bkProxCreds:'\u067E\u0631\u0648\u06A9\u0633\u06CC \u0628\u0627 \u06CC\u0648\u0632\u0631/\u067E\u0633\u0648\u0631\u062F',
   bkEnvDiff:'\u26A0\uFE0F \u0627\u06CC\u0646 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627 \u0628\u0627 \u067E\u0646\u0644 \u0641\u0639\u0644\u06CC \u062A\u0641\u0627\u0648\u062A \u062F\u0627\u0631\u0646\u062F \u0648 \u0628\u0627\u06CC\u062F \u062F\u0633\u062A\u06CC \u062F\u0631 Railway/Render \u0633\u062A \u0634\u0648\u0646\u062F:',
   bkReplaceWarn:'\u0647\u0645\u0647\u0654 \u06A9\u0627\u0631\u0628\u0631\u0627\u0646\u060C \u0622\u06CC\u200C\u067E\u06CC\u200C\u0647\u0627\u06CC \u062A\u0645\u06CC\u0632 \u0648 \u067E\u0631\u0648\u06A9\u0633\u06CC\u200C\u0647\u0627\u06CC \u0641\u0639\u0644\u06CC \u062D\u0630\u0641 \u0648 \u0628\u0627 \u0641\u0627\u06CC\u0644 \u062C\u0627\u06CC\u06AF\u0632\u06CC\u0646 \u0645\u06CC\u200C\u0634\u0648\u0646\u062F. \u0645\u0637\u0645\u0626\u0646\u06CC\u061F',
-  bkPwChanged:'\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.',
+  bkPwChanged:"\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.",
   bkDone:'\u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0627\u0646\u062C\u0627\u0645 \u0634\u062F',
   bkAdded:'\u0627\u0636\u0627\u0641\u0647\u200C\u0634\u062F\u0647',bkUpdated:'\u0628\u0647\u200C\u0631\u0648\u0632\u0634\u062F\u0647',bkSkipped:'\u0631\u062F\u0634\u062F\u0647',
   relayLbl:'\u062F\u0627\u0645\u0646\u0647 \u0631\u0644\u0647',keepAliveLbl:'\u062C\u0644\u0648\u06AF\u06CC\u0631\u06CC \u0627\u0632 \u062E\u0648\u0627\u0628',relayNone:'\u0646\u062F\u0627\u0631\u062F',
@@ -1418,11 +1418,11 @@ const I18N={
         +'Cloudflare relay, set XHTTP_MODE=stream-up to get 2 requests per connection instead. '
         +'Existing configs keep working, but users need to refresh their subscription once.',
   trWarnTitle:'\u26A0\uFE0F XHTTP request cost:',
-  trWarn:'Cost depends on the mode. stream-up \u2014 this panel\\'s default \u2014 is 2 requests per '
-        +'connection (a GET downlink plus one long-lived POST uplink). packet-up sends every '
-        +'upload chunk as its own POST, so one active client can be hundreds of requests a '
-        +'minute and will drain a Cloudflare Worker\\'s daily quota (100k). WS is cheapest of '
-        +'all: 1 request per connection no matter how long it stays open.',
+  trWarn:"Cost depends on the mode. stream-up \u2014 this panel's default \u2014 is 2 requests per "
+       +"connection (one GET downlink plus one long-lived POST uplink). packet-up sends every "
+       +"upload chunk as its own POST, so one active client can be hundreds of requests a "
+       +"minute and will drain a Cloudflare Worker's daily quota (100k). WS is cheapest of "
+       +"all: 1 request per connection no matter how long it stays open.",
   backupTitle:'\u{1F4E6} Backup',
   backupHint:'A single .ixpbak file holding every user (with their UUID and subscription '
         +'token), your clean IPs, your proxies, the panel password and its settings. Import '
@@ -1449,7 +1449,7 @@ const I18N={
   bkProxCreds:'proxies with credentials',
   bkEnvDiff:'\u26A0\uFE0F These variables differ from this panel and must be set by hand in Railway/Render:',
   bkReplaceWarn:'All current users, clean IPs and proxies will be deleted and replaced by the file. Continue?',
-  bkPwChanged:'The panel password was restored from the file \u2014 sign in with that file\\'s password next time.',
+  bkPwChanged:"The panel password was restored from the file \u2014 sign in with that file's password next time.",
   bkDone:'Restore complete',
   bkAdded:'added',bkUpdated:'updated',bkSkipped:'skipped',
   relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
@@ -2546,7 +2546,7 @@ const I18N={
   bkProxCreds:'\u067E\u0631\u0648\u06A9\u0633\u06CC \u0628\u0627 \u06CC\u0648\u0632\u0631/\u067E\u0633\u0648\u0631\u062F',
   bkEnvDiff:'\u26A0\uFE0F \u0627\u06CC\u0646 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627 \u0628\u0627 \u067E\u0646\u0644 \u0641\u0639\u0644\u06CC \u062A\u0641\u0627\u0648\u062A \u062F\u0627\u0631\u0646\u062F \u0648 \u0628\u0627\u06CC\u062F \u062F\u0633\u062A\u06CC \u062F\u0631 Railway/Render \u0633\u062A \u0634\u0648\u0646\u062F:',
   bkReplaceWarn:'\u0647\u0645\u0647\u0654 \u06A9\u0627\u0631\u0628\u0631\u0627\u0646\u060C \u0622\u06CC\u200C\u067E\u06CC\u200C\u0647\u0627\u06CC \u062A\u0645\u06CC\u0632 \u0648 \u067E\u0631\u0648\u06A9\u0633\u06CC\u200C\u0647\u0627\u06CC \u0641\u0639\u0644\u06CC \u062D\u0630\u0641 \u0648 \u0628\u0627 \u0641\u0627\u06CC\u0644 \u062C\u0627\u06CC\u06AF\u0632\u06CC\u0646 \u0645\u06CC\u200C\u0634\u0648\u0646\u062F. \u0645\u0637\u0645\u0626\u0646\u06CC\u061F',
-  bkPwChanged:'\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.',
+  bkPwChanged:"\u0631\u0645\u0632 \u067E\u0646\u0644 \u0627\u0632 \u0641\u0627\u06CC\u0644 \u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0634\u062F \u2014 \u062F\u0641\u0639\u0647\u0654 \u0628\u0639\u062F \u0628\u0627 \u0631\u0645\u0632 \u0642\u062F\u06CC\u0645\u06CC\u0650 \u0647\u0645\u0627\u0646 \u0641\u0627\u06CC\u0644 \u0648\u0627\u0631\u062F \u0634\u0648\u06CC\u062F.",
   bkDone:'\u0628\u0627\u0632\u06AF\u0631\u062F\u0627\u0646\u06CC \u0627\u0646\u062C\u0627\u0645 \u0634\u062F',
   bkAdded:'\u0627\u0636\u0627\u0641\u0647\u200C\u0634\u062F\u0647',bkUpdated:'\u0628\u0647\u200C\u0631\u0648\u0632\u0634\u062F\u0647',bkSkipped:'\u0631\u062F\u0634\u062F\u0647',
   relayLbl:'\u062F\u0627\u0645\u0646\u0647 \u0631\u0644\u0647',keepAliveLbl:'\u062C\u0644\u0648\u06AF\u06CC\u0631\u06CC \u0627\u0632 \u062E\u0648\u0627\u0628',relayNone:'\u0646\u062F\u0627\u0631\u062F',
@@ -2628,11 +2628,11 @@ const I18N={
         +'Cloudflare relay, set XHTTP_MODE=stream-up to get 2 requests per connection instead. '
         +'Existing configs keep working, but users need to refresh their subscription once.',
   trWarnTitle:'\u26A0\uFE0F XHTTP request cost:',
-  trWarn:'Cost depends on the mode. stream-up \u2014 this panel\\\\'s default \u2014 is 2 requests per '
-        +'connection (a GET downlink plus one long-lived POST uplink). packet-up sends every '
-        +'upload chunk as its own POST, so one active client can be hundreds of requests a '
-        +'minute and will drain a Cloudflare Worker\\\\'s daily quota (100k). WS is cheapest of '
-        +'all: 1 request per connection no matter how long it stays open.',
+  trWarn:"Cost depends on the mode. stream-up \u2014 this panel's default \u2014 is 2 requests per "
+       +"connection (one GET downlink plus one long-lived POST uplink). packet-up sends every "
+       +"upload chunk as its own POST, so one active client can be hundreds of requests a "
+       +"minute and will drain a Cloudflare Worker's daily quota (100k). WS is cheapest of "
+       +"all: 1 request per connection no matter how long it stays open.",
   backupTitle:'\u{1F4E6} Backup',
   backupHint:'A single .ixpbak file holding every user (with their UUID and subscription '
         +'token), your clean IPs, your proxies, the panel password and its settings. Import '
@@ -2659,7 +2659,7 @@ const I18N={
   bkProxCreds:'proxies with credentials',
   bkEnvDiff:'\u26A0\uFE0F These variables differ from this panel and must be set by hand in Railway/Render:',
   bkReplaceWarn:'All current users, clean IPs and proxies will be deleted and replaced by the file. Continue?',
-  bkPwChanged:'The panel password was restored from the file \u2014 sign in with that file\\\\'s password next time.',
+  bkPwChanged:"The panel password was restored from the file \u2014 sign in with that file's password next time.",
   bkDone:'Restore complete',
   bkAdded:'added',bkUpdated:'updated',bkSkipped:'skipped',
   relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
