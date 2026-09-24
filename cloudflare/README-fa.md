@@ -1,98 +1,149 @@
-# IranX Panel — نصب دستی روی Cloudflare
+<div align="center">
+
+# IranX Panel
+
+### نصب دستی روی Cloudflare Workers + D1
+
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?style=flat-square&logo=cloudflare&logoColor=white)](#)
+[![D1 Database](https://img.shields.io/badge/D1-Database-005DAA?style=flat-square&logo=cloudflare&logoColor=white)](#)
+[![VLESS WebSocket](https://img.shields.io/badge/VLESS-WebSocket-7C5CFF?style=flat-square&logo=protonmail&logoColor=white)](#)
+
+**فارسی:** [راهنمای فارسی](README-fa.md) · **English:** [English guide](README.md)
+
+</div>
+
+---
 
 <div dir="rtl" align="right">
 
-این مخزن فقط برای نصب دستی نسخهٔ **Cloudflare Workers + D1** است. کد و فایل‌های Auto‑Deployer در این مخزن عمومی قرار ندارند.
+## معرفی کوتاه
 
-English: [README.md](README.md)
+پنل مدیریت IranX را مستقیماً از داخل **Cloudflare Dashboard** نصب کنید. این مخزن عمومی فقط شامل Worker آماده، ساختار D1 و راهنمای نصب است؛ سورس خصوصی Auto‑Deployer هیچ‌کدام از فایل‌های آن در این مخزن قرار ندارد.
 
-## فایل‌ها
+### چه چیزهایی لازم دارید؟
 
-- `index.js`: فایل آمادهٔ Worker پنل؛ محتوای آن را داخل ویرایشگر Cloudflare Dashboard قرار دهید.
-- `schema.sql`: فایل ساخت جدول‌های D1؛ محتوای آن را در D1 Console اجرا کنید.
+- حساب Cloudflare
+- حدود پنج دقیقه برای نصب
+- سه فایل عمومی موجود در همین مخزن
 
-## نصب پنل
+### کاربر چه چیزی را تنظیم می‌کند؟
 
-### ۱. ساخت Worker
+کاربر فقط این سه کار را انجام می‌دهد:
 
-در Cloudflare Dashboard وارد مسیر **Workers & Pages** شوید، یک Worker جدید بسازید و محتوای فایل `index.js` را داخل ویرایشگر آن قرار دهید.
+1. Worker و دیتابیس D1 را می‌سازد.
+2. دیتابیس را به Worker متصل می‌کند.
+3. پنل را باز می‌کند و رمز مدیر را خودش انتخاب می‌کند.
 
-سپس در تنظیمات Worker این Compatibility flag را فعال کنید:
+پنل خودش کلید نشست را می‌سازد، دامنهٔ عمومی `workers.dev` را از آدرس درخواست تشخیص می‌دهد و مسیرهای پیش‌فرض را اعمال می‌کند. دیگر نیازی به ثبت دستی `SECRET_KEY`، `DOMAIN`، `RELAY_DOMAIN` یا سایر متغیرها نیست.
+
+---
+
+## راهنمای نصب
+
+### مرحلهٔ ۱ — ساخت Worker
+
+1. وارد [Cloudflare Dashboard](https://dash.cloudflare.com/) شوید.
+2. به مسیر **Workers & Pages** بروید.
+3. یک Worker با نام کوتاهی مثل `iranx-panel` بسازید.
+4. وارد **Edit code** شوید و کد پیش‌فرض را با کل محتوای فایل [`index.js`](index.js) جای‌گذاری کنید.
+5. از مسیر **Settings → Runtime → Compatibility flags** گزینهٔ زیر را فعال کنید:
 
 ```text
 nodejs_compat
 ```
 
-### ۲. ساخت دیتابیس D1
+> فعال‌کردن `nodejs_compat` ضروری است و نباید رد شود.
 
-از مسیر **D1 SQL Database** یک دیتابیس جدید بسازید. سپس وارد Console آن شوید و محتوای فایل `schema.sql` را اجرا کنید.
+### مرحلهٔ ۲ — ساخت دیتابیس D1
 
-### ۳. اتصال دیتابیس به Worker
+1. در Cloudflare Dashboard وارد **Storage & Databases → D1 SQL Database** شوید.
+2. یک دیتابیس با نامی مثل `iranx-panel-db` بسازید.
+3. وارد **Console** دیتابیس شوید.
+4. فایل [`schema.sql`](schema.sql) را کامل باز کنید، تمام محتوای آن را در D1 Console paste کنید و اجرا بگیرید.
+5. مطمئن شوید جدول‌های پنل ساخته شده‌اند، سپس ادامه دهید.
 
-در مسیر زیر یک D1 binding اضافه کنید:
+### مرحلهٔ ۳ — اتصال D1 به Worker
+
+به مسیر زیر برگردید:
 
 ```text
 Settings → Bindings → Add → D1 Database
 ```
 
-مقادیر را این‌طور وارد کنید:
+تنظیمات را این‌طور وارد کنید:
 
-```text
-Variable name: DB
-D1 database: نام دیتابیسی که ساختید
-```
+| فیلد | مقدار |
+|---|---|
+| Variable name | `DB` |
+| D1 database | دیتابیسی که در مرحلهٔ ۲ ساختید |
 
-نام binding باید دقیقاً `DB` باشد.
+> نام binding باید **دقیقاً `DB`** باشد.
 
-### ۴. تنظیم Secretها
+### مرحلهٔ ۴ — انتشار و تعیین رمز
 
-در مسیر **Settings → Variables and Secrets** این دو Secret را اضافه کنید:
+1. روی **Deploy** بزنید.
+2. آدرس نهایی `https://<worker>.<account>.workers.dev` را باز کنید.
+3. رمز مدیر را دو بار وارد کنید.
+4. رمز باید حداقل ۸ کاراکتر و شامل این موارد باشد: یک حرف بزرگ انگلیسی، یک حرف کوچک انگلیسی و یک رقم.
 
-- `SECRET_KEY`: یک رشتهٔ تصادفی و قدرتمند برای امضای نشست‌ها
-- `ADMIN_PASSWORD`: رمز مدیر؛ حداقل ۸ کاراکتر و شامل حرف بزرگ، حرف کوچک و عدد
-
-مقادیر محرمانه را داخل README، کد یا ریپوی گیت‌هاب ننویسید.
-
-### ۵. تنظیم متغیرها
-
-این Environment Variableها را اضافه کنید:
-
-```text
-PANEL_TITLE = IranX Panel
-DOMAIN = نام-worker.نام-حساب.workers.dev
-RELAY_DOMAIN = نام-worker.نام-حساب.workers.dev
-WS_PATH = ws
-XHTTP_PATH = xh
-DEVICE_WINDOW = 300
-LIVE_WINDOW = 60
-SESSION_IDLE = 90
-```
-
-برای `DOMAIN` و `RELAY_DOMAIN` فقط نام هاست را بنویسید؛ عبارت `https://` و مسیر انتهایی را وارد نکنید.
-
-### ۶. انتشار پنل
-
-روی **Deploy** بزنید و سپس آدرس نهایی را باز کنید:
-
-```text
-https://نام-worker.نام-حساب.workers.dev
-```
-
-نام کاربری مدیر همیشه است:
+نام کاربری مدیر همیشه این است:
 
 ```text
 admin
 ```
 
-رمز ورود همان مقداری است که در Secret با نام `ADMIN_PASSWORD` تعیین کرده‌اید.
+رمز با الگوریتم PBKDF2-SHA256 هش می‌شود و داخل D1 نگهداری می‌شود؛ هیچ رمزی داخل ریپوی عمومی قرار نمی‌گیرد.
+
+---
+
+## بررسی نصب
+
+بعد از راه‌اندازی، موارد زیر را بررسی کنید:
+
+- آدرس `/healthz` مقدار `{"ok":true,"platform":"cloudflare"}` را برگرداند.
+- صفحهٔ `/setup` فقط پیش از تعیین رمز قابل دسترسی باشد.
+- مدیر بتواند کاربر بسازد و لینک سابسکریپشن دریافت کند.
+- مسیر WebSocket با آدرس `/ws` در دسترس باشد.
+- لینک‌های سابسکریپشن به‌صورت خودکار از دامنهٔ عمومی Worker ساخته شوند.
+
+برای بررسی مستقیم Health Check این آدرس را باز کنید:
+
+```text
+https://<worker>.<account>.workers.dev/healthz
+```
+
+---
+
+## چک‌لیست امنیتی
+
+- هرگز API Token، شناسهٔ حساب، رمز عبور یا Secret را commit نکنید.
+- برای پنل مدیر یک رمز یکتا و قدرتمند انتخاب کنید.
+- binding دیتابیس D1 را به Workerهای نامرتبط وصل نکنید.
+- اگر اطلاعات محرمانه‌ای داخل commit یا لاگ عمومی رفته است، آن را فوراً حذف و باطل کنید.
+- پیش از اضافه‌کردن کاربران زیاد، محدودیت‌های حساب Cloudflare را بررسی کنید.
+
+---
 
 ## نکات مهم
 
-- هیچ API Token، `SECRET_KEY`، رمز مدیر یا شناسهٔ خصوصی حساب Cloudflare را commit نکنید.
-- آدرس `workers.dev` ممکن است در بعضی شبکه‌ها، از جمله ایران، مسدود باشد.
-- VLESS روی WebSocket مسیر عملیاتی نسخهٔ Cloudflare است.
-- XHTTP در تنظیمات وجود دارد، اما پیاده‌سازی داخلی آن هنوز کامل و آمادهٔ استفادهٔ production نیست.
-- Workers Free محدودیت اتصال هم‌زمان و سهمیهٔ درخواست دارد.
+- Workers Free محدودیت تعداد درخواست و اتصال هم‌زمان دارد.
+- آدرس `workers.dev` ممکن است در بعضی شبکه‌ها، از جمله برخی شبکه‌های داخل ایران، مسدود باشد.
+- ترانسپورت عملیاتی نسخهٔ Cloudflare، **VLESS روی WebSocket** است.
+- XHTTP در مدل پنل وجود دارد، اما پیاده‌سازی آن هنوز برای استفادهٔ production کامل نشده است.
 - استفاده از Cloudflare Workers تابع شرایط Cloudflare و قوانین محل است.
+
+---
+
+## فایل‌های این مخزن
+
+```text
+.
+├── index.js       # فایل آمادهٔ Cloudflare Worker
+├── schema.sql     # ساختار دیتابیس D1
+├── README.md      # راهنمای انگلیسی
+└── README-fa.md   # همین راهنمای فارسی
+```
+
+سورس و خروجی خصوصی Auto‑Deployer عمداً از این مخزن حذف شده‌اند.
 
 </div>

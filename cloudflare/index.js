@@ -324,8 +324,13 @@ async function passwordSet(db) {
   return Boolean(await setting(db, "password_hash"));
 }
 __name(passwordSet, "passwordSet");
+var randomSecret = /* @__PURE__ */ __name(() => [...crypto.getRandomValues(new Uint8Array(32))].map((x) => x.toString(16).padStart(2, "0")).join(""), "randomSecret");
+async function sessionSecret(env) {
+  return env.SECRET_KEY || await setting(env.DB, "session_secret");
+}
+__name(sessionSecret, "sessionSecret");
 async function isAdmin(request, env) {
-  return verifySession(readCookie(request, "session"), env.SECRET_KEY);
+  return verifySession(readCookie(request, "session"), await sessionSecret(env));
 }
 __name(isAdmin, "isAdmin");
 function sessionCookie(token) {
@@ -336,6 +341,14 @@ function clientIp(r) {
   return r.headers.get("cf-connecting-ip") || r.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "0.0.0.0";
 }
 __name(clientIp, "clientIp");
+async function publicHost(request, env) {
+  return env.RELAY_DOMAIN || env.DOMAIN || new URL(request.url).host;
+}
+__name(publicHost, "publicHost");
+async function subscriptionText(request, env, user) {
+  return buildSubscription({ user, host: await publicHost(request, env), cleanIps: await all(env.DB, "SELECT * FROM clean_ips WHERE enabled=1"), wsPath: env.WS_PATH || "ws", xhttpPath: env.XHTTP_PATH || "xh" });
+}
+__name(subscriptionText, "subscriptionText");
 async function body(request) {
   const b = await request.json();
   if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error("invalid body");
@@ -354,17 +367,20 @@ async function handleApi(request, env, alreadyAuth = false) {
       if (initial && !passwordPolicy(initial)) return err("ADMIN_PASSWORD does not meet password policy");
       const password = initial || b.password;
       const h = await hashPassword(password);
-      const written = await env.DB.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("password_hash", JSON.stringify(h)).run();
-      if (Number(written.meta?.changes || 0) !== 1) return err("password already set", 409);
+      const sessionKey = env.SECRET_KEY || randomSecret();
+      const writes = [env.DB.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("password_hash", JSON.stringify(h))];
+      if (!env.SECRET_KEY) writes.push(env.DB.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("session_secret", sessionKey));
+      const written = await env.DB.batch(writes);
+      if (Number(written?.[0]?.meta?.changes || 0) !== 1) return err("password already set", 409);
       await putSetting(env.DB, "password_salt", h.salt);
-      return json({ ok: true }, 200, { "set-cookie": sessionCookie(await makeSession(env.SECRET_KEY)) });
+      return json({ ok: true }, 200, { "set-cookie": sessionCookie(await makeSession(sessionKey)) });
     }
     if (path === "/api/login" && m === "POST") {
       const b = await body(request);
       if (!await passwordSet(env.DB)) return err("setup required", 409);
       const h = JSON.parse(await setting(env.DB, "password_hash"));
       if (!await verifyPassword(b.password || "", h)) return err("wrong password", 401);
-      return json({ ok: true }, 200, { "set-cookie": sessionCookie(await makeSession(env.SECRET_KEY)) });
+      return json({ ok: true }, 200, { "set-cookie": sessionCookie(await makeSession(await sessionSecret(env))) });
     }
     if (path === "/api/logout" && m === "POST") return json({ ok: true }, 200, { "set-cookie": "session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax" });
     if (path === "/api/change-password" && m === "POST") {
@@ -436,9 +452,10 @@ async function handleApi(request, env, alreadyAuth = false) {
       return json({ rows, live: rows.filter((x) => x.last_seen > Date.now() - 6e4).length });
     }
     if ((mm = path.match(/^\/api\/users\/(\d+)\/config$/)) && m === "GET") {
-      const id = +mm[1], u = await one(env.DB, "SELECT * FROM users WHERE id=?", id), ips = await all(env.DB, "SELECT * FROM clean_ips WHERE enabled=1 ORDER BY id");
+      const id = +mm[1], u = await one(env.DB, "SELECT * FROM users WHERE id=?", id);
       if (!u) return err("not found", 404);
-      return json({ sub_link: `https://${env.DOMAIN}/sub/${u.sub_token}`, config: await buildSubscription({ user: u, host: env.RELAY_DOMAIN || env.DOMAIN, cleanIps: ips, wsPath: env.WS_PATH, xhttpPath: env.XHTTP_PATH }) });
+      const text = await subscriptionText(request, env, u);
+      return json({ sub_link: `https://${await publicHost(request, env)}/sub/${u.sub_token}`, config: text });
     }
     if (path === "/api/clean-ips" && m === "GET") return json(await all(env.DB, "SELECT * FROM clean_ips ORDER BY id DESC"));
     if (path === "/api/clean-ips" && m === "POST") {
@@ -518,7 +535,7 @@ async function handleRequest(request, env, ctx) {
   if (sub && request.method === "GET") {
     const u = await one(env.DB, "SELECT * FROM users WHERE sub_token=?", sub[1]);
     if (!u) return new Response("not found", { status: 404 });
-    const text = await buildSubscription({ user: u, host: env.RELAY_DOMAIN || env.DOMAIN, cleanIps: await all(env.DB, "SELECT * FROM clean_ips WHERE enabled=1"), wsPath: env.WS_PATH, xhttpPath: env.XHTTP_PATH });
+    const text = await subscriptionText(request, env, u);
     const ua = request.headers.get("user-agent") || "";
     if (ua.includes("Mozilla") || url.searchParams.has("page")) return new Response((await Promise.resolve().then(() => (init_ui(), ui_exports))).subscriptionHtml(u, text), { headers: { "content-type": "text/html; charset=utf-8" } });
     const body2 = Buffer.from(text).toString("base64");
