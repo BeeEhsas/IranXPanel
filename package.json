@@ -1,0 +1,23 @@
+{
+  "name": "iranx-panel",
+  "version": "4.0.0",
+  "description": "IranX Panel for Cloudflare Workers and D1",
+  "type": "module",
+  "main": "cloudflare/src/index.js",
+  "scripts": {
+    "test": "node --import ./cloudflare/test/register.mjs --test cloudflare/test/*.test.js",
+    "check": "node --check cloudflare/src/index.js && npm test",
+    "dev": "wrangler dev --config cloudflare/wrangler.jsonc",
+    "deploy": "wrangler deploy --config cloudflare/wrangler.jsonc",
+    "build:deployer": "node cloudflare/deployer/build.mjs",
+    "package": "npm run build:deployer && npm run test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "miniflare": "^5.20260921.0-alpha",
+    "wrangler": "^4.137.0"
+  }
+}

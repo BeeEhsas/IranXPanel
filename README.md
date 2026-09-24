@@ -2,11 +2,11 @@
 
 <img src="https://capsule-render.vercel.app/api?type=waving&color=0:7C5CFF,50:2F83F6,100:22C58C&height=190&section=header&text=IranX%20Panel&fontSize=54&fontColor=ffffff&fontAlignY=36&desc=One%20Python%20file.%20Zero%20VPS.%20Full%20VLESS%20panel.&descAlignY=58&descSize=17" alt="IranX Panel" width="100%" />
 
-<h3>⚡ A single-file VLESS subscription panel that runs anywhere</h3>
+<h3>⚡ IranX Panel — VLESS panel for Python hosts and Cloudflare Workers</h3>
 
 <p>
-Manage users, quotas, device limits and subscription links from <b>one</b> Python file.<br/>
-Two transports · six themes · bilingual UI — <b>no Xray core, no Docker, no VPS, no certificates.</b>
+Manage users, quotas, device limits and subscription links from the original Python panel on Railway/Render,
+or deploy the native Cloudflare Workers + D1 edition.
 </p>
 
 <p>
@@ -19,7 +19,7 @@ Two transports · six themes · bilingual UI — <b>no Xray core, no Docker, no 
 <p>
 <img src="https://img.shields.io/badge/Railway-ready-0B0D0E?style=flat-square&logo=railway&logoColor=white" alt="Railway" />
 <img src="https://img.shields.io/badge/Render-ready-46E3B7?style=flat-square&logo=render&logoColor=white" alt="Render" />
-<img src="https://img.shields.io/badge/Cloudflare-relay%20optional-F38020?style=flat-square&logo=cloudflare&logoColor=white" alt="Cloudflare" />
+<img src="https://img.shields.io/badge/Cloudflare-Workers%20%2B%20D1-ready-F38020?style=flat-square&logo=cloudflare&logoColor=white" alt="Cloudflare" />
 <img src="https://img.shields.io/github/stars/BeeEhsas/IranXPanel?style=flat-square&color=FFD166" alt="Stars" />
 <img src="https://img.shields.io/github/last-commit/BeeEhsas/IranXPanel?style=flat-square&color=2F83F6" alt="Last commit" />
 </p>
@@ -62,7 +62,7 @@ and hands you back a working panel URL and password. No CLI, no `git clone`, no 
 | 🏷️ **Project name & workspace** | Loads your workspaces and server locations from the API |
 | 🔑 **Panel password** | Type your own, or leave it blank for a generated one |
 | ♻️ **Anti-sleep (Render Free)** | Pings itself every 10 minutes so the free service never sleeps |
-| 🟠 **Cloudflare relay** | Optionally creates a Worker in *your own* Cloudflare account and points the configs at it instead of the host domain |
+| ☁️ **Cloudflare Workers + D1** | Creates a native panel Worker, D1 database, schema, secrets, bindings and workers.dev address directly in the user's account |
 | 🔐 **Token hygiene** | The token is used in-memory for that single request — never stored, never logged |
 
 <div align="center">
@@ -70,10 +70,8 @@ and hands you back a working panel URL and password. No CLI, no `git clone`, no 
 ```mermaid
 flowchart LR
     U["🧑 You"] -->|"API token"| D["🪄 IranX Deployer<br/>workers.dev page"]
-    D -->|"create project + env vars"| H["🚄 Railway / 🎨 Render"]
-    H -->|"builds main.py"| P["🛡️ IranX Panel<br/>https://your-app"]
-    D -.->|"optional"| W["🟠 Cloudflare Worker<br/>relay in your account"]
-    W -.-> P
+    D -->|"create project / Worker + resources"| H["🚄 Railway / 🎨 Render / ☁️ Cloudflare"]
+    H -->|"deploys selected edition"| P["🛡️ IranX Panel<br/>https://your-app"]
 
     style U fill:#7C5CFF,stroke:#9B81FF,color:#fff
     style D fill:#2F83F6,stroke:#57A5FF,color:#fff
@@ -188,10 +186,12 @@ unreachable from your network.
 <br/>
 
 1. Open **[IranX Deployer](https://iranxpanel.cvtlwdm.workers.dev/)**
-2. Choose **Railway** or **Render**
-3. Paste your provider API token, pick a project name, load your workspace and location
-4. Optionally set a panel password, enable anti-sleep, or add a Cloudflare relay
+2. Choose **Railway**, **Render**, or **Cloudflare Workers + D1**
+3. Paste your provider API token, choose the account/project fields, and load the available resources
+4. Optionally provide a panel password (or let the deployer generate one)
 5. Press **Start** — you get the panel URL and login password at the end
+
+For Cloudflare, the deployer creates a native panel Worker, D1 database, schema, bindings, secrets, environment variables, and the `workers.dev` address in the selected account.
 
 </details>
 
@@ -228,8 +228,25 @@ unreachable from your network.
 
 </details>
 
+<details open>
+<summary><b>☁️ Option C — Cloudflare Workers + D1</b></summary>
+
+<br/>
+
+Cloudflare is a first-class deployment target, not only an optional relay. Select **Cloudflare** in the deployer and provide an account token with these restricted permissions:
+
+- Workers Scripts: Edit
+- D1: Edit
+- Account Settings: Read
+
+The deployer creates a native JavaScript panel Worker, D1 database, schema, `DB` binding, panel secrets, `DOMAIN`/`RELAY_DOMAIN` variables, and the `workers.dev` address. The **Create token in Cloudflare** button opens Cloudflare's official token form with the required Workers Scripts and D1 permissions pre-filled. Choose a custom password or leave it blank to generate one. The token is not persisted or logged and should be revoked after installation.
+
+For a manual Dashboard deployment and detailed configuration, see [`cloudflare/README-fa.md`](cloudflare/README-fa.md).
+
+</details>
+
 <details>
-<summary><b>🎨 Option C — Render</b></summary>
+<summary><b>🎨 Option D — Render</b></summary>
 
 <br/>
 
@@ -239,7 +256,7 @@ then add `SECRET_KEY` and `DOMAIN` under Environment.
 </details>
 
 <details>
-<summary><b>🐍 Option D — Any other ASGI host</b></summary>
+<summary><b>🐍 Option E — Any other ASGI host</b></summary>
 
 <br/>
 
