@@ -829,7 +829,7 @@ async function submit(){
     body:JSON.stringify(body)});
   if(r.ok){location.href='/panel';return}
   const j=await r.json().catch(()=>({}));
-  err.textContent=j.detail||T('netErr');
+  err.textContent=j.error||j.detail||T('netErr');
  }catch(e){err.textContent=T('netErr')}
  go.disabled=false;
 }
@@ -1173,7 +1173,7 @@ async function submit(){
     body:JSON.stringify(body)});
   if(r.ok){location.href='/panel';return}
   const j=await r.json().catch(()=>({}));
-  err.textContent=j.detail||T('netErr');
+  err.textContent=j.error||j.detail||T('netErr');
  }catch(e){err.textContent=T('netErr')}
  go.disabled=false;
 }
@@ -3758,26 +3758,50 @@ async function validateBackup(doc, force = false) {
   return p;
 }
 __name(validateBackup, "validateBackup");
+async function claimInitialPassword(db, env, provided = "") {
+  const initial = String(env.ADMIN_PASSWORD || "");
+  if (!initial) return false;
+  if (!passwordPolicy(initial)) throw new Error("ADMIN_PASSWORD does not meet password policy");
+  if (provided !== initial) return false;
+  const h = await hashPassword(initial), sessionKey = env.SECRET_KEY || randomSecret(), writes = [db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("password_hash", JSON.stringify(h))];
+  if (!env.SECRET_KEY) writes.push(db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("session_secret", sessionKey));
+  const written = await db.batch(writes);
+  if (Number(written?.[0]?.meta?.changes || 0) !== 1) return false;
+  await putSetting(db, "password_salt", h.salt);
+  return sessionKey;
+}
+__name(claimInitialPassword, "claimInitialPassword");
+async function setupPassword(db, env, provided = "", confirm = "") {
+  const seeded = await claimInitialPassword(db, env, provided);
+  if (seeded) return seeded;
+  if (await passwordSet(db)) return false;
+  if (provided !== confirm || !passwordPolicy(provided)) throw new Error("passwords must match and meet password policy");
+  const h = await hashPassword(provided), sessionKey = env.SECRET_KEY || randomSecret(), writes = [db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("password_hash", JSON.stringify(h))];
+  if (!env.SECRET_KEY) writes.push(db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("session_secret", sessionKey));
+  const written = await db.batch(writes);
+  if (Number(written?.[0]?.meta?.changes || 0) !== 1) return false;
+  await putSetting(db, "password_salt", h.salt);
+  return sessionKey;
+}
+__name(setupPassword, "setupPassword");
 async function handleApi(request, env, alreadyAuth = false) {
   const path = new URL(request.url).pathname, m = request.method;
   try {
     if (path === "/api/state" && m === "GET") return json({ needs_setup: !await passwordSet(env.DB) && !env.ADMIN_PASSWORD, logged_in: await isAdmin(request, env) });
     if (path === "/api/setup" && m === "POST") {
       if (await passwordSet(env.DB)) return err("password already set", 409);
-      const b = await body(request), initial = String(env.ADMIN_PASSWORD || "");
-      if (!initial && (b.password !== b.confirm || !passwordPolicy(b.password))) return err("passwords must match and meet password policy");
-      if (initial && !passwordPolicy(initial)) return err("ADMIN_PASSWORD does not meet password policy");
-      const password = initial || b.password, h = await hashPassword(password), sessionKey = env.SECRET_KEY || randomSecret();
-      const writes = [env.DB.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("password_hash", JSON.stringify(h))];
-      if (!env.SECRET_KEY) writes.push(env.DB.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind("session_secret", sessionKey));
-      const written = await env.DB.batch(writes);
-      if (Number(written?.[0]?.meta?.changes || 0) !== 1) return err("password already set", 409);
-      await putSetting(env.DB, "password_salt", h.salt);
+      const b = await body(request);
+      const sessionKey = await setupPassword(env.DB, env, b.password, b.confirm);
+      if (!sessionKey) return err("password already set", 409);
       return json({ ok: true }, 200, { "set-cookie": sessionCookie(await makeSession(sessionKey)) });
     }
     if (path === "/api/login" && m === "POST") {
       const b = await body(request);
-      if (!await passwordSet(env.DB)) return err("setup required", 409);
+      if (!await passwordSet(env.DB)) {
+        const sessionKey = await claimInitialPassword(env.DB, env, String(b.password || ""));
+        if (!sessionKey) return err("wrong password", 401);
+        return json({ ok: true }, 200, { "set-cookie": sessionCookie(await makeSession(sessionKey)) });
+      }
       const h = JSON.parse(await setting(env.DB, "password_hash"));
       if (!await verifyPassword(b.password || "", h)) return err("wrong password", 401);
       return json({ ok: true }, 200, { "set-cookie": sessionCookie(await makeSession(await sessionSecret(env))) });
@@ -4100,6 +4124,7 @@ var index_default = { async fetch(request, env, ctx) {
   }
 } };
 export {
+  claimInitialPassword,
   index_default as default,
   handleApi,
   handleRequest
