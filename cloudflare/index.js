@@ -10,7 +10,7 @@ var randomHex = /* @__PURE__ */ __name((n) => {
   const b = crypto.getRandomValues(new Uint8Array(n));
   return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }, "randomHex");
-async function hashPassword(password, iterations = 21e4) {
+async function hashPassword(password, iterations = 1e5) {
   const salt = randomHex(16);
   const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: enc.encode(salt), iterations }, key, 256);
@@ -22,7 +22,7 @@ async function verifyPassword(password, stored) {
   try {
     if (!stored?.salt || !stored?.hash) return false;
     const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
-    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: enc.encode(stored.salt), iterations: Number(stored.iterations) || 21e4 }, key, 256);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: enc.encode(stored.salt), iterations: Number(stored.iterations) || 1e5 }, key, 256);
     const actual = [...new Uint8Array(bits)].map((x) => x.toString(16).padStart(2, "0")).join("");
     let diff = actual.length ^ stored.hash.length;
     for (let i = 0; i < actual.length; i++) diff |= actual.charCodeAt(i) ^ (stored.hash.charCodeAt(i) || 0);
