@@ -10,7 +10,7 @@
     "dev": "wrangler dev --config cloudflare/wrangler.jsonc",
     "deploy": "wrangler deploy --config cloudflare/wrangler.jsonc",
     "build:deployer": "node cloudflare/deployer/build.mjs",
-    "package": "npm run build:deployer && npm run test"
+    "package": "npm run test && npm run build:deployer"
   },
   "keywords": [],
   "author": "",
