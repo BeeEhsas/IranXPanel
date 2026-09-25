@@ -2,11 +2,11 @@
 
 <img src="https://capsule-render.vercel.app/api?type=waving&color=0:7C5CFF,50:2F83F6,100:22C58C&height=190&section=header&text=IranX%20Panel&fontSize=54&fontColor=ffffff&fontAlignY=36&desc=%DB%B1%20%D9%81%D8%A7%DB%8C%D9%84%20%D9%BE%D8%A7%DB%8C%D8%AA%D9%88%D9%86%20%C2%B7%20%D8%A8%D8%AF%D9%88%D9%86%20VPS%20%C2%B7%20%D9%BE%D9%86%D9%84%20%DA%A9%D8%A7%D9%85%D9%84%20VLESS&descAlignY=58&descSize=17" alt="IranX Panel" width="100%" />
 
-<h3>⚡ پنل VLESS برای Railway، Render و Cloudflare Workers</h3>
+<h3>⚡ پنل اشتراک VLESS در یک فایل، قابل اجرا روی هر جایی</h3>
 
 <p>
-کاربران، حجم، محدودیت دستگاه و لینک سابسکریپشن را با نسخهٔ اصلی Python روی Railway/Render مدیریت کنید،
-یا نسخهٔ بومی Cloudflare Workers + D1 را نصب کنید.
+مدیریت کاربر، حجم، محدودیت دستگاه و لینک سابسکریپشن — همه در <b>یک</b> فایل پایتون.<br/>
+دو ترانسپورت · شش تم · رابط دوزبانه — <b>بدون هستهٔ Xray، بدون داکر، بدون VPS، بدون گواهی.</b>
 </p>
 
 <p>
@@ -19,7 +19,7 @@
 <p>
 <img src="https://img.shields.io/badge/Railway-آماده-0B0D0E?style=flat-square&logo=railway&logoColor=white" alt="Railway" />
 <img src="https://img.shields.io/badge/Render-آماده-46E3B7?style=flat-square&logo=render&logoColor=white" alt="Render" />
-<img src="https://img.shields.io/badge/Cloudflare-Workers%20%2B%20D1-آماده-F38020?style=flat-square&logo=cloudflare&logoColor=white" alt="Cloudflare" />
+<img src="https://img.shields.io/badge/Cloudflare-رلهٔ%20اختیاری-F38020?style=flat-square&logo=cloudflare&logoColor=white" alt="Cloudflare" />
 <img src="https://img.shields.io/github/stars/BeeEhsas/IranXPanel?style=flat-square&color=FFD166" alt="Stars" />
 <img src="https://img.shields.io/github/last-commit/BeeEhsas/IranXPanel?style=flat-square&color=2F83F6" alt="Last commit" />
 </p>
@@ -68,7 +68,7 @@
 | 🏷️ **نام پروژه و ورک‌اسپیس** | ورک‌اسپیس‌ها و لوکیشن‌های سرور را از API خودش می‌خواند |
 | 🔑 **رمز پنل** | رمز دلخواهت را بنویس یا خالی بگذار تا خودکار ساخته شود |
 | ♻️ **جلوگیری از خواب (Render Free)** | هر ۱۰ دقیقه خودش را صدا می‌زند تا سرویس رایگان نخوابد |
-| ☁️ **Cloudflare Workers + D1** | به‌صورت بومی Worker پنل، دیتابیس D1، schema، secretها، bindingها و آدرس workers.dev را مستقیماً در حساب کاربر می‌سازد |
+| 🟠 **رلهٔ Cloudflare** | به دلخواه، یک Worker در حساب Cloudflare خودت می‌سازد و کانفیگ‌ها را به آن وصل می‌کند، نه به دامنهٔ هاست |
 | 🔐 **امنیت توکن** | توکن فقط همان لحطه در حافظه استفاده می‌شود — ذخیره نمی‌شود، لاگ نمی‌شود |
 
 </div>
@@ -78,8 +78,10 @@
 ```mermaid
 flowchart LR
     U["🧑 تو"] -->|"API token"| D["🪄 IranX Deployer<br/>صفحهٔ workers.dev"]
-    D -->|"ساخت پروژه / Worker + منابع"| H["🚄 Railway / 🎨 Render / ☁️ Cloudflare"]
-    H -->|"استقرار نسخهٔ انتخاب‌شده"| P["🛡️ IranX Panel<br/>https://your-app"]
+    D -->|"ساخت پروژه + متغیرها"| H["🚄 Railway / 🎨 Render"]
+    H -->|"بیلد main.py"| P["🛡️ IranX Panel<br/>https://your-app"]
+    D -.->|"اختیاری"| W["🟠 Cloudflare Worker<br/>رله در حساب خودت"]
+    W -.-> P
 
     style U fill:#7C5CFF,stroke:#9B81FF,color:#fff
     style D fill:#2F83F6,stroke:#57A5FF,color:#fff
@@ -209,12 +211,10 @@ TLS در لبهٔ پلتفرم خاتمه می‌شود، پس `main.py` همی�
 <br/>
 
 1. صفحهٔ **[IranX Deployer](https://iranxpanel.cvtlwdm.workers.dev/)** را باز کن
-2. **Railway**، **Render** یا **Cloudflare Workers + D1** را انتخاب کن
-3. توکن API سرویس را وارد کن، حساب/پروژه را انتخاب کن و منابع موجود را بارگذاری کن
-4. در صورت تمایل رمز پنل را وارد کن یا بگذار خودکار ساخته شود
+2. **Railway** یا **Render** را انتخاب کن
+3. توکن API را پیست کن، نام پروژه بگذار، ورک‌اسپیس و لوکیشن را بارگیری کن
+4. اگر خواستی رمز پنل بده، جلوگیری از خواب را فعال کن، یا رلهٔ Cloudflare بیافزا
 5. **شروع نصب** را بزن — در انتها آدرس پنل و رمز ورود را می‌گیری
-
-برای Cloudflare، دیپلویر Worker پنل، دیتابیس D1، schema، bindingها، secretها، متغیرهای محیطی و آدرس `workers.dev` را در حساب انتخاب‌شده می‌سازد.
 
 </details>
 
@@ -251,23 +251,6 @@ TLS در لبهٔ پلتفرم خاتمه می‌شود، پس `main.py` همی�
 
 </details>
 
-<details open>
-<summary><b>☁️ روش ج — Cloudflare Workers + D1</b></summary>
-
-<br/>
-
-Cloudflare اکنون یک مقصد نصب اصلی است، نه صرفاً یک رلهٔ اختیاری. در Deployer گزینهٔ **Cloudflare** را انتخاب کن و توکنی با این مجوزهای محدود بده:
-
-- Workers Scripts: Edit
-- D1: Edit
-- Account Settings: Read
-
-Deployer پنل JavaScript بومی، دیتابیس D1، schema، binding با نام `DB`، secretهای پنل، متغیرهای `DOMAIN`/`RELAY_DOMAIN` و آدرس `workers.dev` را می‌سازد. دکمهٔ **ساخت توکن در Cloudflare** صفحهٔ رسمی ساخت توکن را با مجوزهای لازم Workers Scripts و D1 از قبل باز می‌کند. رمز را خالی بگذار تا خودکار ساخته شود یا رمز دلخواه بده. توکن ذخیره یا log نمی‌شود و باید پس از نصب حذف شود.
-
-برای نصب دستی از Dashboard و تنظیمات دقیق، [`cloudflare/README-fa.md`](cloudflare/README-fa.md) را ببینید.
-
-</details>
-
 <details>
 <summary><b>🎨 روش پ — Render</b></summary>
 
@@ -279,7 +262,7 @@ Render فایل `render.yaml` را خودکار می‌خواند. یک **Web Se
 </details>
 
 <details>
-<summary><b>🐍 روش ه — هر ASGI host دیگر</b></summary>
+<summary><b>🐍 روش ت — هر هاست ASGI دیگر</b></summary>
 
 <br/>
 
