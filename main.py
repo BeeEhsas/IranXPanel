@@ -1586,7 +1586,7 @@ def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
     # because standard clients (v2rayNG/NekoBox/Streisand) reject mux on xhttp and
     # silently fail to connect when it is forced on.
     return (f"vless://{row['uuid']}@{address}:443"
-            f"?encryption=none&security=tls&sni={host}&fp=chrome&alpn=http%2F1.1"
+            f"?encryption=none&security=tls&sni={host}&fp=unsafe&alpn=http%2F1.1"
             f"&type=ws&host={host}&path=%2F{path}&mux=1"
             f"#{quote(label)}")
 
@@ -1600,28 +1600,13 @@ def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
 # Everyone else keeps the plain config, so links handed out earlier never change.
 
 OBF_CIPHERS = (
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_CHACHA20_POLY1305_SHA256",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+  TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
 )
 OBF_CS = ":".join(OBF_CIPHERS)
 
 # Written out literally (not via json.dumps) so the spacing matches the reference
 # link exactly: ", " and ": " inside each object, no space between the two stages.
-OBF_FM = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", '
-          '"lengths": ["5", "94", "1"], "delays": ["0"], "maxSplit": "0"}},'
-          '{"type": "fragment", "settings": {"packets": "1-1", "lengths": '
-          '["109", "1"], "delays": ["1"], "maxSplit": "355"}}]}')
+OBF_FM = ({"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", "lengths": ["0", "104", "1"], "delays": ["0"], "maxSplit": "0"}},{"type": "fragment", "settings": {"packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11"}}]})
 
 
 def obf_on(row) -> bool:
