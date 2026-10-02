@@ -1600,13 +1600,28 @@ def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
 # Everyone else keeps the plain config, so links handed out earlier never change.
 
 OBF_CIPHERS = (
-  TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
 )
 OBF_CS = ":".join(OBF_CIPHERS)
 
 # Written out literally (not via json.dumps) so the spacing matches the reference
 # link exactly: ", " and ": " inside each object, no space between the two stages.
-OBF_FM = ({"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", "lengths": ["0", "104", "1"], "delays": ["0"], "maxSplit": "0"}},{"type": "fragment", "settings": {"packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11"}}]})
+OBF_FM = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", '
+          '"lengths": ["0", "104", "1"], "delays": ["0"], "maxSplit": "0"}},'
+          '{"type": "fragment", "settings": {"packets": "1-1", "lengths": '
+          '["114", "1"], "delays": ["1"], "maxSplit": "11"}}]}')
 
 
 def obf_on(row) -> bool:
@@ -1638,7 +1653,7 @@ def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False,
     # WS variant only (see ws_uri).
     path = XHTTP_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
     return (f"vless://{row['uuid']}@{address}:443"
-            f"?encryption=none&security=tls&sni={host}&fp=chrome"
+            f"?encryption=none&security=tls&sni={host}&fp=unsafe"
             f"&type=xhttp&host={host}&path=%2F{path}&mode={XHTTP_MODE}"
             f"#{quote(label)}")
 
