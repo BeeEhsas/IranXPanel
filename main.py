@@ -124,6 +124,9 @@ CREATE TABLE IF NOT EXISTS users (
     device_limit INTEGER DEFAULT 1,
     transport    TEXT    DEFAULT 'both',
     obfuscate    INTEGER DEFAULT 0,
+    ech          INTEGER DEFAULT 0,
+    fp           TEXT    DEFAULT 'unsafe',
+    alpn         TEXT    DEFAULT '',
     created_at   INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS clean_ips (
@@ -191,7 +194,10 @@ def now() -> int:
 def migrate():
     """Add columns that older databases may be missing."""
     wanted = {"users": [("transport", "TEXT DEFAULT 'both'"),
-                        ("obfuscate", "INTEGER DEFAULT 0")],
+                        ("obfuscate", "INTEGER DEFAULT 0"),
+                        ("ech", "INTEGER DEFAULT 0"),
+                        ("fp", "TEXT DEFAULT 'unsafe'"),
+                        ("alpn", "TEXT DEFAULT ''")],
               "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
               "clean_ips": [("country", "TEXT DEFAULT ''")],
               "proxies": [("country", "TEXT DEFAULT ''"),
@@ -1586,7 +1592,8 @@ def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
     # because standard clients (v2rayNG/NekoBox/Streisand) reject mux on xhttp and
     # silently fail to connect when it is forced on.
     return (f"vless://{row['uuid']}@{address}:443"
-            f"?encryption=none&security=tls&sni={host}&fp=unsafe&alpn=http%2F1.1"
+            f"?encryption=none&security=tls&sni={host}&{tls_extras(row)}"
+            f"&alpn={quote(user_alpn(row, 'http/1.1'), safe='')}"
             f"&type=ws&host={host}&path=%2F{path}&mux=1"
             f"#{quote(label)}")
 
@@ -1624,6 +1631,78 @@ OBF_FM = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", '
           '["114", "1"], "delays": ["1"], "maxSplit": "11"}}]}')
 
 
+# ───────────────── optional per-user anti-censorship extras ─────────────────
+#
+# ECH (Encrypted Client Hello) hides the SNI from a censor. It is opt-in per user:
+# enabled, every link this panel issues for them carries one extra parameter holding
+# the public "ECH config list" record published for Cloudflare's ECH-capable domains;
+# disabled, the link is byte-for-byte what it used to be, so configs already
+# installed keep working unchanged.
+ECH_VALUE = "cloudflare-ech.com+udp://1.1.1.1"
+
+# TLS Client Hello fingerprints a user may pick. "unsafe" is the panel default and
+# stays first, so links issued before this setting existed stay unchanged; a client
+# that does not know a name simply ignores it.
+FINGERPRINTS = ("unsafe", "chrome", "firefox", "safari", "ios", "android",
+                "edge", "ie", "qq", "random")
+
+# ALPN values offered in the panel. "" means "this transport's own default"
+# (http/1.1 for ws, none for xhttp) — i.e. exactly what every link carried before
+# this setting existed, so an untouched account keeps its links as they were.
+ALPN_CHOICES = ("", "http/1.1", "h2", "h2,http/1.1")
+
+
+def _pick_choice(value, allowed, default: str) -> str:
+    """Keep a stored choice only if it is one this panel still recognises."""
+    try:
+        v = str(value or "").strip().lower()
+    except Exception:
+        return default
+    return v if v in allowed else default
+
+
+def ech_on(row) -> bool:
+    """True when this user asked for the ECH config list in their links."""
+    try:
+        return bool(row["ech"])
+    except Exception:
+        return False
+
+
+def user_fp(row) -> str:
+    """This user's TLS fingerprint, or the panel default when unset/unknown."""
+    try:
+        f = row["fp"]
+    except Exception:
+        f = None
+    return _pick_choice(f, FINGERPRINTS, "unsafe")
+
+
+def user_alpn(row, default: str) -> str:
+    """This user's ALPN when they set one, else the transport's own default.
+
+    An empty stored value means "this transport's own default" (http/1.1 for ws,
+    none for xhttp) — never an empty ``alpn=`` parameter, which would break every
+    link a user already has installed.
+    """
+    try:
+        a = row["alpn"]
+    except Exception:
+        a = None
+    v = str(a or "").strip().lower()
+    if not v:
+        return default
+    return v if v in ALPN_CHOICES else default
+
+
+def tls_extras(row) -> str:
+    """Per-user TLS parameters appended to every link: fp, and ech when enabled."""
+    out = [f"fp={quote(user_fp(row), safe='')}"]
+    if ech_on(row):
+        out.append(f"ech={quote(ECH_VALUE, safe='')}")
+    return "&".join(out)
+
+
 def obf_on(row) -> bool:
     """True when this user asked for the obfuscated link shape."""
     try:
@@ -1636,12 +1715,14 @@ def ws_uri_obf(row, address: str, host: str, label: str, direct: bool = False,
                pid: int | None = None) -> str:
     """The obfuscated WS link. No mux here: fragmenting plus mux confuses clients."""
     path = WS_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
+    _a = user_alpn(row, "")
+    alpn_part = f"&alpn={quote(_a, safe='')}" if _a else ""
     return (f"vless://{row['uuid']}@{address}:443"
             f"?cs={quote(OBF_CS, safe='')}"
             f"&path={quote('/' + path, safe='')}"
             f"&security=tls&encryption=none"
             f"&fm={quote(OBF_FM, safe='')}"
-            f"&insecure=0&host={host}&fp=unsafe&type=ws&allowInsecure=0"
+            f"&insecure=0&host={host}&{tls_extras(row)}{alpn_part}&type=ws&allowInsecure=0"
             f"&sni={host}"
             f"#{quote(label)}")
 
@@ -1652,8 +1733,10 @@ def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False,
     # common clients; adding it makes the config refuse to connect. Keep mux on the
     # WS variant only (see ws_uri).
     path = XHTTP_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
+    _a = user_alpn(row, "")
+    alpn_part = f"&alpn={quote(_a, safe='')}" if _a else ""
     return (f"vless://{row['uuid']}@{address}:443"
-            f"?encryption=none&security=tls&sni={host}&fp=unsafe"
+            f"?encryption=none&security=tls&sni={host}&{tls_extras(row)}{alpn_part}"
             f"&type=xhttp&host={host}&path=%2F{path}&mode={XHTTP_MODE}"
             f"#{quote(label)}")
 
@@ -1876,6 +1959,9 @@ class UserIn(BaseModel):
     note: str = ""
     enabled: bool = True
     obfuscate: bool = False
+    ech: bool = False
+    fp: str = "unsafe"
+    alpn: str = ""
 
 
 class UserPatch(BaseModel):
@@ -1887,6 +1973,9 @@ class UserPatch(BaseModel):
     note: Optional[str] = None
     enabled: Optional[bool] = None
     obfuscate: Optional[bool] = None
+    ech: Optional[bool] = None
+    fp: Optional[str] = None
+    alpn: Optional[str] = None
     uuid: Optional[str] = None
 
 
@@ -2016,12 +2105,16 @@ async def create_user(body: UserIn, _=Depends(require_admin)):
             cur = c.execute(
                 """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                      used_bytes,expire_at,device_limit,transport,
-                                     obfuscate,created_at)
-                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?)""",
+                                     obfuscate,ech,fp,alpn,created_at)
+                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)""",
                 (name, str(uuid.uuid4()), secrets.token_urlsafe(16), body.note,
                  1 if body.enabled else 0, int(body.quota_gb * GB), expire,
                  max(0, body.device_limit), tr,
-                 1 if body.obfuscate else 0, now()))
+                 1 if body.obfuscate else 0,
+                 1 if body.ech else 0,
+                 _pick_choice(body.fp, FINGERPRINTS, "unsafe"),
+                 _pick_choice(body.alpn, ALPN_CHOICES, ""),
+                 now()))
             row = c.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
     except sqlite3.IntegrityError:
         raise HTTPException(409, "this name already exists")
@@ -2057,6 +2150,14 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
             sets.append("enabled=?"); vals.append(1 if body.enabled else 0)
         if body.obfuscate is not None:
             sets.append("obfuscate=?"); vals.append(1 if body.obfuscate else 0)
+        if body.ech is not None:
+            sets.append("ech=?"); vals.append(1 if body.ech else 0)
+        if body.fp is not None:
+            sets.append("fp=?")
+            vals.append(_pick_choice(body.fp, FINGERPRINTS, "unsafe"))
+        if body.alpn is not None:
+            sets.append("alpn=?")
+            vals.append(_pick_choice(body.alpn, ALPN_CHOICES, ""))
         if body.uuid is not None:
             try:
                 clean = str(uuid.UUID(body.uuid.strip()))
@@ -2479,7 +2580,7 @@ async def delete_proxy(pid: int, _=Depends(require_admin)):
 # lands or the database is left exactly as it was.
 
 BACKUP_FORMAT = "iranx-panel-backup"
-BACKUP_VERSION = 3          # v1 had no proxies table, v2 no obfuscate flag
+BACKUP_VERSION = 4          # v1 no proxies, v2 no obfuscate, v3 no ech/fp/alpn
 
 # Runtime settings that live in the environment, not the database. They are recorded for
 # reference and shown on restore, because a new host needs them set by hand — the panel
@@ -2490,7 +2591,7 @@ ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
 
 USER_FIELDS = ("name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
                "used_bytes", "expire_at", "device_limit", "transport",
-               "obfuscate", "created_at")
+               "obfuscate", "ech", "fp", "alpn", "created_at")
 CIP_FIELDS = ("address", "remark", "country", "enabled", "added_at")
 # Health columns are deliberately included: a restore then shows the same list state the
 # old panel had, and the next test run refreshes it anyway.
@@ -2629,6 +2730,10 @@ def _clean_user(u: dict) -> Optional[dict]:
         "transport": tr if tr in TRANSPORTS else "both",
         # Missing in v2 backups: default off, exactly like a fresh user.
         "obfuscate": 1 if u.get("obfuscate") else 0,
+        # Missing in v3 backups: the same defaults a brand-new user gets.
+        "ech": 1 if u.get("ech") else 0,
+        "fp": _pick_choice(u.get("fp"), FINGERPRINTS, "unsafe"),
+        "alpn": _pick_choice(u.get("alpn"), ALPN_CHOICES, ""),
         "created_at": num("created_at") or now(),
     }
 
@@ -2729,10 +2834,12 @@ def apply_backup(payload: dict, mode: str = "merge",
                 conn.execute(
                     """UPDATE users SET name=?, uuid=?, sub_token=?, note=?, enabled=?,
                            quota_bytes=?, used_bytes=?, expire_at=?, device_limit=?,
-                           transport=?, obfuscate=?, created_at=? WHERE id=?""",
+                           transport=?, obfuscate=?, ech=?, fp=?, alpn=?,
+                           created_at=? WHERE id=?""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
                      u["device_limit"], u["transport"], u["obfuscate"],
+                     u["ech"], u["fp"], u["alpn"],
                      u["created_at"], existing["id"]))
                 stats["users_updated"] += 1
                 continue
@@ -2740,11 +2847,12 @@ def apply_backup(payload: dict, mode: str = "merge",
                 conn.execute(
                     """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                          used_bytes,expire_at,device_limit,transport,
-                                         obfuscate,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                         obfuscate,ech,fp,alpn,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
                      u["device_limit"], u["transport"], u["obfuscate"],
+                     u["ech"], u["fp"], u["alpn"],
                      u["created_at"]))
                 stats["users_added"] += 1
             except sqlite3.IntegrityError:
@@ -2753,11 +2861,12 @@ def apply_backup(payload: dict, mode: str = "merge",
                     conn.execute(
                         """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                              used_bytes,expire_at,device_limit,transport,
-                                             obfuscate,created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                             obfuscate,ech,fp,alpn,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (u["name"], u["uuid"], secrets.token_urlsafe(16), u["note"],
                          u["enabled"], u["quota_bytes"], u["used_bytes"], u["expire_at"],
                          u["device_limit"], u["transport"], u["obfuscate"],
+                         u["ech"], u["fp"], u["alpn"],
                          u["created_at"]))
                     stats["users_added"] += 1
                 except sqlite3.IntegrityError:
@@ -4098,6 +4207,8 @@ const I18N={
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
   obfLbl:'مبهم‌ساز (Fragment + Cipher mask)',
+  echLbl:'آنتی سانسور (Ech)',
+  fpLbl:'فینگرپرینت TLS',alpnLbl:'ALPN',alpnDef:'پیش‌فرض این نوع کانفیگ',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
   cleanTitle:'مدیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
@@ -4210,6 +4321,8 @@ const I18N={
   active:'Enabled',saveBtn:'Save',resetTraffic:'Reset traffic',newUuid:'New UUID',
   customUuid:'Custom UUID',del:'Delete',
   obfLbl:'Obfuscation (Fragment + Cipher mask)',
+  echLbl:'Anti-censorship (Ech)',
+  fpLbl:'TLS fingerprint',alpnLbl:'ALPN',alpnDef:'This transport\'s default',
   uuidWarn:'Rotate UUID? Existing configs will stop working.',delWarn:'Delete this user?',
   cleanTitle:'Clean IP manager',
   cleanHint:'Clean IPs or domains. Added to every subscription as extra configs.',
@@ -4494,6 +4607,13 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
    </div>
    <label class="flex items-center gap-2 text-xs mt-2">
     <input id="nObf" type="checkbox"><span data-t="obfLbl"></span></label>
+   <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs mt-2">
+    <label class="flex items-center gap-2"><input id="nEch" type="checkbox"><span data-t="echLbl"></span></label>
+    <label class="flex items-center gap-2"><span class="dim" data-t="fpLbl"></span>
+     <select id="nFp" class="inp rounded-lg px-2 py-1 text-xs"></select></label>
+    <label class="flex items-center gap-2"><span class="dim" data-t="alpnLbl"></span>
+     <select id="nAlpn" class="inp rounded-lg px-2 py-1 text-xs"></select></label>
+   </div>
    <button onclick="createUser()" id="btnAdd" class="grad rounded-xl px-4 py-2 mt-2 text-sm font-bold text-white w-full sm:w-auto"></button>
    <p class="text-[11px] dim mt-2" data-t="zeroInf"></p>
    <p id="cErr" class="text-xs mt-1" style="color:var(--bad)"></p>
@@ -4763,6 +4883,17 @@ const dt=t=>t?new Date(t*1000).toLocaleString(LANG==='fa'?'fa-IR':'en-GB'):T('ne
 const statusTxt=s=>({disabled:T('statusDisabled'),expired:T('statusExpired'),
  quota:T('statusQuota')}[s]||s);
 const trTxt=t=>({ws:T('trWs'),xhttp:T('trXhttp'),both:T('trBoth')}[t]||t);
+// Per-user TLS options, mirrored from the server-side lists in main.py. A client
+// ignores a fingerprint name it does not know, and an empty ALPN means "this
+// transport's own default" — both keep an untouched account's links unchanged.
+const FP_OPTIONS=['unsafe','chrome','firefox','safari','ios','android','edge','ie','qq','random'];
+const ALPN_OPTIONS=['','http/1.1','h2','h2,http/1.1'];
+function fillSelect(sel,opts,blankLbl){
+ if(!sel)return;
+ sel.innerHTML='';
+ const b=document.createElement('option');b.value='';b.textContent=blankLbl;sel.appendChild(b);
+ opts.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v||'—';sel.appendChild(o)});
+}
 let users=[],cips=[],stats={},logItems=[],chart;
 
 async function api(p,o={}){
@@ -4793,6 +4924,8 @@ function paintStatic(){
  nTr.options[0].textContent=T('trBoth');
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
+ fillSelect(nFp, FP_OPTIONS, T('fpLbl'));
+ fillSelect(nAlpn, ALPN_OPTIONS, T('alpnDef'));
  cAddr.placeholder=T('addrPh'); cRem.placeholder=T('remarkPh'); cBulk.placeholder=T('bulkPh');
  fillCountry(document.getElementById('cCty'),document.getElementById('cCty')?.value||'');
  fillCountry(document.getElementById('mcSel'),MAIN_CC);
@@ -4958,7 +5091,8 @@ async function createUser(){
   await api('/api/users',{method:'POST',body:JSON.stringify({
    name:nName.value.trim(),quota_gb:parseFloat(nQuota.value||0),
    expire_days:parseInt(nDays.value||0),device_limit:parseInt(nDev.value||0),
-   transport:nTr.value,obfuscate:nObf.checked})});
+   transport:nTr.value,obfuscate:nObf.checked,
+   ech:nEch.checked,fp:nFp.value||'unsafe',alpn:nAlpn.value})});
   nName.value='';loadUsers();loadStats();
  }catch(e){cErr.textContent=e.message}
 }
@@ -5171,6 +5305,13 @@ function showEdit(id){
   <label class="block text-xs dim">${T('transport')}</label>
   <select id="eT" class="w-full inp rounded-xl px-3 py-2">${opt('both')}${opt('ws')}${opt('xhttp')}</select>
   <label class="flex items-center gap-2 text-xs pt-1"><input id="eObf" type="checkbox" ${u.obfuscate?'checked':''}> ${T('obfLbl')}</label>
+  <label class="flex items-center gap-2 text-xs pt-1"><input id="eEch" type="checkbox" ${u.ech?'checked':''}> ${T('echLbl')}</label>
+  <div class="grid grid-cols-2 gap-2 pt-1">
+   <div><label class="block text-xs dim">${T('fpLbl')}</label>
+    <select id="eFp" class="w-full inp rounded-xl px-2 py-2 text-xs"></select></div>
+   <div><label class="block text-xs dim">${T('alpnLbl')}</label>
+    <select id="eFpAlpn" class="w-full inp rounded-xl px-2 py-2 text-xs"></select></div>
+  </div>
   <label class="block text-xs dim">${T('customUuid')}</label>
   <input id="eU" value="${u.uuid}" class="w-full inp rounded-xl px-3 py-2 mono text-[11px]">
   <label class="flex items-center gap-2 text-xs"><input id="eE" type="checkbox" ${u.enabled?'checked':''}> ${T('active')}</label>
@@ -5181,13 +5322,16 @@ function showEdit(id){
    <button onclick="delUser(${id})" class="rounded-xl py-2 text-[11px]" style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${T('del')}</button>
   </div>
   <p id="eErr" class="text-xs" style="color:var(--bad)"></p>`);
+ fillSelect(eFp,FP_OPTIONS,T('fpLbl')); eFp.value=(FP_OPTIONS.indexOf(u.fp)>-1?u.fp:'unsafe');
+ fillSelect(eFpAlpn,ALPN_OPTIONS,T('alpnDef')); eFpAlpn.value=(ALPN_OPTIONS.indexOf(u.alpn)>-1?u.alpn:'');
 }
 async function saveEdit(id){
  try{
   const u=users.find(x=>x.id===id);
   const payload={quota_gb:parseFloat(eQ.value||0),expire_days:parseInt(eD.value||0),
    device_limit:parseInt(eV.value||0),transport:eT.value,enabled:eE.checked,
-   obfuscate:eObf.checked};
+   obfuscate:eObf.checked,ech:eEch.checked,
+   fp:eFp.value||'unsafe',alpn:eFpAlpn.value};
   if(eU.value.trim()&&eU.value.trim()!==u.uuid)payload.uuid=eU.value.trim();
   await api('/api/users/'+id,{method:'PATCH',body:JSON.stringify(payload)});
   closeModal();loadUsers();loadStats();
