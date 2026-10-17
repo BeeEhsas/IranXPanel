@@ -168,6 +168,24 @@ CREATE TABLE IF NOT EXISTS user_ips (
     hits       INTEGER DEFAULT 1,
     UNIQUE(user_id, ip)
 );
+-- One row per detected client device. Identity is an opaque key derived from the
+-- client IP plus its User-Agent, so the same phone always lands on the same row and a
+-- second device (different app or different IP) gets its own. `device_limit` counts
+-- these rows inside DEVICE_WINDOW.
+CREATE TABLE IF NOT EXISTS devices (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    dkey       TEXT    NOT NULL,
+    ip         TEXT    DEFAULT '',
+    ua         TEXT    DEFAULT '',
+    client     TEXT    DEFAULT '',
+    platform   TEXT    DEFAULT '',
+    proto      TEXT    DEFAULT 'ws',
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    hits       INTEGER DEFAULT 1,
+    UNIQUE(user_id, dkey)
+);
 CREATE TABLE IF NOT EXISTS traffic_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -183,6 +201,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ips_user  ON user_ips(user_id, last_seen);
+CREATE INDEX IF NOT EXISTS idx_dev_user  ON devices(user_id, last_seen);
 CREATE INDEX IF NOT EXISTS idx_traf_user ON traffic_log(user_id, ts);
 """
 
@@ -215,6 +234,15 @@ def migrate():
             for name, decl in cols:
                 if name not in have:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        # One-time backfill: turn legacy IP rows into device rows so history survives.
+        if c.execute("SELECT COUNT(*) n FROM devices").fetchone()["n"] == 0:
+            for r in c.execute("SELECT user_id,ip,proto,first_seen,last_seen,hits "
+                               "FROM user_ips").fetchall():
+                c.execute("""INSERT OR IGNORE INTO devices
+                             (user_id,dkey,ip,proto,first_seen,last_seen,hits)
+                             VALUES(?,?,?,?,?,?,?)""",
+                          (r["user_id"], "ip:" + str(r["ip"]), r["ip"], r["proto"],
+                           r["first_seen"], r["last_seen"], r["hits"]))
 
 
 def init_db():
@@ -330,6 +358,14 @@ def client_ip(req) -> str:
         return "0.0.0.0"
 
 
+def user_agent(req) -> str:
+    """The client app string, used to fingerprint devices. Truncated, best-effort."""
+    try:
+        return (req.headers.get("user-agent") or "")[:300]
+    except Exception:
+        return ""
+
+
 # ────────────────────────────── TRAFFIC ──────────────────────────────
 
 _pending: dict[int, list[int]] = {}
@@ -411,11 +447,69 @@ def user_status(row) -> tuple[bool, str]:
     return True, "ok"
 
 
+# ── device fingerprinting ──
+# VLESS over WS/XHTTP is plain HTTP underneath, so the only stable hints we get are the
+# client IP and the request User-Agent. The pair becomes one opaque key per device, and we
+# remember the parsed app + platform so the panel can show "who" is connected.
+UA_CLIENTS = (
+    ("v2rayng", "v2rayNG"), ("v2raytun", "v2rayTun"), ("v2rayn", "v2rayN"),
+    ("nekobox", "NekoBox"), ("nekoray", "NekoRay"), ("streisand", "Streisand"),
+    ("hiddify", "Hiddify"), ("shadowrocket", "Shadowrocket"), ("quantumult", "Quantumult"),
+    ("stash", "Stash"), ("clash", "Clash"), ("sing-box", "sing-box"), ("singbox", "sing-box"),
+    ("karing", "Karing"), ("foxray", "Foxray"), ("v2box", "V2Box"), ("matsuri", "Matsuri"),
+    ("napsternetv", "NapsternetV"), ("sagernet", "SagerNet"), ("exclave", "Exclave"),
+    ("kitsunebi", "Kitsunebi"), ("surge", "Surge"), ("passwall", "PassWall"),
+    ("hysteria", "Hysteria"), ("xray", "Xray"), ("v2ray", "V2Ray"),
+    ("okhttp", "OkHttp"), ("go-http-client", "Go HTTP"), ("dart", "Dart"),
+    ("python", "Python"), ("curl", "cURL"), ("wget", "Wget"),
+)
+
+
+def parse_ua(ua: str) -> tuple[str, str]:
+    """Best-effort (client, platform) from a User-Agent string."""
+    u = (ua or "").lower()
+    client = ""
+    for token, name in UA_CLIENTS:
+        if token in u:
+            client = name
+            break
+    platform = ""
+    if "android" in u:
+        platform = "Android"
+    elif any(k in u for k in ("iphone", "ipad", "ios")):
+        platform = "iOS"
+    elif any(k in u for k in ("macintosh", "mac os", "darwin")):
+        platform = "macOS"
+    elif "windows" in u:
+        platform = "Windows"
+    elif "linux" in u:
+        platform = "Linux"
+    if not client and u.startswith("mozilla"):
+        client = "Browser"
+    return client, platform
+
+
+def device_key(ip: str, ua: str) -> str:
+    """Opaque per-device identity: stable for one client+IP, distinct for others."""
+    seed = f"{(ip or '').strip()}|{(ua or '').strip().lower()}"
+    return hashlib.sha1(seed.encode()).hexdigest()[:16]
+
+
+def device_label(client: str, platform: str, ip: str) -> str:
+    if client and platform:
+        return f"{client} · {platform}"
+    if client:
+        return client
+    if platform:
+        return platform
+    return ip or "?"
+
+
 def active_devices(uid: int, window: Optional[int] = None) -> int:
-    """Distinct IPs seen inside a window. Defaults to the enforcement window."""
+    """Distinct devices seen inside a window. Defaults to the enforcement window."""
     w = DEVICE_WINDOW if window is None else window
     with db() as c:
-        r = c.execute("SELECT COUNT(*) n FROM user_ips WHERE user_id=? AND last_seen>?",
+        r = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=? AND last_seen>?",
                       (uid, now() - w)).fetchone()
     return r["n"] if r else 0
 
@@ -424,21 +518,26 @@ def live_devices(uid: int) -> int:
     return active_devices(uid, LIVE_WINDOW)
 
 
-def touch_ip(uid: int, ip: str, proto: str):
+def touch_device(uid: int, dkey: str, ip: str, ua: str, proto: str):
+    client, platform = parse_ua(ua)
     with db() as c:
-        c.execute("""INSERT INTO user_ips(user_id,ip,proto,first_seen,last_seen,hits)
-                     VALUES(?,?,?,?,?,1)
-                     ON CONFLICT(user_id,ip) DO UPDATE
-                     SET last_seen=excluded.last_seen, proto=excluded.proto, hits=hits+1""",
-                  (uid, ip, proto, now(), now()))
+        c.execute("""INSERT INTO devices(user_id,dkey,ip,ua,client,platform,proto,
+                                         first_seen,last_seen,hits)
+                     VALUES(?,?,?,?,?,?,?,?,?,1)
+                     ON CONFLICT(user_id,dkey) DO UPDATE
+                     SET last_seen=excluded.last_seen, ip=excluded.ip, ua=excluded.ua,
+                         client=excluded.client, platform=excluded.platform,
+                         proto=excluded.proto, hits=hits+1""",
+                  (uid, dkey, ip, (ua or "")[:300], client, platform, proto, now(), now()))
 
 
-def ip_allowed(uid: int, ip: str, limit: int) -> bool:
+def device_allowed(uid: int, dkey: str, limit: int) -> bool:
+    """A known device always passes; a brand-new one only while a slot is free."""
     if limit <= 0:
         return True
     with db() as c:
-        known = c.execute("SELECT 1 FROM user_ips WHERE user_id=? AND ip=? AND last_seen>?",
-                          (uid, ip, now() - DEVICE_WINDOW)).fetchone()
+        known = c.execute("SELECT 1 FROM devices WHERE user_id=? AND dkey=? AND last_seen>?",
+                          (uid, dkey, now() - DEVICE_WINDOW)).fetchone()
     return bool(known) or active_devices(uid) < limit
 
 
@@ -918,7 +1017,7 @@ def lookup_user(uid_str: str):
         return c.execute("SELECT * FROM users WHERE uuid=?", (uid_str,)).fetchone()
 
 
-def authorize(uid_str: str, ip: str, proto: str):
+def authorize(uid_str: str, ip: str, proto: str, ua: str = ""):
     """Returns (row, None) on success or (None, reason)."""
     row = lookup_user(uid_str)
     if not row:
@@ -928,23 +1027,24 @@ def authorize(uid_str: str, ip: str, proto: str):
         return None, reason
     if not transport_allowed(row, proto):
         return None, f"{proto} not allowed"
-    if not ip_allowed(row["id"], ip, row["device_limit"]):
+    dkey = device_key(ip, ua)
+    if not device_allowed(row["id"], dkey, row["device_limit"]):
         return None, "device limit"
-    touch_ip(row["id"], ip, proto)
+    touch_device(row["id"], dkey, ip, ua, proto)
     return row, None
 
 
 async def relay_session(stream: ByteStream,
                         send: Callable[[bytes], Awaitable[None]],
                         ip: str, proto: str, direct: bool = False,
-                        pid: int | None = None) -> None:
+                        pid: int | None = None, ua: str = "") -> None:
     """Shared VLESS handling: authenticate, dial the target, pump both ways."""
     parsed = await parse_vless(stream)
     if not parsed:
         raise ValueError("bad vless header")
     uid_str, cmd, host, port = parsed
 
-    row, reason = authorize(uid_str, ip, proto)
+    row, reason = authorize(uid_str, ip, proto, ua)
     if not row:
         audit("reject", ip, f"{proto}: {reason}")
         raise PermissionError(reason)
@@ -954,6 +1054,7 @@ async def relay_session(stream: ByteStream,
     # every exit path below via finally.
     _live_key = f"{ip}:{row['uuid']}:{id(stream)}"
     proxy_tag = f"proxy#{pid}" if pid is not None else ("direct" if direct else "host")
+    _client, _platform = parse_ua(ua)
     await live_register(_live_key, {
         "ip": ip,
         "user": row["name"],
@@ -961,6 +1062,8 @@ async def relay_session(stream: ByteStream,
         "transport": proto,
         "route": proxy_tag,
         "mux": cmd == 3,
+        "client": _client,
+        "platform": _platform,
         "since": int(time.time()),
     })
     try:
@@ -1243,6 +1346,7 @@ class XSession:
     def __init__(self, sid: str, ip: str):
         self.sid = sid
         self.ip = ip
+        self.ua = ""
         self.stream = ByteStream()
         self.out: asyncio.Queue = asyncio.Queue()
         self.next_seq = 0
@@ -1311,14 +1415,17 @@ SID_RE = re.compile(r"^[A-Za-z0-9._\-]{4,64}$")
 
 
 def get_session(sid: str, ip: str, direct: bool = False,
-                pid: int | None = None) -> XSession:
+                pid: int | None = None, ua: str = "") -> XSession:
     s = SESSIONS.get(sid)
     if s is None or s.closed:
         s = XSession(sid, ip)
         s.direct = direct
         s.pid = pid
+        s.ua = ua
         SESSIONS[sid] = s
         s.worker = asyncio.create_task(run_session(s))
+    if ua and not s.ua:
+        s.ua = ua
     s.touch()
     return s
 
@@ -1327,7 +1434,8 @@ async def run_session(s: XSession):
     try:
         await relay_session(s.stream, s.send, s.ip, "xhttp",
                             getattr(s, "direct", False),
-                            getattr(s, "pid", None))
+                            getattr(s, "pid", None),
+                            getattr(s, "ua", ""))
     except Exception:
         pass
     finally:
@@ -1440,7 +1548,8 @@ async def _xhttp_uplink_packet(s: XSession, seq: str, request: Request) -> Respo
 async def xhttp_down(session: str, request: Request):
     if not SID_RE.match(session):
         raise HTTPException(404)
-    return _xhttp_downlink(get_session(session, client_ip(request)))
+    return _xhttp_downlink(get_session(session, client_ip(request),
+                                       ua=user_agent(request)))
 
 
 @app.post("/" + XHTTP_PATH + "/{session}")
@@ -1448,7 +1557,7 @@ async def xhttp_up_stream(session: str, request: Request):
     if not SID_RE.match(session):
         raise HTTPException(404)
     return await _xhttp_uplink_stream(
-        get_session(session, client_ip(request)), request)
+        get_session(session, client_ip(request), ua=user_agent(request)), request)
 
 
 @app.post("/" + XHTTP_PATH + "/{session}/{seq}")
@@ -1456,7 +1565,7 @@ async def xhttp_up(session: str, seq: str, request: Request):
     if not SID_RE.match(session) or not seq.isdigit():
         raise HTTPException(404)
     return await _xhttp_uplink_packet(
-        get_session(session, client_ip(request)), seq, request)
+        get_session(session, client_ip(request), ua=user_agent(request)), seq, request)
 
 
 # ── XHTTP, no-proxy variant ──
@@ -1467,7 +1576,8 @@ async def xhttp_up(session: str, seq: str, request: Request):
 async def xhttp_down_direct(session: str, request: Request):
     if not SID_RE.match(session):
         raise HTTPException(404)
-    return _xhttp_downlink(get_session("d." + session, client_ip(request), True))
+    return _xhttp_downlink(get_session("d." + session, client_ip(request), True,
+                                       ua=user_agent(request)))
 
 
 @app.post("/" + XHTTP_PATH + "-d/{session}")
@@ -1475,7 +1585,7 @@ async def xhttp_up_direct_stream(session: str, request: Request):
     if not SID_RE.match(session):
         raise HTTPException(404)
     return await _xhttp_uplink_stream(
-        get_session("d." + session, client_ip(request), True), request)
+        get_session("d." + session, client_ip(request), True, ua=user_agent(request)), request)
 
 
 @app.post("/" + XHTTP_PATH + "-d/{session}/{seq}")
@@ -1483,7 +1593,8 @@ async def xhttp_up_direct(session: str, seq: str, request: Request):
     if not SID_RE.match(session) or not seq.isdigit():
         raise HTTPException(404)
     return await _xhttp_uplink_packet(
-        get_session("d." + session, client_ip(request), True), seq, request)
+        get_session("d." + session, client_ip(request), True, ua=user_agent(request)),
+        seq, request)
 
 
 # ── XHTTP, per-proxy variants ──
@@ -1495,7 +1606,8 @@ async def xhttp_down_proxy(pid: int, session: str, request: Request):
     if not SID_RE.match(session) or pid <= 0:
         raise HTTPException(404)
     return _xhttp_downlink(
-        get_session("p%d.%s" % (pid, session), client_ip(request), False, pid))
+        get_session("p%d.%s" % (pid, session), client_ip(request), False, pid,
+                    ua=user_agent(request)))
 
 
 @app.post("/" + XHTTP_PATH + "-p{pid}/{session}")
@@ -1503,7 +1615,8 @@ async def xhttp_up_proxy_stream(pid: int, session: str, request: Request):
     if not SID_RE.match(session) or pid <= 0:
         raise HTTPException(404)
     return await _xhttp_uplink_stream(
-        get_session("p%d.%s" % (pid, session), client_ip(request), False, pid), request)
+        get_session("p%d.%s" % (pid, session), client_ip(request), False, pid,
+                    ua=user_agent(request)), request)
 
 
 @app.post("/" + XHTTP_PATH + "-p{pid}/{session}/{seq}")
@@ -1511,7 +1624,8 @@ async def xhttp_up_proxy(pid: int, session: str, seq: str, request: Request):
     if not SID_RE.match(session) or not seq.isdigit() or pid <= 0:
         raise HTTPException(404)
     return await _xhttp_uplink_packet(
-        get_session("p%d.%s" % (pid, session), client_ip(request), False, pid),
+        get_session("p%d.%s" % (pid, session), client_ip(request), False, pid,
+                    ua=user_agent(request)),
         seq, request)
 
 
@@ -1528,6 +1642,7 @@ async def vless_ws(websocket: WebSocket, path: str):
         await websocket.close(code=1008)
         return
     ip = client_ip(websocket)
+    ua = user_agent(websocket)
     await websocket.accept()
     stream = WSStream(websocket)
 
@@ -1535,7 +1650,7 @@ async def vless_ws(websocket: WebSocket, path: str):
         await websocket.send_bytes(data)
 
     try:
-        await relay_session(stream, send, ip, "ws", direct, pid)
+        await relay_session(stream, send, ip, "ws", direct, pid, ua)
     except PermissionError:
         try:
             await websocket.close(code=1008)
@@ -2187,6 +2302,7 @@ async def rotate_uuid(uid: int, _=Depends(require_admin)):
     with db() as c:
         c.execute("UPDATE users SET uuid=? WHERE id=?", (new, uid))
         c.execute("DELETE FROM user_ips WHERE user_id=?", (uid,))
+        c.execute("DELETE FROM devices WHERE user_id=?", (uid,))
     audit("uuid_rotated", "", f"user {uid}")
     return {"ok": True, "uuid": new}
 
@@ -2203,34 +2319,48 @@ async def rotate_sub(uid: int, _=Depends(require_admin)):
 async def clear_ips(uid: int, _=Depends(require_admin)):
     with db() as c:
         c.execute("DELETE FROM user_ips WHERE user_id=?", (uid,))
+        c.execute("DELETE FROM devices WHERE user_id=?", (uid,))
+    return {"ok": True}
+
+
+@app.delete("/api/users/{uid}/devices/{did}")
+async def delete_device(uid: int, did: int, _=Depends(require_admin)):
+    """Forget one detected device so it frees a slot (and stops being recognised)."""
+    with db() as c:
+        c.execute("DELETE FROM devices WHERE id=? AND user_id=?", (did, uid))
     return {"ok": True}
 
 
 @app.get("/api/users/{uid}/ips")
 async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
-    """Live view by default: only IPs still connected. history=1 returns everything."""
+    """Live view by default: only devices still connected. history=1 returns everything."""
     live_cut = now() - LIVE_WINDOW
     count_cut = now() - DEVICE_WINDOW
+    cols = "id,dkey,ip,ua,client,platform,proto,first_seen,last_seen,hits"
     with db() as c:
         if history:
-            rows = c.execute("""SELECT ip,proto,first_seen,last_seen,hits FROM user_ips
-                                WHERE user_id=? ORDER BY last_seen DESC LIMIT 200""",
+            rows = c.execute(f"""SELECT {cols} FROM devices
+                                 WHERE user_id=? ORDER BY last_seen DESC LIMIT 200""",
                              (uid,)).fetchall()
         else:
-            rows = c.execute("""SELECT ip,proto,first_seen,last_seen,hits FROM user_ips
-                                WHERE user_id=? AND last_seen>?
-                                ORDER BY last_seen DESC""", (uid, live_cut)).fetchall()
-        total = c.execute("SELECT COUNT(*) n FROM user_ips WHERE user_id=?",
+            rows = c.execute(f"""SELECT {cols} FROM devices
+                                 WHERE user_id=? AND last_seen>?
+                                 ORDER BY last_seen DESC""", (uid, live_cut)).fetchall()
+        total = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=?",
                           (uid,)).fetchone()["n"]
+        urow = c.execute("SELECT device_limit FROM users WHERE id=?", (uid,)).fetchone()
     return {
         "live": live_devices(uid),
         "counted": active_devices(uid),
         "total_seen": total,
+        "limit": (urow["device_limit"] if urow else 0),
         "live_window": LIVE_WINDOW,
         "device_window": DEVICE_WINDOW,
         "history": bool(history),
         "rows": [
-            {**dict(r), "online": r["last_seen"] > live_cut,
+            {**dict(r),
+             "label": device_label(r["client"], r["platform"], r["ip"]),
+             "online": r["last_seen"] > live_cut,
              "counted": r["last_seen"] > count_cut}
             for r in rows
         ],
@@ -2255,6 +2385,7 @@ async def delete_user(uid: int, _=Depends(require_admin)):
     with db() as c:
         c.execute("DELETE FROM users WHERE id=?", (uid,))
         c.execute("DELETE FROM user_ips WHERE user_id=?", (uid,))
+        c.execute("DELETE FROM devices WHERE user_id=?", (uid,))
         c.execute("DELETE FROM traffic_log WHERE user_id=?", (uid,))
     return {"ok": True}
 
@@ -2818,6 +2949,7 @@ def apply_backup(payload: dict, mode: str = "merge",
         conn.execute("BEGIN IMMEDIATE")
         if mode == "replace":
             conn.execute("DELETE FROM user_ips")
+            conn.execute("DELETE FROM devices")
             conn.execute("DELETE FROM traffic_log")
             conn.execute("DELETE FROM users")
             conn.execute("DELETE FROM clean_ips")
@@ -3071,16 +3203,16 @@ async def stats(_=Depends(require_admin)):
     with db() as c:
         tot = c.execute("SELECT COUNT(*) n, COALESCE(SUM(used_bytes),0) b FROM users").fetchone()
         act = c.execute("SELECT COUNT(*) n FROM users WHERE enabled=1").fetchone()
-        onl = c.execute("SELECT COUNT(DISTINCT user_id) n FROM user_ips WHERE last_seen>?",
+        onl = c.execute("SELECT COUNT(DISTINCT user_id) n FROM devices WHERE last_seen>?",
                         (now() - DEVICE_WINDOW,)).fetchone()
-        dev = c.execute("SELECT COUNT(*) n FROM user_ips WHERE last_seen>?",
+        dev = c.execute("SELECT COUNT(*) n FROM devices WHERE last_seen>?",
                         (now() - DEVICE_WINDOW,)).fetchone()
-        liv = c.execute("SELECT COUNT(*) n FROM user_ips WHERE last_seen>?",
+        liv = c.execute("SELECT COUNT(*) n FROM devices WHERE last_seen>?",
                         (now() - LIVE_WINDOW,)).fetchone()
-        lu = c.execute("SELECT COUNT(DISTINCT user_id) n FROM user_ips WHERE last_seen>?",
+        lu = c.execute("SELECT COUNT(DISTINCT user_id) n FROM devices WHERE last_seen>?",
                        (now() - LIVE_WINDOW,)).fetchone()
         cip = c.execute("SELECT COUNT(*) n FROM clean_ips WHERE enabled=1").fetchone()
-        byp = c.execute("SELECT proto, COUNT(*) n FROM user_ips WHERE last_seen>? "
+        byp = c.execute("SELECT proto, COUNT(*) n FROM devices WHERE last_seen>? "
                         "GROUP BY proto", (now() - DEVICE_WINDOW,)).fetchall()
         series = c.execute("""SELECT ts/3600*3600 h, SUM(up) up, SUM(down) down
                               FROM traffic_log WHERE ts>? GROUP BY h ORDER BY h""",
@@ -4361,16 +4493,16 @@ const I18N={
   newUser:'ساخت کاربر جدید',users:'کاربران',
   name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',
   transport:'ترنسپورت',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 هر دو',
-  add:'افزودن',zeroInf:'۰ = بی‌نهایت. «تعداد دستگاه» بر اساس IP یکتای فعال محاسبه می‌شود.',
+  add:'افزودن',zeroInf:'۰ = بی‌نهایت. هر دستگاه از روی IP و User-Agent کلاینت شناسایی و ثبت می‌شود؛ «تعداد دستگاه» یعنی چند دستگاه هم‌زمان مجاز است.',
   search:'جستجو…',noUsers:'کاربری نیست',
-  config:'کانفیگ',ipsBtn:'IP ها',edit:'ویرایش',
+  config:'کانفیگ',ipsBtn:'دستگاه‌ها',edit:'ویرایش',
   used:'مصرف',expiry:'انقضا',never:'بی‌نهایت',
   subLink:'لینک اشتراک (Subscription)',copySub:'کپی لینک اشتراک',
   singleCfg:'کانفیگ‌های تکی',copy:'کپی',copied:'کپی شد ✓',
   devTitle:'دستگاه‌های متصل',noConn:'هنوز اتصالی ثبت نشده',
-  clearIps:'پاک کردن لیست IP',
+  clearIps:'پاک کردن همه دستگاه‌ها',delDevice:'حذف دستگاه',delDeviceWarn:'این دستگاه از لیست حذف شود؟ (یک جای خالی آزاد می‌شود)',unknownClient:'ناشناس',devLimitLbl:'مجاز',onlineTag:'آنلاین',offlineTag:'آفلاین',
   liveNow:'الان متصل',noneNow:'همین الان هیچ دستگاهی متصل نیست',
-  countedFor:'شمرده‌شده برای محدودیت',totalSeen:'کل IP های دیده‌شده',
+  countedFor:'شمرده‌شده برای محدودیت',totalSeen:'کل دستگاه‌های دیده‌شده',
   showHistory:'نمایش تاریخچه',showLive:'نمایش فقط متصل‌ها',
   inLast:'در %s ثانیه اخیر',refresh:'به‌روزرسانی',
   liveDevices:'دستگاه‌های فعال الان',
@@ -4475,16 +4607,16 @@ const I18N={
   newUser:'Create user',users:'Users',
   name:'Name',quota:'Quota (GB)',days:'Days',devLimit:'Devices',
   transport:'Transport',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 Both',
-  add:'Add',zeroInf:'0 = unlimited. Device count is based on distinct active IPs.',
+  add:'Add',zeroInf:'0 = unlimited. Every device is identified and recorded from its IP and client User-Agent; "Devices" is how many may connect at once.',
   search:'Search…',noUsers:'No users yet',
-  config:'Config',ipsBtn:'IPs',edit:'Edit',
+  config:'Config',ipsBtn:'Devices',edit:'Edit',
   used:'Used',expiry:'Expires',never:'Never',
   subLink:'Subscription link',copySub:'Copy subscription link',
   singleCfg:'Individual configs',copy:'Copy',copied:'Copied ✓',
   devTitle:'Connected devices',noConn:'No connections recorded yet',
-  clearIps:'Clear IP list',
+  clearIps:'Clear all devices',delDevice:'Remove device',delDeviceWarn:'Remove this device from the list? (frees a slot)',unknownClient:'Unknown',devLimitLbl:'Allowed',onlineTag:'Online',offlineTag:'Offline',
   liveNow:'Connected now',noneNow:'No device connected right now',
-  countedFor:'Counted toward the limit',totalSeen:'Total IPs ever seen',
+  countedFor:'Counted toward the limit',totalSeen:'Total devices ever seen',
   showHistory:'Show history',showLive:'Show only connected',
   inLast:'in the last %ss',refresh:'Refresh',
   liveDevices:'Devices live now',
@@ -5455,9 +5587,12 @@ async function paintIps(quiet){
  const rows=d.rows.length ? d.rows.map(x=>`
   <div class="lrow">
    <span style="width:8px;height:8px;border-radius:50%;background:${x.online?'var(--ok)':(x.counted?'var(--info)':'var(--dim)')}"></span>
-   <span class="mono">${esc(x.ip)}</span>
-   <span class="chip">${esc(x.proto||'ws')}</span>
-   <span class="ms-auto dim">${dt(x.last_seen)}</span>
+   <div style="min-width:0;flex:1">
+    <div class="font-bold truncate">${esc(x.label||x.ip)}</div>
+    <div class="text-xs dim mono truncate">${esc(x.ip)} · ${esc(x.proto||'ws')}${x.hits?' · '+x.hits+'x':''}</div>
+   </div>
+   <span class="text-xs dim" title="${esc(x.ua||'')}">${dt(x.last_seen)}</span>
+   <button class="icon-btn danger" title="${T('delDevice')}" onclick="delDevice(${ipUid},${x.id})">${ICO.del}</button>
   </div>`).join('')
   : `<p class="text-xs dim" style="margin:0">${ipHistory?T('noConn'):T('noneNow')}</p>`;
 
@@ -5469,7 +5604,7 @@ async function paintIps(quiet){
   </div>
   <div class="g2 text-sm">
    <div class="kv"><span class="dim">${T('countedFor')}</span>
-    <span class="ms-auto font-bold" style="color:var(--info)">${d.counted}</span></div>
+    <span class="ms-auto font-bold" style="color:var(--info)">${d.counted}${d.limit?' / '+d.limit:' / ∞'}</span></div>
    <div class="kv"><span class="dim">${T('totalSeen')}</span>
     <span class="ms-auto font-bold">${d.total_seen}</span></div>
   </div>
@@ -5485,6 +5620,12 @@ async function paintIps(quiet){
 function toggleIpHistory(){ ipHistory=!ipHistory; paintIps(); }
 
 async function clearIps(id){await api('/api/users/'+id+'/clear-ips',{method:'POST'});closeModal();loadUsers();loadStats()}
+
+async function delDevice(uid,did){
+ if(!confirm(T('delDeviceWarn')))return;
+ try{await api('/api/users/'+uid+'/devices/'+did,{method:'DELETE'});paintIps(true);loadUsers();loadStats();}
+ catch(e){}
+}
 
 function showEdit(id){
  const u=users.find(x=>x.id===id);
