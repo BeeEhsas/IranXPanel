@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS users (
     ech          INTEGER DEFAULT 0,
     fp           TEXT    DEFAULT 'unsafe',
     alpn         TEXT    DEFAULT '',
+    ech_value    TEXT    DEFAULT '',
+    obf_cs       TEXT    DEFAULT '',
+    obf_fm       TEXT    DEFAULT '',
     created_at   INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS clean_ips (
@@ -186,6 +189,17 @@ CREATE TABLE IF NOT EXISTS devices (
     hits       INTEGER DEFAULT 1,
     UNIQUE(user_id, dkey)
 );
+-- Outbound destination filter. The VLESS header carries the target host, so the panel
+-- can refuse to dial a censored site before the connection is made.
+CREATE TABLE IF NOT EXISTS filter_rules (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern  TEXT    NOT NULL,
+    kind     TEXT    DEFAULT 'domain',   -- 'domain' = host or its subdomains, 'keyword' = anywhere
+    note     TEXT    DEFAULT '',
+    enabled  INTEGER DEFAULT 1,
+    added_at INTEGER NOT NULL,
+    UNIQUE(pattern)
+);
 CREATE TABLE IF NOT EXISTS traffic_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -216,7 +230,10 @@ def migrate():
                         ("obfuscate", "INTEGER DEFAULT 0"),
                         ("ech", "INTEGER DEFAULT 0"),
                         ("fp", "TEXT DEFAULT 'unsafe'"),
-                        ("alpn", "TEXT DEFAULT ''")],
+                        ("alpn", "TEXT DEFAULT ''"),
+                        ("ech_value", "TEXT DEFAULT ''"),
+                        ("obf_cs", "TEXT DEFAULT ''"),
+                        ("obf_fm", "TEXT DEFAULT ''")],
               "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
               "clean_ips": [("country", "TEXT DEFAULT ''")],
               "proxies": [("country", "TEXT DEFAULT ''"),
@@ -1012,6 +1029,75 @@ def blocked(host: str) -> bool:
     return any(a in n for n in BLOCKED)
 
 
+# ────────────────────────────── CONTENT FILTER ──────────────────────────────
+#
+# The VLESS header carries the destination host, so the panel can refuse to dial a
+# censored site (or porn) before any connection is made. Enforced on the plain TCP
+# path AND on every mux sub-stream, which is the one clients actually use with the
+# WS transport (mux=1). DNS sub-streams are left alone: refusing the dial is what
+# actually stops the page from loading.
+
+PORN_KEYWORDS = (
+    "porn", "xxx", "xnxx", "xvideos", "xhamster", "redtube", "youporn", "pornhub",
+    "brazzers", "onlyfans", "livejasmin", "chaturbate", "stripchat", "bongacams",
+    "cam4", "beeg", "spankbang", "tnaflix", "hqporner", "eporner", "txxx",
+    "daftsex", "hclips", "tube8", "porntrex", "javhd", "javbus", "18porn", "hentai",
+    "nhentai", "e-hentai", "rule34", "fapello", "erome", "escort", "hardcore",
+    "blowjob", "cumshot", "milf-porn", "nude", "nudes", "xxxvideo",
+)
+
+_FILTER_CACHE = {"ts": 0.0, "domains": frozenset(), "keywords": frozenset()}
+
+
+def filter_on() -> bool:
+    return get_setting("filter_enabled") == "1"
+
+
+def porn_on() -> bool:
+    return get_setting("block_porn") == "1"
+
+
+def load_filter_rules(force: bool = False):
+    """Domains + keywords, cached a few seconds so the hot path stays cheap."""
+    t = time.time()
+    if not force and t - _FILTER_CACHE["ts"] < 5:
+        return _FILTER_CACHE
+    doms, kws = set(), set()
+    try:
+        with db() as c:
+            for r in c.execute("SELECT pattern,kind FROM filter_rules WHERE enabled=1"):
+                p = (r["pattern"] or "").strip().lower().lstrip("*.").strip(".")
+                if p:
+                    (kws if r["kind"] == "keyword" else doms).add(p)
+    except Exception:
+        pass
+    _FILTER_CACHE["ts"] = t
+    _FILTER_CACHE["domains"] = frozenset(doms)
+    _FILTER_CACHE["keywords"] = frozenset(kws)
+    return _FILTER_CACHE
+
+
+def host_blocked(host: str) -> str:
+    """'' when allowed, else a short reason used in the audit log."""
+    if not filter_on():
+        return ""
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return ""
+    rules = load_filter_rules()
+    for d in rules["domains"]:
+        if h == d or h.endswith("." + d):
+            return "site:" + d
+    for k in rules["keywords"]:
+        if k in h:
+            return "keyword:" + k
+    if porn_on():
+        for k in PORN_KEYWORDS:
+            if k in h:
+                return "porn:" + k
+    return ""
+
+
 def lookup_user(uid_str: str):
     with db() as c:
         return c.execute("SELECT * FROM users WHERE uuid=?", (uid_str,)).fetchone()
@@ -1117,6 +1203,10 @@ async def _relay_session_body(stream, send, row, ip, proto, direct, pid, cmd, ho
         raise ValueError("only TCP supported")
     if blocked(host) or port == 0:
         raise PermissionError("blocked destination")
+    why = host_blocked(host)
+    if why:
+        audit("filtered", ip, f"{host} ({why})")
+        raise PermissionError("blocked by filter")
 
     reader, writer = await dial_target(host, port, direct, pid)
 
@@ -1296,6 +1386,11 @@ async def relay_mux(stream: ByteStream,
                 # Any other UDP sub-stream is still refused, without tearing the
                 # tunnel down.
                 if net_type != 1 or not host or port == 0 or blocked(host):
+                    await send_frame(sid, MUX_END)
+                    continue
+                why = host_blocked(host)
+                if why:
+                    audit("filtered", ip, f"{host} ({why})")
                     await send_frame(sid, MUX_END)
                     continue
                 try:
@@ -1784,6 +1879,28 @@ def ech_on(row) -> bool:
         return False
 
 
+def _row_str(row, col: str) -> str:
+    try:
+        return (row[col] or "").strip()
+    except Exception:
+        return ""
+
+
+def ech_value(row) -> str:
+    """This user's custom ECH config list, or the panel default when unset."""
+    return _row_str(row, "ech_value") or ECH_VALUE
+
+
+def obf_cs(row) -> str:
+    """Custom cipher-suite mask for the obfuscated link, else the default list."""
+    return _row_str(row, "obf_cs") or OBF_CS
+
+
+def obf_fm(row) -> str:
+    """Custom fragment JSON for the obfuscated link, else the default shape."""
+    return _row_str(row, "obf_fm") or OBF_FM
+
+
 def user_fp(row) -> str:
     """This user's TLS fingerprint, or the panel default when unset/unknown."""
     try:
@@ -1814,7 +1931,7 @@ def tls_extras(row) -> str:
     """Per-user TLS parameters appended to every link: fp, and ech when enabled."""
     out = [f"fp={quote(user_fp(row), safe='')}"]
     if ech_on(row):
-        out.append(f"ech={quote(ECH_VALUE, safe='')}")
+        out.append(f"ech={quote(ech_value(row), safe='')}")
     return "&".join(out)
 
 
@@ -1833,10 +1950,10 @@ def ws_uri_obf(row, address: str, host: str, label: str, direct: bool = False,
     _a = user_alpn(row, "")
     alpn_part = f"&alpn={quote(_a, safe='')}" if _a else ""
     return (f"vless://{row['uuid']}@{address}:443"
-            f"?cs={quote(OBF_CS, safe='')}"
+            f"?cs={quote(obf_cs(row), safe='')}"
             f"&path={quote('/' + path, safe='')}"
             f"&security=tls&encryption=none"
-            f"&fm={quote(OBF_FM, safe='')}"
+            f"&fm={quote(obf_fm(row), safe='')}"
             f"&insecure=0&host={host}&{tls_extras(row)}{alpn_part}&type=ws&allowInsecure=0"
             f"&sni={host}"
             f"#{quote(label)}")
@@ -2077,6 +2194,9 @@ class UserIn(BaseModel):
     ech: bool = False
     fp: str = "unsafe"
     alpn: str = ""
+    ech_value: str = ""
+    obf_cs: str = ""
+    obf_fm: str = ""
 
 
 class UserPatch(BaseModel):
@@ -2091,6 +2211,9 @@ class UserPatch(BaseModel):
     ech: Optional[bool] = None
     fp: Optional[str] = None
     alpn: Optional[str] = None
+    ech_value: Optional[str] = None
+    obf_cs: Optional[str] = None
+    obf_fm: Optional[str] = None
     uuid: Optional[str] = None
 
 
@@ -2220,8 +2343,8 @@ async def create_user(body: UserIn, _=Depends(require_admin)):
             cur = c.execute(
                 """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                      used_bytes,expire_at,device_limit,transport,
-                                     obfuscate,ech,fp,alpn,created_at)
-                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)""",
+                                     obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,created_at)
+                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?)""",
                 (name, str(uuid.uuid4()), secrets.token_urlsafe(16), body.note,
                  1 if body.enabled else 0, int(body.quota_gb * GB), expire,
                  max(0, body.device_limit), tr,
@@ -2229,6 +2352,9 @@ async def create_user(body: UserIn, _=Depends(require_admin)):
                  1 if body.ech else 0,
                  _pick_choice(body.fp, FINGERPRINTS, "unsafe"),
                  _pick_choice(body.alpn, ALPN_CHOICES, ""),
+                 (body.ech_value or "").strip()[:2000],
+                 (body.obf_cs or "").strip()[:4000],
+                 (body.obf_fm or "").strip()[:4000],
                  now()))
             row = c.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
     except sqlite3.IntegrityError:
@@ -2273,6 +2399,12 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
         if body.alpn is not None:
             sets.append("alpn=?")
             vals.append(_pick_choice(body.alpn, ALPN_CHOICES, ""))
+        if body.ech_value is not None:
+            sets.append("ech_value=?"); vals.append((body.ech_value or "").strip()[:2000])
+        if body.obf_cs is not None:
+            sets.append("obf_cs=?"); vals.append((body.obf_cs or "").strip()[:4000])
+        if body.obf_fm is not None:
+            sets.append("obf_fm=?"); vals.append((body.obf_fm or "").strip()[:4000])
         if body.uuid is not None:
             try:
                 clean = str(uuid.UUID(body.uuid.strip()))
@@ -2711,7 +2843,7 @@ async def delete_proxy(pid: int, _=Depends(require_admin)):
 # lands or the database is left exactly as it was.
 
 BACKUP_FORMAT = "iranx-panel-backup"
-BACKUP_VERSION = 4          # v1 no proxies, v2 no obfuscate, v3 no ech/fp/alpn
+BACKUP_VERSION = 5          # v1 no proxies, v2 no obfuscate, v3 no ech/fp/alpn, v5 no custom ech/obf
 
 # Runtime settings that live in the environment, not the database. They are recorded for
 # reference and shown on restore, because a new host needs them set by hand — the panel
@@ -2722,7 +2854,8 @@ ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
 
 USER_FIELDS = ("name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
                "used_bytes", "expire_at", "device_limit", "transport",
-               "obfuscate", "ech", "fp", "alpn", "created_at")
+               "obfuscate", "ech", "fp", "alpn", "ech_value", "obf_cs", "obf_fm",
+               "created_at")
 CIP_FIELDS = ("address", "remark", "country", "enabled", "added_at")
 # Health columns are deliberately included: a restore then shows the same list state the
 # old panel had, and the next test run refreshes it anyway.
@@ -2865,6 +2998,10 @@ def _clean_user(u: dict) -> Optional[dict]:
         "ech": 1 if u.get("ech") else 0,
         "fp": _pick_choice(u.get("fp"), FINGERPRINTS, "unsafe"),
         "alpn": _pick_choice(u.get("alpn"), ALPN_CHOICES, ""),
+        # Missing in v4 (and older) backups: empty means "use the panel default".
+        "ech_value": str(u.get("ech_value") or "").strip()[:2000],
+        "obf_cs": str(u.get("obf_cs") or "").strip()[:4000],
+        "obf_fm": str(u.get("obf_fm") or "").strip()[:4000],
         "created_at": num("created_at") or now(),
     }
 
@@ -2967,11 +3104,13 @@ def apply_backup(payload: dict, mode: str = "merge",
                     """UPDATE users SET name=?, uuid=?, sub_token=?, note=?, enabled=?,
                            quota_bytes=?, used_bytes=?, expire_at=?, device_limit=?,
                            transport=?, obfuscate=?, ech=?, fp=?, alpn=?,
+                           ech_value=?, obf_cs=?, obf_fm=?,
                            created_at=? WHERE id=?""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
                      u["device_limit"], u["transport"], u["obfuscate"],
                      u["ech"], u["fp"], u["alpn"],
+                     u["ech_value"], u["obf_cs"], u["obf_fm"],
                      u["created_at"], existing["id"]))
                 stats["users_updated"] += 1
                 continue
@@ -2979,12 +3118,14 @@ def apply_backup(payload: dict, mode: str = "merge",
                 conn.execute(
                     """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                          used_bytes,expire_at,device_limit,transport,
-                                         obfuscate,ech,fp,alpn,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                         obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
+                                         created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
                      u["device_limit"], u["transport"], u["obfuscate"],
                      u["ech"], u["fp"], u["alpn"],
+                     u["ech_value"], u["obf_cs"], u["obf_fm"],
                      u["created_at"]))
                 stats["users_added"] += 1
             except sqlite3.IntegrityError:
@@ -2993,12 +3134,14 @@ def apply_backup(payload: dict, mode: str = "merge",
                     conn.execute(
                         """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                              used_bytes,expire_at,device_limit,transport,
-                                             obfuscate,ech,fp,alpn,created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                             obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
+                                             created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (u["name"], u["uuid"], secrets.token_urlsafe(16), u["note"],
                          u["enabled"], u["quota_bytes"], u["used_bytes"], u["expire_at"],
                          u["device_limit"], u["transport"], u["obfuscate"],
                          u["ech"], u["fp"], u["alpn"],
+                         u["ech_value"], u["obf_cs"], u["obf_fm"],
                          u["created_at"]))
                     stats["users_added"] += 1
                 except sqlite3.IntegrityError:
@@ -3237,8 +3380,95 @@ async def logs(_=Depends(require_admin)):
     return [dict(r) for r in rows]
 
 
-# ────────────────────────────── SUBSCRIPTION ──────────────────────────────
+# ────────────────────────────── CONTENT FILTER ──────────────────────────────
 
+class FilterRuleIn(BaseModel):
+    pattern: str = ""
+    kind: str = "domain"
+    note: str = ""
+    bulk: str = ""
+
+
+class FilterModeIn(BaseModel):
+    enabled: Optional[bool] = None
+    block_porn: Optional[bool] = None
+
+
+@app.get("/api/filter")
+async def get_filter(_=Depends(require_admin)):
+    with db() as c:
+        rows = c.execute("""SELECT id,pattern,kind,note,enabled,added_at
+                            FROM filter_rules ORDER BY id DESC LIMIT 1000""").fetchall()
+    return {"enabled": filter_on(), "block_porn": porn_on(),
+            "porn_keywords": len(PORN_KEYWORDS),
+            "rules": [dict(r) for r in rows]}
+
+
+@app.post("/api/filter/mode")
+async def set_filter_mode(body: FilterModeIn, _=Depends(require_admin)):
+    if body.enabled is not None:
+        set_setting("filter_enabled", "1" if body.enabled else "0")
+    if body.block_porn is not None:
+        set_setting("block_porn", "1" if body.block_porn else "0")
+    audit("filter_mode", "", f"enabled={filter_on()} porn={porn_on()}")
+    return {"ok": True, "enabled": filter_on(), "block_porn": porn_on()}
+
+
+@app.post("/api/filter/rules")
+async def add_filter_rules(body: FilterRuleIn, _=Depends(require_admin)):
+    kind = body.kind if body.kind in ("domain", "keyword") else "domain"
+    raw = body.bulk or body.pattern or ""
+    items = []
+    for line in str(raw).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        note = ""
+        if "#" in line:
+            line, note = line.split("#", 1)
+            line, note = line.strip(), note.strip()
+        for token in line.replace(",", " ").split():
+            token = token.strip().lower().lstrip("*.").strip(".")
+            if token:
+                items.append((token, kind, note))
+    added = 0
+    with db() as c:
+        for pat, k, note in items:
+            cur = c.execute("""INSERT OR IGNORE INTO filter_rules(pattern,kind,note,enabled,added_at)
+                               VALUES(?,?,?,1,?)""", (pat, k, note, now()))
+            added += cur.rowcount or 0
+    load_filter_rules(force=True)
+    return {"ok": True, "added": added}
+
+
+@app.patch("/api/filter/rules/{rid}")
+async def toggle_filter_rule(rid: int, _=Depends(require_admin)):
+    with db() as c:
+        c.execute("UPDATE filter_rules SET enabled=1-enabled WHERE id=?", (rid,))
+    load_filter_rules(force=True)
+    return {"ok": True}
+
+
+@app.delete("/api/filter/rules/{rid}")
+async def delete_filter_rule(rid: int, _=Depends(require_admin)):
+    with db() as c:
+        c.execute("DELETE FROM filter_rules WHERE id=?", (rid,))
+    load_filter_rules(force=True)
+    return {"ok": True}
+
+
+@app.delete("/api/filter/rules")
+async def clear_filter_rules(kind: str = "", _=Depends(require_admin)):
+    with db() as c:
+        if kind in ("domain", "keyword"):
+            c.execute("DELETE FROM filter_rules WHERE kind=?", (kind,))
+        else:
+            c.execute("DELETE FROM filter_rules")
+    load_filter_rules(force=True)
+    return {"ok": True}
+
+
+# ────────────────────────────── SUBSCRIPTION ──────────────────────────────
 
 
 # ══════════════════════════ SUBSCRIPTION PAGE ══════════════════════════
@@ -4591,6 +4821,29 @@ const I18N={
   devWinLbl:'پنجره شمارش دستگاه',seconds:'ثانیه',
   envNote:'این مقادیر از متغیرهای محیطی خوانده می‌شوند و در Railway قابل تغییرند.',
   logout:'خروج',logs:'رخدادها',noLogs:'رخدادی نیست',
+  navFilter:'فیلتر سایت',
+  fltTitle:'فیلتر و سانسور محتوا',
+  fltHint:'اتصال کاربران به سایت‌های فیلترشده رد می‌شود. مقصد از همان هدر VLESS خوانده می‌شود، پس پیش از برقراری اتصال جلوی آن گرفته می‌شود.',
+  fltEnable:'فیلتر فعال باشد',
+  fltEnableHint:'وقتی خاموش باشد هیچ سایتی مسدود نمی‌شود.',
+  fltPorn:'مسدودسازی خودکار محتوای بزرگسال',
+  fltPornHint:'لیست آمادهٔ سایت‌ها و کلیدواژه‌های پورن.',
+  fltRules:'قوانین مسدودسازی',
+  fltKindDomain:'دامنه (و زیردامنه‌ها)',
+  fltKindKeyword:'کلیدواژه (هرجای دامنه)',
+  fltAdd:'افزودن قانون',
+  fltBulk:'افزودن انبوه (هر خط یکی)',
+  fltClear:'پاک کردن همهٔ قوانین',
+  fltClearWarn:'همهٔ قوانین فیلتر حذف شوند؟',
+  fltList:'قوانین فعلی',
+  fltNone:'هنوز قانونی اضافه نشده',
+  fltAdded:'قانون اضافه شد',
+  fltDupe:'تکراری',
+  fltDomain:'دامنه',fltKeyword:'کلیدواژه',
+  fltOn:'فیلتر روشن است',fltOff:'فیلتر خاموش است',
+  echValueLbl:'مقدار کاستوم ECH',obfCsLbl:'کاستوم cs (ماسک سیفر)',obfFmLbl:'کاستوم fm (مبهم‌ساز)',
+  optDefault:'پیش‌فرض پنل',
+  custLbl:'مقادیر کاستوم ECH و مبهم‌ساز (اختیاری)',
   statusDisabled:'غیرفعال',statusExpired:'منقضی',statusQuota:'حجم تمام',
  },
  en:{dir:'ltr',
@@ -4706,6 +4959,29 @@ const I18N={
   devWinLbl:'Device counting window',seconds:'seconds',
   envNote:'These come from environment variables and can be changed in Railway.',
   logout:'Sign out',logs:'Events',noLogs:'No events yet',
+  navFilter:'Site filter',
+  fltTitle:'Content filtering & censorship',
+  fltHint:'Connections to filtered sites are refused. The destination is read from the VLESS header, so it is blocked before the connection is even made.',
+  fltEnable:'Filter enabled',
+  fltEnableHint:'When off, nothing is blocked.',
+  fltPorn:'Auto-block adult content',
+  fltPornHint:'A built-in list of porn sites and keywords.',
+  fltRules:'Blocking rules',
+  fltKindDomain:'Domain (and subdomains)',
+  fltKindKeyword:'Keyword (anywhere in the host)',
+  fltAdd:'Add rule',
+  fltBulk:'Bulk add (one per line)',
+  fltClear:'Clear all rules',
+  fltClearWarn:'Delete every filter rule?',
+  fltList:'Current rules',
+  fltNone:'No rules yet',
+  fltAdded:'rules added',
+  fltDupe:'duplicate',
+  fltDomain:'domain',fltKeyword:'keyword',
+  fltOn:'Filter is on',fltOff:'Filter is off',
+  echValueLbl:'Custom ECH value',obfCsLbl:'Custom cipher mask (cs)',obfFmLbl:'Custom obfuscation value (fm)',
+  optDefault:'Panel default',
+  custLbl:'Custom ECH / obfuscation values (optional)',
   statusDisabled:'disabled',statusExpired:'expired',statusQuota:'quota used',
  }
 };
@@ -4834,6 +5110,9 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
   <div class="navi" data-page="clean" onclick="go('clean')">
    <svg class="ic" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/>
     <path d="M9.4 14.6a2.8 2.8 0 002.6 2.6"/></svg><span data-t="navClean"></span></div>
+  <div class="navi" data-page="filter" onclick="go('filter')">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M3.5 5h17l-6.5 7.5V20l-4-2.2v-5.3z"/></svg>
+   <span data-t="navFilter"></span></div>
   <div class="navi" data-page="proxy" onclick="go('proxy')">
    <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h6.5a3 3 0 013 3v4a3 3 0 003 3H20"/>
     <path d="M17 4l3 3-3 3M17 14l3 3-3 3"/><circle cx="4" cy="7" r="1.6"/></svg>
@@ -4943,6 +5222,19 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
      <label class="flex items-center gap-2"><span class="dim" data-t="alpnLbl"></span>
       <select id="nAlpn" class="inp" style="width:auto;padding:6px 9px;font-size:12px"></select></label>
     </div>
+    <details class="mt-3">
+     <summary class="text-xs dim" style="cursor:pointer" data-t="custLbl"></summary>
+     <div class="mt-3">
+      <label class="fld"><span class="text-xs dim" data-t="echValueLbl"></span>
+       <input id="nEchVal" class="inp mono" style="font-size:11px" placeholder="cloudflare-ech.com+udp://1.1.1.1"></label>
+      <div class="g2 mt-2">
+       <label class="fld"><span class="text-xs dim" data-t="obfCsLbl"></span>
+        <input id="nObfCs" class="inp mono" style="font-size:11px"></label>
+       <label class="fld"><span class="text-xs dim" data-t="obfFmLbl"></span>
+        <textarea id="nObfFm" rows="3" spellcheck="false" class="inp mono" style="font-size:11px"></textarea></label>
+      </div>
+     </div>
+    </details>
     <div class="flex flex-wrap items-center gap-3 mt-3">
      <button onclick="createUser()" id="btnAdd" class="btn"></button>
      <span class="text-xs dim" data-t="zeroInf"></span>
@@ -4980,6 +5272,52 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
     <p id="cipMsg" class="text-xs dim mt-2" style="margin-bottom:0"></p>
    </div>
    <div class="card p-4 mt-4"><div id="cipRows" class="g2"></div></div>
+  </section>
+
+  <!-- ══ SITE FILTER ══ -->
+  <section data-pg="filter" class="hidden">
+   <div class="card p-4">
+    <b class="text-base" data-t="fltTitle"></b>
+    <p class="text-xs dim mt-1 mb-3" data-t="fltHint"></p>
+    <div class="soft" style="border-radius:12px;padding:12px">
+     <label class="flex items-center gap-2 text-sm">
+      <input id="fOn" type="checkbox" onchange="saveFilterMode()">
+      <b data-t="fltEnable"></b></label>
+     <p class="text-xs dim" style="margin:5px 0 0" data-t="fltEnableHint"></p>
+    </div>
+    <div class="soft mt-3" style="border-radius:12px;padding:12px">
+     <label class="flex items-center gap-2 text-sm">
+      <input id="fPorn" type="checkbox" onchange="saveFilterMode()">
+      <b data-t="fltPorn"></b></label>
+     <p class="text-xs dim" style="margin:5px 0 0"><span data-t="fltPornHint"></span>
+      <span id="fPornN" class="mono"></span></p>
+    </div>
+    <p id="fMsg" class="text-xs mt-2" style="margin-bottom:0;color:var(--ok)"></p>
+   </div>
+
+   <div class="card p-4 mt-4">
+    <b class="text-base" data-t="fltRules"></b>
+    <div class="g2 mt-3">
+     <input id="frPat" class="inp mono" placeholder="example.com">
+     <select id="frKind" class="inp">
+      <option value="domain" data-t="fltKindDomain"></option>
+      <option value="keyword" data-t="fltKindKeyword"></option></select>
+    </div>
+    <button onclick="addFilterRule()" id="btnFrAdd" class="btn w-full mt-2"></button>
+    <textarea id="frBulk" rows="5" spellcheck="false" class="inp mono mt-3"
+      placeholder="example.com&#10;*.blocked-site.net&#10;porn-keyword"></textarea>
+    <div class="g2 mt-2">
+     <button onclick="bulkFilter()" id="btnFrBulk" class="btn btn-soft"></button>
+     <button onclick="clearFilter()" id="btnFrClear" class="btn btn-danger"></button>
+    </div>
+    <p id="frMsg" class="text-xs dim mt-2" style="margin-bottom:0"></p>
+   </div>
+
+   <div class="card mt-4" style="overflow:hidden">
+    <div class="card-head"><b class="text-base" data-t="fltList"></b>
+     <span id="frCount" class="chip teal ms-auto"></span></div>
+    <div id="frRows"></div>
+   </div>
   </section>
 
   <!-- ══ PROXY ══ -->
@@ -5192,11 +5530,12 @@ function go(p){
  PAGE=p; localStorage.setItem('page',p);
  document.querySelectorAll('[data-pg]').forEach(s=>s.classList.toggle('hidden',s.dataset.pg!==p));
  document.querySelectorAll('.navi').forEach(n=>n.classList.toggle('on',n.dataset.page===p));
- crumb.textContent=T({dash:'navDash',users:'navUsers',clean:'navClean',
+ crumb.textContent=T({dash:'navDash',users:'navUsers',clean:'navClean',filter:'navFilter',
    proxy:'navProxy',live:'navLive',settings:'navSettings',logs:'navLogs'}[p]);
  closeDrawer();
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
+ if(p==='filter')loadFilter();
  if(p==='settings'){renderServer();loadBackupInfo()}
  if(p==='live')loadLive(); else stopLive();
 }
@@ -5237,6 +5576,8 @@ function paintStatic(){
  btnOut.textContent=T('logout'); btnAdd.textContent=T('add');
  btnCipAdd.textContent=T('add'); btnBulk.textContent=T('bulkAdd');
  btnClearAll.textContent=T('clearAll'); btnPw.textContent=T('saveBtn');
+ btnFrAdd.textContent=T('fltAdd'); btnFrBulk.textContent=T('fltBulk');
+ btnFrClear.textContent=T('fltClear');
  btnBackup.textContent=T('btnBackupLbl'); btnRestore.textContent=T('btnRestoreLbl');
  bkMode.options[0].textContent=T('bkMerge');
  bkMode.options[1].textContent=T('bkReplace');
@@ -5256,7 +5597,7 @@ function paintStatic(){
  applyNav();
 }
 window.rerender=()=>{paintStatic();go(PAGE);renderUsers();renderCips();
- renderProto();renderServer();renderLogs()};
+ renderProto();renderServer();renderLogs();renderFilter()};
 
 /* ─── charts / dashboard ─── */
 function paintChart(){
@@ -5421,7 +5762,8 @@ async function createUser(){
    name:nName.value.trim(),quota_gb:parseFloat(nQuota.value||0),
    expire_days:parseInt(nDays.value||0),device_limit:parseInt(nDev.value||0),
    transport:nTr.value,obfuscate:nObf.checked,
-   ech:nEch.checked,fp:nFp.value||'unsafe',alpn:nAlpn.value})});
+   ech:nEch.checked,fp:nFp.value||'unsafe',alpn:nAlpn.value,
+   ech_value:nEchVal.value.trim(),obf_cs:nObfCs.value.trim(),obf_fm:nObfFm.value.trim()})});
   nName.value='';loadUsers();loadStats();
  }catch(e){cErr.textContent=e.message}
 }
@@ -5444,6 +5786,53 @@ async function bulkCip(){
 async function toggleCip(id){await api('/api/clean-ips/'+id,{method:'PATCH'});loadCips();loadStats()}
 async function delCip(id){await api('/api/clean-ips/'+id,{method:'DELETE'});loadCips();loadStats()}
 async function clearCips(){if(confirm(T('clearAll')+'?')){await api('/api/clean-ips',{method:'DELETE'});loadCips();loadStats()}}
+
+/* ─── site filter ─── */
+let FILTER={enabled:false,block_porn:false,rules:[],porn_keywords:0};
+async function loadFilter(){
+ try{FILTER=await api('/api/filter');renderFilter()}catch(e){}
+}
+function renderFilter(){
+ if(!window.fOn)return;
+ fOn.checked=!!FILTER.enabled; fPorn.checked=!!FILTER.block_porn;
+ fPornN.textContent=FILTER.porn_keywords?('('+FILTER.porn_keywords+')'):'';
+ frCount.textContent=FILTER.rules.length;
+ frRows.innerHTML=FILTER.rules.map(r=>`
+  <div class="lrow">
+   <span style="width:8px;height:8px;border-radius:50%;background:${r.enabled?'var(--ok)':'var(--dim)'}"></span>
+   <span class="chip ${r.kind==='keyword'?'teal':''}" style="font-size:10px">${r.kind==='keyword'?T('fltKeyword'):T('fltDomain')}</span>
+   <span class="mono text-sm truncate" style="flex:1">${esc(r.pattern)}</span>
+   ${r.note?`<span class="text-xs dim truncate">${esc(r.note)}</span>`:''}
+   <button onclick="toggleFilterRule(${r.id})" title="${T('active')}" class="icon-btn">${r.enabled?ICO.pause:ICO.play}</button>
+   <button onclick="delFilterRule(${r.id})" class="icon-btn danger">${ICO.del}</button>
+  </div>`).join('')||`<div class="p-4 text-sm dim" style="text-align:center">${T('fltNone')}</div>`;
+}
+async function saveFilterMode(){
+ fMsg.textContent='';
+ try{await api('/api/filter/mode',{method:'POST',
+  body:JSON.stringify({enabled:fOn.checked,block_porn:fPorn.checked})});
+  fMsg.style.color='var(--ok)';fMsg.textContent=T('savedOk');await loadFilter();
+ }catch(e){fMsg.style.color='var(--bad)';fMsg.textContent=e.message}
+}
+async function addFilterRule(){
+ frMsg.textContent='';
+ const pat=frPat.value.trim(); if(!pat)return;
+ try{await api('/api/filter/rules',{method:'POST',
+  body:JSON.stringify({pattern:pat,kind:frKind.value})});
+  frPat.value='';await loadFilter();
+ }catch(e){frMsg.textContent=e.message}
+}
+async function bulkFilter(){
+ frMsg.textContent='';
+ try{const r=await api('/api/filter/rules',{method:'POST',
+  body:JSON.stringify({bulk:frBulk.value,kind:frKind.value})});
+  frMsg.textContent=(r.added||0)+' '+T('fltAdded');
+  frBulk.value='';await loadFilter();
+ }catch(e){frMsg.textContent=e.message}
+}
+async function toggleFilterRule(id){await api('/api/filter/rules/'+id,{method:'PATCH'});loadFilter()}
+async function delFilterRule(id){await api('/api/filter/rules/'+id,{method:'DELETE'});loadFilter()}
+async function clearFilter(){if(confirm(T('fltClearWarn'))){await api('/api/filter/rules',{method:'DELETE'});loadFilter()}}
 
 
 async function loadProxies(){
@@ -5648,6 +6037,17 @@ function showEdit(id){
    <label class="fld"><span class="text-xs dim">${T('alpnLbl')}</span>
     <select id="eFpAlpn" class="inp" style="font-size:12px"></select></label>
   </div>
+  <details>
+   <summary class="text-xs dim" style="cursor:pointer">${T('custLbl')}</summary>
+   <label class="fld mt-2"><span class="text-xs dim">${T('echValueLbl')}</span>
+    <input id="eEchVal" class="inp mono" style="font-size:11px" value="${esc(u.ech_value||'')}" placeholder="${esc(T('optDefault'))}"></label>
+   <div class="g2 mt-2">
+    <label class="fld"><span class="text-xs dim">${T('obfCsLbl')}</span>
+     <input id="eObfCs" class="inp mono" style="font-size:11px" value="${esc(u.obf_cs||'')}" placeholder="${esc(T('optDefault'))}"></label>
+    <label class="fld"><span class="text-xs dim">${T('obfFmLbl')}</span>
+     <textarea id="eObfFm" rows="3" spellcheck="false" class="inp mono" style="font-size:11px" placeholder="${esc(T('optDefault'))}">${esc(u.obf_fm||'')}</textarea></label>
+   </div>
+  </details>
   <label class="fld"><span class="text-xs dim">${T('customUuid')}</span>
    <input id="eU" value="${esc(u.uuid)}" class="inp mono" style="font-size:11px"></label>
   <label class="flex items-center gap-2"><input id="eE" type="checkbox" ${u.enabled?'checked':''}> ${T('active')}</label>
@@ -5667,7 +6067,8 @@ async function saveEdit(id){
   const payload={quota_gb:parseFloat(eQ.value||0),expire_days:parseInt(eD.value||0),
    device_limit:parseInt(eV.value||0),transport:eT.value,enabled:eE.checked,
    obfuscate:eObf.checked,ech:eEch.checked,
-   fp:eFp.value||'unsafe',alpn:eFpAlpn.value};
+   fp:eFp.value||'unsafe',alpn:eFpAlpn.value,
+   ech_value:eEchVal.value.trim(),obf_cs:eObfCs.value.trim(),obf_fm:eObfFm.value.trim()};
   if(eU.value.trim()&&eU.value.trim()!==u.uuid)payload.uuid=eU.value.trim();
   await api('/api/users/'+id,{method:'PATCH',body:JSON.stringify(payload)});
   closeModal();loadUsers();loadStats();
