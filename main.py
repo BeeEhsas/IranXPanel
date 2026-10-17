@@ -4131,47 +4131,218 @@ async def healthz():
 # ════════════════════════════ FRONTEND ════════════════════════════
 
 THEME_CSS = r"""
+/* ── IranX Panel UI — visual language modelled on the 3x-ui (Sanaei) panel ──
+   teal-green accent, deep navy surfaces, collapsible rail sidebar.        */
 html,body{overflow-x:hidden;max-width:100%}
-/* three themes only: black+blue, white+blue, grey. Buttons are black on white text. */
-:root,[data-theme="dark"]{--bg:#000000;--panel:#07090f;--card:#0b0f17;--line:#1b2537;
-      --txt:#f2f6fc;--dim:#8fa3c0;--a1:#1d4ed8;--a2:#3b82f6;--ok:#34d399;--bad:#fb7185;--info:#38bdf8;
-      --btn:#000000;--btn-tx:#ffffff;--btn-line:#2f4570;--ring:#1d4ed855}
-[data-theme="light"]{--bg:#f3f7ff;--panel:#ffffff;--card:#ffffff;--line:#d3e0f5;
-      --txt:#0b1c38;--dim:#5b7a9c;--a1:#1d4ed8;--a2:#3b82f6;--ok:#15803d;--bad:#b91c1c;--info:#0369a1;
-      --btn:#0b0f17;--btn-tx:#ffffff;--btn-line:#0b0f17;--ring:#1d4ed833}
-[data-theme="gray"]{--bg:#1a1d21;--panel:#22262b;--card:#282d33;--line:#3a424c;
-      --txt:#eef1f5;--dim:#a7b0bc;--a1:#3f6fd1;--a2:#5b8ae6;--ok:#4ade80;--bad:#f87171;--info:#60a5fa;
-      --btn:#0d0f12;--btn-tx:#ffffff;--btn-line:#0d0f12;--ring:#3f6fd155}
-body{background:var(--bg);color:var(--txt)}
-.card{background:var(--card);border:1px solid var(--line)}
-.grad{background-image:linear-gradient(to right,var(--a1),var(--a2))}
-/* every action button: solid black, white text */
-button.grad,a.grad.btn,.btn-solid{background-image:none;background:var(--btn);color:var(--btn-tx);
-  border:1px solid var(--btn-line)}
-button.grad:hover,.btn-solid:hover{filter:brightness(1.25)}
-button.grad:focus-visible,.btn-solid:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
-.ic{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;
-    stroke-linecap:round;stroke-linejoin:round}
-.ic-lg{width:22px;height:22px}
-.icbox{display:grid;place-items:center}
-.dim{color:var(--dim)}
-.inp{background:color-mix(in srgb,var(--bg) 65%,#8881);border:1px solid var(--line);color:var(--txt)}
-.inp:focus{border-color:var(--a1);outline:none}
-.soft{background:color-mix(in srgb,var(--txt) 8%,transparent)}
-.sw{width:44px;height:24px;background:var(--line);position:relative;transition:.18s;flex:none}
+:root,[data-theme="dark"]{
+  --bg:#0a1222; --surface:#151f31; --surface2:#1b2740; --card:#151f31;
+  --line:#2c3950; --line2:#222d42;
+  --txt:#e7edf7; --dim:rgba(231,237,247,.52);
+  --a1:#008771; --a2:#3ad3ba; --ok:#3ad3ba; --bad:#e04141; --warn:#ffa031; --info:#529fff;
+  --btn:#008771; --btn-tx:#ffffff; --btn-line:#008771; --ring:rgba(0,135,113,.5);
+  --chip:rgba(255,255,255,.05); --chip-line:rgba(255,255,255,.09);
+  --shadow:0 10px 30px rgba(0,0,0,.4)}
+[data-theme="light"]{
+  --bg:#f0f2f5; --surface:#ffffff; --surface2:#f7f9fc; --card:#ffffff;
+  --line:#e6e9ef; --line2:#eef1f5;
+  --txt:#1f2937; --dim:#7a8694;
+  --a1:#008771; --a2:#009980; --ok:#199270; --bad:#cf3c3c; --warn:#f37b24; --info:#0e49b5;
+  --btn:#008771; --btn-tx:#ffffff; --btn-line:#008771; --ring:rgba(0,135,113,.3);
+  --chip:#f3f5f8; --chip-line:#e6e9ef;
+  --shadow:0 8px 24px rgba(16,24,40,.08)}
+[data-theme="gray"]{
+  --bg:#1a1d22; --surface:#22262c; --surface2:#282d34; --card:#22262c;
+  --line:#343a43; --line2:#2b3037;
+  --txt:#e8ebef; --dim:#98a1ad;
+  --a1:#008771; --a2:#3ad3ba; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --info:#60a5fa;
+  --btn:#008771; --btn-tx:#ffffff; --btn-line:#008771; --ring:rgba(0,135,113,.5);
+  --chip:rgba(255,255,255,.06); --chip-line:rgba(255,255,255,.1);
+  --shadow:0 10px 30px rgba(0,0,0,.4)}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font-family:Vazirmatn,system-ui,-apple-system,"Segoe UI",Roboto,Tahoma,sans-serif}
+a{color:var(--a2)}
+::placeholder{color:var(--dim)}
+input[type=checkbox]{accent-color:var(--a1);width:15px;height:15px;cursor:pointer}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
+::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+
+/* ── tiny utility set (no external framework needed) ── */
+.flex{display:flex}.items-center{align-items:center}.items-start{align-items:flex-start}
+.flex-wrap{flex-wrap:wrap}.flex-1{flex:1 1 auto;min-width:0}.ms-auto{margin-inline-start:auto}
+.grid{display:grid;gap:12px;grid-template-columns:1fr}
+@media(min-width:620px){.g2,.g3,.g4{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(min-width:1000px){
+  .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .g4{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.gap-1{gap:4px}.gap-2{gap:8px}.gap-3{gap:12px}
+.mt-1{margin-top:4px}.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:16px}
+.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.pt-3{padding-top:12px}
+.p-3{padding:12px}.p-4{padding:16px}.py-2{padding-block:8px}
+.text-xs{font-size:11px}.text-sm{font-size:12.5px}.text-base{font-size:14px}
+.font-bold{font-weight:700}.font-extrabold{font-weight:800}
+.dim{color:var(--dim)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;direction:ltr}
+.w-full{width:100%}.break-all{word-break:break-all}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hidden{display:none!important}
+.space-y-2>*+*{margin-top:8px}.space-y-3>*+*{margin-top:12px}
+.fld{display:flex;flex-direction:column;gap:5px}
+
+/* ── sidebar ── */
+#nav{position:fixed;inset-block:0;inset-inline-start:0;width:244px;z-index:60;
+  display:flex;flex-direction:column;background:var(--surface);
+  border-inline-end:1px solid var(--line);
+  transition:width .2s ease,transform .2s ease}
+.side-brand{display:flex;align-items:center;gap:10px;height:58px;padding:0 14px;flex:none;
+  border-bottom:1px solid var(--line);overflow:hidden}
+.side-brand .brand-logo{width:36px;height:36px;flex:none;border-radius:10px;display:grid;
+  place-items:center;background:linear-gradient(135deg,var(--a1),var(--a2));color:#fff}
+.brand-text{min-width:0;line-height:1.15}
+.brand-text b{display:block;font-size:14px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand-text span{font-size:11px;color:var(--dim)}
+.side-collapse{margin-inline-start:auto;flex:none}
+.side-nav{flex:1 1 auto;overflow-y:auto;padding:10px 8px;display:flex;flex-direction:column;gap:2px}
+.navi{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;
+  color:var(--dim);font-size:13.5px;font-weight:500;cursor:pointer;white-space:nowrap;
+  position:relative;transition:background .15s,color .15s}
+.navi:hover{background:var(--chip);color:var(--txt)}
+.navi.on{background:color-mix(in srgb,var(--a1) 18%,transparent);color:var(--a2);font-weight:700}
+.navi.on:before{content:"";position:absolute;inset-inline-start:0;top:9px;bottom:9px;width:3px;
+  border-radius:3px;background:var(--a2)}
+.side-foot{flex:none;padding:10px;border-top:1px solid var(--line);display:flex;
+  flex-direction:column;gap:8px}
+.side-foot .row2{display:flex;gap:8px}
+
+/* collapsed rail (desktop) */
+body.nav-mini #nav{width:66px}
+body.nav-mini .brand-text,body.nav-mini .navi span,body.nav-mini .side-foot .row2,body.nav-mini #btnOut{display:none}
+body.nav-mini .navi{justify-content:center;padding:11px 0}
+body.nav-mini .side-collapse{display:none}
+
+#scrim{position:fixed;inset:0;z-index:55;background:rgba(0,0,0,.55);backdrop-filter:blur(2px)}
+
+/* ── app shell ── */
+#app{margin-inline-start:244px;min-height:100vh;display:flex;flex-direction:column;
+  transition:margin-inline-start .2s ease}
+body.nav-mini #app{margin-inline-start:66px}
+.appbar{position:sticky;top:0;z-index:40;flex:none;height:58px;display:flex;align-items:center;
+  gap:12px;padding:0 16px;border-bottom:1px solid var(--line);
+  background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(10px)}
+.appbar .ttl{min-width:0;line-height:1.2}
+.appbar h1{margin:0;font-size:14.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.appbar .crumb{font-size:11px;color:var(--dim)}
+.path-pill{font-size:10.5px;color:var(--dim);background:var(--chip);border:1px solid var(--chip-line);
+  border-radius:999px;padding:4px 10px;white-space:nowrap;max-width:44vw;overflow:hidden;text-overflow:ellipsis}
+.content{flex:1 1 auto;width:100%;max-width:1240px;margin:0 auto;padding:16px}
+
+/* ── surfaces ── */
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px}
+.card-head{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line2)}
+.soft{background:var(--chip);border:1px solid var(--chip-line)}
+.sheet{background:var(--surface)}
+.kv{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:9px;background:var(--chip)}
+.notice{font-size:11.5px;line-height:1.75;border-radius:9px;padding:10px 12px;
+  background:color-mix(in srgb,var(--warn) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--warn) 38%,transparent)}
+.notice.ok{background:color-mix(in srgb,var(--ok) 12%,transparent);
+  border-color:color-mix(in srgb,var(--ok) 38%,transparent)}
+
+/* ── stat cards ── */
+.stat{display:flex;align-items:center;gap:12px;padding:14px;border-radius:12px;
+  background:var(--card);border:1px solid var(--line);transition:border-color .15s,transform .15s}
+.stat:hover{border-color:color-mix(in srgb,var(--a1) 60%,var(--line));transform:translateY(-1px)}
+.stat .ico{width:40px;height:40px;flex:none;border-radius:11px;display:grid;place-items:center}
+.stat b{display:block;font-size:20px;font-weight:800;line-height:1.2}
+.stat span{font-size:11.5px;color:var(--dim)}
+
+/* ── buttons ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;cursor:pointer;
+  border:1px solid var(--btn-line);background:var(--btn);color:var(--btn-tx);
+  border-radius:9px;padding:9px 15px;font:inherit;font-size:13px;font-weight:600;
+  white-space:nowrap;transition:filter .15s,background .15s}
+.btn:hover{filter:brightness(1.12)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-soft{background:var(--chip);color:var(--txt);border-color:var(--chip-line)}
+.btn-soft:hover{background:color-mix(in srgb,var(--txt) 12%,transparent);filter:none}
+.btn-danger{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad);border-color:transparent}
+.btn-danger:hover{background:color-mix(in srgb,var(--bad) 24%,transparent);filter:none}
+.icon-btn{width:34px;height:34px;flex:none;border-radius:9px;display:grid;place-items:center;
+  background:transparent;border:1px solid transparent;color:var(--dim);cursor:pointer;
+  transition:background .15s,color .15s}
+.icon-btn:hover{background:var(--chip);color:var(--txt)}
+.icon-btn.danger:hover{color:var(--bad);background:color-mix(in srgb,var(--bad) 14%,transparent)}
+.grad{background:linear-gradient(135deg,var(--a1),var(--a2));color:#fff}
+
+/* ── form fields ── */
+.inp{width:100%;background:var(--surface2);border:1px solid var(--line);color:var(--txt);
+  border-radius:9px;padding:9px 12px;font:inherit;font-size:13px;
+  transition:border-color .15s,box-shadow .15s}
+.inp:focus{outline:none;border-color:var(--a1);box-shadow:0 0 0 3px var(--ring)}
+textarea.inp{resize:vertical;min-height:76px}
+
+/* ── chips / badges ── */
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:700;
+  padding:3px 9px;border-radius:999px;background:var(--chip);border:1px solid var(--chip-line);
+  color:var(--dim);white-space:nowrap}
+.chip.green{background:color-mix(in srgb,var(--ok) 15%,transparent);border-color:transparent;color:var(--ok)}
+.chip.red{background:color-mix(in srgb,var(--bad) 15%,transparent);border-color:transparent;color:var(--bad)}
+.chip.blue{background:color-mix(in srgb,var(--info) 15%,transparent);border-color:transparent;color:var(--info)}
+.chip.orange{background:color-mix(in srgb,var(--warn) 16%,transparent);border-color:transparent;color:var(--warn)}
+.chip.teal{background:color-mix(in srgb,var(--a2) 15%,transparent);border-color:transparent;color:var(--a2)}
+
+/* ── switch ── */
+.sw{width:42px;height:24px;flex:none;border-radius:999px;background:var(--line);position:relative;
+  border:none;cursor:pointer;transition:background .18s;padding:0}
 .sw:after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:18px;height:18px;
-  border-radius:50%;background:var(--txt);transition:.18s}
+  border-radius:50%;background:#fff;transition:inset-inline-start .18s}
 .sw.on{background:var(--a1)}
-.sw.on:after{inset-inline-start:23px;background:#fff}
-.navi{display:flex;align-items:center;gap:.6rem;padding:.7rem .9rem;border-radius:.85rem;
-      font-size:.85rem;cursor:pointer;transition:.15s}
-.navi:hover{background:color-mix(in srgb,var(--txt) 7%,transparent)}
-.navi.on{background:var(--btn);color:var(--btn-tx);font-weight:700;border:1px solid var(--btn-line)}
-.navi.on .ic{stroke:var(--btn-tx)}
-.sheet{background:var(--panel)}
-::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
-.mono{font-family:ui-monospace,Menlo,monospace;direction:ltr}
+.sw.on:after{inset-inline-start:21px}
+
+/* ── progress ── */
+.progress{height:6px;border-radius:6px;background:var(--chip);overflow:hidden}
+.progress>i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,var(--a1),var(--a2))}
+.progress.hot>i{background:var(--bad)}
+
+/* ── user row ── */
+.urow{display:flex;align-items:center;gap:12px;padding:12px 14px;flex-wrap:wrap;
+  border-bottom:1px solid var(--line2)}
+.urow:last-child{border-bottom:0}
+.urow:hover{background:var(--chip)}
+.u-av{width:38px;height:38px;flex:none;border-radius:11px;display:grid;place-items:center;
+  font-weight:800;font-size:15px;background:color-mix(in srgb,var(--a1) 18%,transparent);color:var(--a2)}
+.u-main{flex:1 1 220px;min-width:0}
+.u-dev{font-size:12px;font-weight:700;flex:none}
+.u-actions{display:flex;gap:6px;align-items:center;flex:none}
+
+/* ── list rows ── */
+.prow{border-radius:10px;padding:10px 12px;background:var(--chip);border:1px solid var(--chip-line)}
+.prow.on{border-color:var(--a1);box-shadow:0 0 0 2px var(--ring)}
+.lrow{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:9px;
+  background:var(--chip);font-size:11.5px;flex-wrap:wrap}
+
+/* ── modal ── */
+#modal{position:fixed;inset:0;z-index:80;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.62);padding:14px}
+.modal-card{width:100%;max-width:460px;max-height:86vh;overflow-y:auto;
+  background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  padding:18px;box-shadow:var(--shadow)}
+.modal-head{display:flex;align-items:center;margin-bottom:14px}
+.modal-head b{font-size:14px}
+
+.ic{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;
+  stroke-linecap:round;stroke-linejoin:round}
+.ic-lg{width:22px;height:22px}
+
+@media(max-width:1023px){
+  #nav{transform:translateX(-100%);width:244px}
+  [dir="rtl"] #nav{transform:translateX(100%)}
+  body.nav-open #nav{transform:none}
+  #app{margin-inline-start:0!important}
+  .path-pill{display:none}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
 I18N_JS = r"""
@@ -4425,35 +4596,46 @@ applyChrome();
 AUTH_HTML = r"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{TITLE}}</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;800&display=swap" rel="stylesheet">
-<style>body{font-family:Vazirmatn,system-ui,sans-serif}__THEME__
-.glow{background:radial-gradient(60% 55% at 50% 0%,color-mix(in srgb,var(--a1) 40%,transparent),transparent 70%)}
-</style></head><body class="min-h-screen flex items-center justify-center p-4">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>__THEME__
+body{min-height:100vh;display:grid;place-items:center;padding:18px;position:relative}
+.bg-glow{position:fixed;inset:0;pointer-events:none;
+  background:
+   radial-gradient(58% 55% at 50% -8%,color-mix(in srgb,var(--a1) 34%,transparent),transparent 70%),
+   radial-gradient(40% 40% at 92% 100%,color-mix(in srgb,var(--a2) 16%,transparent),transparent 72%)}
+.auth{position:relative;width:100%;max-width:392px;background:var(--surface);
+  border:1px solid var(--line);border-radius:16px;padding:30px 26px;box-shadow:var(--shadow)}
+.auth .top{display:flex;gap:8px;justify-content:flex-end;margin-bottom:18px}
+.auth select{width:auto}
+.auth .logo{width:56px;height:56px;margin:0 auto 14px;border-radius:16px;display:grid;
+  place-items:center;background:linear-gradient(135deg,var(--a1),var(--a2));color:#fff;
+  box-shadow:0 10px 26px color-mix(in srgb,var(--a1) 45%,transparent)}
+.auth h1{margin:0;text-align:center;font-size:19px;font-weight:800}
+.auth .sub{margin:5px 0 22px;text-align:center;font-size:12px;color:var(--dim)}
+.auth .go{width:100%;margin-top:6px;padding:11px}
+</style></head><body>
 <script>__I18N__</script>
-<div class="glow fixed inset-0 pointer-events-none"></div>
-<div class="relative w-full max-w-sm card rounded-3xl p-8 shadow-2xl backdrop-blur">
- <div class="flex justify-between mb-4">
-  <select onchange="setLang(this.value)" id="langSel" class="inp rounded-lg px-2 py-1 text-xs">
+<div class="bg-glow"></div>
+<div class="auth">
+ <div class="top">
+  <select onchange="setLang(this.value)" id="langSel" class="inp" style="width:auto;font-size:12px;padding:5px 9px">
    <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select>
-  <select onchange="setTheme(this.value)" id="thSel" class="inp rounded-lg px-2 py-1 text-xs">
-   <option value="dark">Dark</option><option value="light">Light</option>
-   <option value="gray">Gray</option></select>
+  <select onchange="setTheme(this.value)" id="thSel" class="inp" style="width:auto;font-size:12px;padding:5px 9px">
+   <option value="dark">Dark</option><option value="light">Light</option><option value="gray">Gray</option></select>
  </div>
- <div class="mb-6 text-center">
-  <div class="mx-auto mb-3 h-14 w-14 rounded-2xl grad grid place-items-center">
-   <svg viewBox="0 0 24 24" style="width:30px;height:30px;stroke:#fff;fill:none;stroke-width:1.6;stroke-linejoin:round">
-    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
-    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
-  <h1 id="h1" class="text-xl font-extrabold"></h1>
-  <p id="sub" class="text-xs dim mt-1"></p>
+ <div class="logo">
+  <svg class="ic ic-lg" viewBox="0 0 24 24" style="stroke:#fff">
+   <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
+   <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg>
  </div>
- <div class="space-y-3">
-  <input id="p1" type="password" class="w-full inp rounded-xl px-4 py-3">
-  <input id="p2" type="password" class="w-full inp rounded-xl px-4 py-3 hidden">
-  <p id="rule" class="text-[11px] dim hidden"></p>
-  <button id="go" class="w-full grad rounded-xl py-3 font-bold text-white hover:opacity-90"></button>
-  <p id="err" class="text-center text-xs min-h-4" style="color:var(--bad)"></p>
+ <h1 id="h1"></h1>
+ <p id="sub" class="sub"></p>
+ <div class="space-y-2">
+  <input id="p1" type="password" class="inp" autocomplete="current-password">
+  <input id="p2" type="password" class="inp hidden" autocomplete="new-password">
+  <p id="rule" class="text-xs dim hidden" style="margin:0"></p>
+  <button id="go" class="btn go"></button>
+  <p id="err" class="text-sm" style="text-align:center;color:var(--bad);min-height:18px;margin:0"></p>
  </div>
 </div>
 <script>
@@ -4489,352 +4671,373 @@ go.onclick=submit;
 PANEL_HTML = r"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{TITLE}}</title>
-<script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;800&display=swap" rel="stylesheet">
-<style>body{font-family:Vazirmatn,system-ui,sans-serif}__THEME__</style>
-</head><body class="min-h-screen">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>__THEME__</style>
+</head><body>
 <script>__I18N__</script>
 
-<!-- ─── top bar ─── -->
-<header class="sticky top-0 z-30 backdrop-blur border-b"
-        style="border-color:var(--line);background:color-mix(in srgb,var(--bg) 88%,transparent)">
- <div class="max-w-6xl mx-auto px-3 py-3 flex items-center gap-2">
-  <button onclick="toggleNav()" aria-label="menu"
-          class="h-9 w-9 rounded-xl soft grid place-items-center">
-   <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
-  <div class="h-9 w-9 rounded-xl grad grid place-items-center text-white">
-   <svg class="ic" viewBox="0 0 24 24" style="stroke:#fff">
-    <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
-    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
-  <h1 class="font-extrabold text-sm sm:text-base">{{TITLE}}</h1>
-  <span id="crumb" class="text-[11px] dim px-2 py-1 rounded-lg soft hidden sm:inline"></span>
-  <div class="flex-1"></div>
-  <span id="pill" class="mono text-[10px] dim"></span>
- </div>
-</header>
-
-<!-- ─── drawer ─── -->
-<div id="scrim" onclick="toggleNav()" class="fixed inset-0 z-40 bg-black/60 hidden"></div>
-<aside id="nav" class="fixed top-0 z-50 h-full w-72 sheet p-4 space-y-1 shadow-2xl
-        transition-transform duration-200 overflow-y-auto"
-       style="border-inline-end:1px solid var(--line)">
- <div class="flex items-center gap-2 mb-4">
-  <div class="h-10 w-10 rounded-xl grad grid place-items-center">
+<!-- ══════════ SIDEBAR ══════════ -->
+<aside id="nav">
+ <div class="side-brand">
+  <div class="brand-logo">
    <svg class="ic ic-lg" viewBox="0 0 24 24" style="stroke:#fff">
     <path d="M12 2.7l7.5 3.4v5.3c0 4.4-3.1 8.2-7.5 9.9-4.4-1.7-7.5-5.5-7.5-9.9V6.1L12 2.7z"/>
-    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg></div>
-  <div><p class="font-extrabold text-sm">{{TITLE}}</p>
-       <p class="text-[10px] dim">admin</p></div>
-  <button onclick="toggleNav()" aria-label="close" class="ms-auto dim icbox h-8 w-8">
-   <svg class="ic" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    <path d="M12.6 8.2L9.4 13h2.6l-.6 3.4L14.6 11H12l.6-2.8z" style="fill:#fff;stroke-width:1"/></svg>
+  </div>
+  <div class="brand-text"><b>{{TITLE}}</b><span>admin</span></div>
+  <button class="icon-btn side-collapse" onclick="toggleNav()" aria-label="collapse">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
  </div>
-
- <div class="navi" data-page="dash" onclick="go('dash')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M4 19V11M9.5 19V5M15 19v-6M20.5 19V8"/>
-   <path d="M3 21h18"/></svg><span data-t="navDash"></span></div>
- <div class="navi" data-page="users" onclick="go('users')">
-  <svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/>
-   <path d="M3.5 19.5c0-3 2.5-4.8 5.5-4.8s5.5 1.8 5.5 4.8"/>
-   <path d="M16.5 5.6a3 3 0 010 5.6M18 14.9c2 .6 3.4 2.2 3.4 4.6"/></svg><span data-t="navUsers"></span></div>
- <div class="navi" data-page="clean" onclick="go('clean')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/>
-   <path d="M9.4 14.6a2.8 2.8 0 002.6 2.6"/></svg><span data-t="navClean"></span></div>
- <div class="navi" data-page="proxy" onclick="go('proxy')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h6.5a3 3 0 013 3v4a3 3 0 003 3H20"/>
-  <path d="M17 4l3 3-3 3M17 14l3 3-3 3"/><circle cx="4" cy="7" r="1.6"/></svg>
-  <span data-t="navProxy"></span></div>
- <div class="navi" data-page="live" onclick="go('live')">
-  <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
-  <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
-  <span data-t="navLive"></span></div>
- <div class="navi" data-page="settings" onclick="go('settings')">
-  <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
-   <path d="M19.4 14.5a1.7 1.7 0 00.35 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.35 1.7 1.7 0 00-1.03 1.56V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.55 1.7 1.7 0 00-1.87.35l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.7 1.7 0 00.35-1.87 1.7 1.7 0 00-1.56-1.03H3a2 2 0 110-4h.1a1.7 1.7 0 001.55-1.1 1.7 1.7 0 00-.35-1.87l-.06-.06a2 2 0 112.83-2.83l.06.06a1.7 1.7 0 001.87.35H9a1.7 1.7 0 001-1.56V3a2 2 0 114 0v.1a1.7 1.7 0 001.03 1.56 1.7 1.7 0 001.87-.35l.06-.06a2 2 0 112.83 2.83l-.06.06a1.7 1.7 0 00-.35 1.87V9a1.7 1.7 0 001.56 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1.05z"/></svg><span data-t="navSettings"></span></div>
- <div class="navi" data-page="logs" onclick="go('logs')">
-  <svg class="ic" viewBox="0 0 24 24"><path d="M5 4.5h11l3 3V19a1 1 0 01-1 1H5a1 1 0 01-1-1V5.5a1 1 0 011-1z"/>
-   <path d="M15.5 4.5V8H19M7.5 12h9M7.5 15.5h6"/></svg><span data-t="navLogs"></span></div>
-
- <div class="pt-3 mt-3 border-t space-y-2" style="border-color:var(--line)">
-  <div class="flex gap-2">
-   <select id="thSel" onchange="setTheme(this.value)" class="inp rounded-lg px-2 py-1.5 text-xs flex-1">
+ <nav class="side-nav">
+  <div class="navi" data-page="dash" onclick="go('dash')">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M4 13h6V4H4v9zM14 20h6v-9h-6v9zM4 20h6v-4H4v4zM14 8h6V4h-6v4z"/></svg>
+   <span data-t="navDash"></span></div>
+  <div class="navi" data-page="users" onclick="go('users')">
+   <svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/>
+    <path d="M3.5 19.5c0-3 2.5-4.8 5.5-4.8s5.5 1.8 5.5 4.8"/>
+    <path d="M16.5 5.6a3 3 0 010 5.6M18 14.9c2 .6 3.4 2.2 3.4 4.6"/></svg>
+   <span data-t="navUsers"></span></div>
+  <div class="navi" data-page="clean" onclick="go('clean')">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/>
+    <path d="M9.4 14.6a2.8 2.8 0 002.6 2.6"/></svg><span data-t="navClean"></span></div>
+  <div class="navi" data-page="proxy" onclick="go('proxy')">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h6.5a3 3 0 013 3v4a3 3 0 003 3H20"/>
+    <path d="M17 4l3 3-3 3M17 14l3 3-3 3"/><circle cx="4" cy="7" r="1.6"/></svg>
+   <span data-t="navProxy"></span></div>
+  <div class="navi" data-page="live" onclick="go('live')">
+   <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
+    <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
+   <span data-t="navLive"></span></div>
+  <div class="navi" data-page="settings" onclick="go('settings')">
+   <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>
+    <path d="M19.4 14.5a1.7 1.7 0 00.35 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.35 1.7 1.7 0 00-1.03 1.56V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.55 1.7 1.7 0 00-1.87.35l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.7 1.7 0 00.35-1.87 1.7 1.7 0 00-1.56-1.03H3a2 2 0 110-4h.1a1.7 1.7 0 001.55-1.1 1.7 1.7 0 00-.35-1.87l-.06-.06a2 2 0 112.83-2.83l.06.06a1.7 1.7 0 001.87.35H9a1.7 1.7 0 001-1.56V3a2 2 0 114 0v.1a1.7 1.7 0 001.03 1.56 1.7 1.7 0 001.87-.35l.06-.06a2 2 0 112.83 2.83l-.06.06a1.7 1.7 0 00-.35 1.87V9a1.7 1.7 0 001.56 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1.05z"/></svg>
+   <span data-t="navSettings"></span></div>
+  <div class="navi" data-page="logs" onclick="go('logs')">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M5 4.5h11l3 3V19a1 1 0 01-1 1H5a1 1 0 01-1-1V5.5a1 1 0 011-1z"/>
+    <path d="M15.5 4.5V8H19M7.5 12h9M7.5 15.5h6"/></svg><span data-t="navLogs"></span></div>
+ </nav>
+ <div class="side-foot">
+  <div class="row2">
+   <select id="thSel" onchange="setTheme(this.value)" class="inp" style="font-size:11.5px;padding:6px 8px">
     <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
     <option value="gray" data-t="thGray"></option></select>
-   <select id="langSel" onchange="setLang(this.value)" class="inp rounded-lg px-2 py-1.5 text-xs">
+   <select id="langSel" onchange="setLang(this.value)" class="inp" style="font-size:11.5px;padding:6px 8px">
     <option value="fa">فا</option><option value="en">EN</option></select>
   </div>
-  <button onclick="logout()" id="btnOut"
-    class="w-full rounded-xl py-2 text-xs font-bold"
-    style="background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)"></button>
+  <button onclick="logout()" id="btnOut" class="btn btn-danger"></button>
  </div>
 </aside>
 
-<main class="max-w-6xl mx-auto p-4">
+<div id="scrim" class="hidden" onclick="closeDrawer()"></div>
 
- <!-- ══ DASHBOARD ══ -->
- <section data-pg="dash" class="space-y-4">
-  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
-   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="totalUsers"></p><p id="sUsers" class="text-2xl font-extrabold mt-1">—</p></div>
-   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="online"></p><p id="sOnline" class="text-2xl font-extrabold mt-1" style="color:var(--ok)">—</p></div>
-   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="liveDevices"></p><p id="sLive" class="text-2xl font-extrabold mt-1" style="color:var(--ok)">—</p></div>
-   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="devices"></p><p id="sDev" class="text-2xl font-extrabold mt-1" style="color:var(--info)">—</p></div>
-   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="traffic"></p><p id="sBytes" class="text-2xl font-extrabold mt-1" style="color:var(--a2)">—</p></div>
-   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="cleanIps"></p><p id="sCip" class="text-2xl font-extrabold mt-1" style="color:var(--a1)">—</p></div>
-   <div class="card rounded-2xl p-4"><p class="text-xs dim" data-t="xSessions"></p><p id="sXs" class="text-2xl font-extrabold mt-1">—</p></div>
+<!-- ══════════ APP ══════════ -->
+<div id="app">
+ <header class="appbar">
+  <button class="icon-btn" onclick="toggleNav()" aria-label="menu">
+   <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <div class="ttl">
+   <h1>{{TITLE}}</h1>
+   <span id="crumb" class="crumb"></span>
   </div>
-  <div class="card rounded-2xl p-4">
-   <p class="text-sm font-bold mb-3" data-t="chart24"></p>
-   <canvas id="chart" height="90"></canvas>
-  </div>
-  <div class="card rounded-2xl p-4">
-   <p class="text-sm font-bold mb-3" data-t="protoSplit"></p>
-   <div id="protoBox" class="flex gap-3 flex-wrap text-xs"></div>
-  </div>
- </section>
+  <div class="flex-1"></div>
+  <span id="pill" class="path-pill mono"></span>
+ </header>
 
- <!-- ══ USERS ══ -->
- <section data-pg="users" class="space-y-4 hidden">
-  <div class="card rounded-2xl p-4">
-   <p class="text-sm font-bold mb-3" data-t="newUser"></p>
-   <div class="grid sm:grid-cols-3 lg:grid-cols-5 gap-2">
-    <input id="nName" class="inp rounded-xl px-3 py-2 text-sm">
-    <input id="nQuota" type="number" step="0.5" value="30" class="inp rounded-xl px-3 py-2 text-sm">
-    <input id="nDays" type="number" value="30" class="inp rounded-xl px-3 py-2 text-sm">
-    <input id="nDev" type="number" value="1" class="inp rounded-xl px-3 py-2 text-sm">
-    <select id="nTr" class="inp rounded-xl px-3 py-2 text-sm">
-     <option value="both"></option><option value="ws"></option><option value="xhttp"></option></select>
-   </div>
-   <label class="flex items-center gap-2 text-xs mt-2">
-    <input id="nObf" type="checkbox"><span data-t="obfLbl"></span></label>
-   <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs mt-2">
-    <label class="flex items-center gap-2"><input id="nEch" type="checkbox"><span data-t="echLbl"></span></label>
-    <label class="flex items-center gap-2"><span class="dim" data-t="fpLbl"></span>
-     <select id="nFp" class="inp rounded-lg px-2 py-1 text-xs"></select></label>
-    <label class="flex items-center gap-2"><span class="dim" data-t="alpnLbl"></span>
-     <select id="nAlpn" class="inp rounded-lg px-2 py-1 text-xs"></select></label>
-   </div>
-   <button onclick="createUser()" id="btnAdd" class="grad rounded-xl px-4 py-2 mt-2 text-sm font-bold text-white w-full sm:w-auto"></button>
-   <p class="text-[11px] dim mt-2" data-t="zeroInf"></p>
-   <p id="cErr" class="text-xs mt-1" style="color:var(--bad)"></p>
-  </div>
-  <div class="card rounded-2xl overflow-hidden">
-   <div class="px-4 py-3 flex items-center gap-2 border-b" style="border-color:var(--line)">
-    <p class="text-sm font-bold" data-t="users"></p>
-    <input id="q" oninput="renderUsers()" class="ms-auto inp rounded-xl px-3 py-1.5 text-xs w-40">
-   </div>
-   <div id="rows"></div>
-  </div>
- </section>
+ <main class="content">
 
- <!-- ══ CLEAN IP ══ -->
- <section data-pg="clean" class="space-y-4 hidden">
-  <div class="card rounded-2xl p-4">
-   <p class="text-sm font-bold" data-t="cleanTitle"></p>
-   <p class="text-[11px] dim mt-1 mb-3" data-t="cleanHint"></p>
-   <div class="grid sm:grid-cols-4 gap-2">
-    <input id="cAddr" class="inp rounded-xl px-3 py-2 text-sm">
-    <input id="cRem" class="inp rounded-xl px-3 py-2 text-sm">
-    <select id="cCty" class="inp rounded-xl px-3 py-2 text-sm"></select>
-    <button onclick="addCip()" id="btnCipAdd" class="grad rounded-xl px-4 py-2 text-sm font-bold"></button>
+  <!-- ══ DASHBOARD ══ -->
+  <section data-pg="dash">
+   <div class="g4">
+    <div class="stat">
+     <div class="ico" style="background:color-mix(in srgb,var(--info) 16%,transparent);color:var(--info)">
+      <svg class="ic ic-lg" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19.5c0-3 2.5-4.8 5.5-4.8s5.5 1.8 5.5 4.8"/><path d="M16.5 5.6a3 3 0 010 5.6M18 14.9c2 .6 3.4 2.2 3.4 4.6"/></svg></div>
+     <div><b id="sUsers">—</b><span data-t="totalUsers"></span></div></div>
+    <div class="stat">
+     <div class="ico" style="background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)">
+      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg></div>
+     <div><b id="sOnline" style="color:var(--ok)">—</b><span data-t="online"></span></div></div>
+    <div class="stat">
+     <div class="ico" style="background:color-mix(in srgb,var(--a2) 16%,transparent);color:var(--a2)">
+      <svg class="ic ic-lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg></div>
+     <div><b id="sLive" style="color:var(--ok)">—</b><span data-t="liveDevices"></span></div></div>
+    <div class="stat">
+     <div class="ico" style="background:color-mix(in srgb,var(--info) 16%,transparent);color:var(--info)">
+      <svg class="ic ic-lg" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2"/><path d="M11 18h2"/></svg></div>
+     <div><b id="sDev" style="color:var(--info)">—</b><span data-t="devices"></span></div></div>
+    <div class="stat">
+     <div class="ico" style="background:color-mix(in srgb,var(--a1) 20%,transparent);color:var(--a2)">
+      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M4 16l5-6 4 4 7-8"/><path d="M4 20h16"/></svg></div>
+     <div><b id="sBytes" style="color:var(--a2)">—</b><span data-t="traffic"></span></div></div>
+    <div class="stat">
+     <div class="ico" style="background:color-mix(in srgb,var(--a1) 20%,transparent);color:var(--a2)">
+      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/></svg></div>
+     <div><b id="sCip" style="color:var(--a1)">—</b><span data-t="cleanIps"></span></div></div>
+    <div class="stat">
+     <div class="ico" style="background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)">
+      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M13 3L5 14h5l-1 7 8-11h-5z"/></svg></div>
+     <div><b id="sXs">—</b><span data-t="xSessions"></span></div></div>
    </div>
-   <textarea id="cBulk" rows="4" class="inp rounded-xl px-3 py-2 text-sm w-full mt-2 mono"></textarea>
-   <div class="grid grid-cols-2 gap-2 mt-2">
-    <button onclick="bulkCip()" id="btnBulk" class="rounded-xl soft py-2 text-xs font-bold"></button>
-    <button onclick="clearCips()" id="btnClearAll" class="rounded-xl py-2 text-xs font-bold"
-      style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)"></button>
-   </div>
-   <p id="cipMsg" class="text-xs dim mt-2"></p>
-  </div>
-  <div class="card rounded-2xl p-4"><div id="cipRows" class="grid sm:grid-cols-2 gap-2"></div></div>
- </section>
 
- <!-- ══ PROXY ══ -->
- <section data-pg="proxy" class="space-y-4 hidden">
-  <div class="card rounded-2xl p-4">
-   <p class="text-sm font-bold" data-t="pxTitle"></p>
-   <p class="text-[11px] dim mt-1 mb-3" data-t="pxHint"></p>
-   <textarea id="pBulk" rows="3" spellcheck="false"
-     class="w-full inp rounded-xl px-3 py-2 text-sm mono"
-     placeholder="socks5://1.1.1.1:5866"></textarea>
-   <p class="text-[10px] dim mt-1" data-t="pxLineHint"></p>
-   <button onclick="addBulk()" class="w-full grad rounded-xl px-4 py-2 text-sm font-bold mt-2"
-     data-t="pxAddLines"></button>
-   <details class="mt-3">
-   <summary class="text-[11px] dim cursor-pointer" data-t="pxAdvanced"></summary>
-   <div class="grid sm:grid-cols-3 gap-2 mt-2">
-    <div><label class="text-[11px] dim" data-t="pxKind"></label>
-     <select id="pKind" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-      <option value="socks5">SOCKS5</option><option value="socks4">SOCKS4</option>
-      <option value="http">HTTP</option></select></div>
-    <div><label class="text-[11px] dim" data-t="pxHost"></label>
-     <input id="pHost" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono" placeholder="1.2.3.4"></div>
-    <div><label class="text-[11px] dim" data-t="pxPort"></label>
-     <input id="pPort" type="number" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono" placeholder="1080"></div>
-    <div><label class="text-[11px] dim" data-t="pxUser"></label>
-     <input id="pUser" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono"></div>
-    <div><label class="text-[11px] dim" data-t="pxPass"></label>
-     <input id="pPass" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1 mono"></div>
-    <div><label class="text-[11px] dim" data-t="remarkPh"></label>
-     <input id="pRem" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1"></div>
+   <div class="card p-4 mt-4">
+    <b class="text-base" data-t="chart24"></b>
+    <div class="mt-3"><canvas id="chart" height="88"></canvas></div>
    </div>
-   </details>
-   <div class="grid grid-cols-2 gap-2 mt-3">
-    <button onclick="addProxy()" class="grad rounded-xl px-4 py-2 text-sm font-bold" data-t="pxAdd"></button>
-    <button onclick="testAllProxies()" class="rounded-xl soft py-2 text-xs font-bold" data-t="pxTestAll"></button>
-   </div>
-   <p id="pxMsg" class="text-xs dim mt-2"></p>
-  </div>
 
-  <div class="card rounded-2xl p-4 space-y-3">
-   <div class="flex items-center gap-3">
-    <div class="flex-1">
-     <p class="text-sm font-bold" data-t="pxStrict"></p>
-     <p class="text-[10px] dim" data-t="pxStrictHint"></p>
+   <div class="card p-4 mt-4">
+    <b class="text-base" data-t="protoSplit"></b>
+    <div id="protoBox" class="flex flex-wrap gap-2 mt-3 text-sm"></div>
+   </div>
+  </section>
+
+  <!-- ══ USERS ══ -->
+  <section data-pg="users" class="hidden">
+   <div class="card p-4">
+    <b class="text-base" data-t="newUser"></b>
+    <div class="g3 mt-3">
+     <label class="fld"><span class="text-xs dim" data-t="name"></span><input id="nName" class="inp"></label>
+     <label class="fld"><span class="text-xs dim" data-t="quota"></span><input id="nQuota" type="number" step="0.5" value="30" class="inp"></label>
+     <label class="fld"><span class="text-xs dim" data-t="days"></span><input id="nDays" type="number" value="30" class="inp"></label>
+     <label class="fld"><span class="text-xs dim" data-t="devLimit"></span><input id="nDev" type="number" value="1" class="inp"></label>
+     <label class="fld"><span class="text-xs dim" data-t="transport"></span>
+      <select id="nTr" class="inp"><option value="both"></option><option value="ws"></option><option value="xhttp"></option></select></label>
     </div>
-    <button id="pxStrictBtn" onclick="toggleStrict()" class="sw rounded-full"></button>
+    <div class="flex flex-wrap items-center gap-3 mt-3 text-sm">
+     <label class="flex items-center gap-2"><input id="nObf" type="checkbox"><span data-t="obfLbl"></span></label>
+     <label class="flex items-center gap-2"><input id="nEch" type="checkbox"><span data-t="echLbl"></span></label>
+     <label class="flex items-center gap-2"><span class="dim" data-t="fpLbl"></span>
+      <select id="nFp" class="inp" style="width:auto;padding:6px 9px;font-size:12px"></select></label>
+     <label class="flex items-center gap-2"><span class="dim" data-t="alpnLbl"></span>
+      <select id="nAlpn" class="inp" style="width:auto;padding:6px 9px;font-size:12px"></select></label>
+    </div>
+    <div class="flex flex-wrap items-center gap-3 mt-3">
+     <button onclick="createUser()" id="btnAdd" class="btn"></button>
+     <span class="text-xs dim" data-t="zeroInf"></span>
+    </div>
+    <p id="cErr" class="text-sm mt-2" style="color:var(--bad);margin-bottom:0"></p>
    </div>
-   <div>
-    <label class="text-xs dim" data-t="pxFlagSrc"></label>
-    <select id="pxFlagSel" onchange="saveFlagSource()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-     <option value="proxy" data-t="pxFlagProxy"></option>
-     <option value="entry" data-t="pxFlagEntry"></option></select>
+
+   <div class="card mt-4" style="overflow:hidden">
+    <div class="card-head">
+     <b class="text-base" data-t="users"></b>
+     <input id="q" oninput="renderUsers()" class="inp ms-auto" style="width:190px;padding:7px 11px">
+    </div>
+    <div id="rows"></div>
    </div>
-  </div>
+  </section>
 
-  <div class="card rounded-2xl p-4 space-y-2">
-   <p class="text-[11px] dim" data-t="pxAutoNote"></p>
-   <div id="pxRows" class="space-y-2"></div>
-  </div>
- </section>
+  <!-- ══ CLEAN IP ══ -->
+  <section data-pg="clean" class="hidden">
+   <div class="card p-4">
+    <b class="text-base" data-t="cleanTitle"></b>
+    <p class="text-xs dim mt-1 mb-3" data-t="cleanHint"></p>
+    <div class="g4">
+     <input id="cAddr" class="inp" style="grid-column:span 2">
+     <input id="cRem" class="inp">
+     <select id="cCty" class="inp"></select>
+    </div>
+    <div class="flex flex-wrap gap-2 mt-3">
+     <button onclick="addCip()" id="btnCipAdd" class="btn"></button>
+    </div>
+    <textarea id="cBulk" rows="4" class="inp mono mt-3"></textarea>
+    <div class="g2 mt-2">
+     <button onclick="bulkCip()" id="btnBulk" class="btn btn-soft"></button>
+     <button onclick="clearCips()" id="btnClearAll" class="btn btn-danger"></button>
+    </div>
+    <p id="cipMsg" class="text-xs dim mt-2" style="margin-bottom:0"></p>
+   </div>
+   <div class="card p-4 mt-4"><div id="cipRows" class="g2"></div></div>
+  </section>
 
- <!-- ══ SETTINGS ══ -->
- <section data-pg="settings" class="space-y-4 hidden">
-  <div class="card rounded-2xl p-4 space-y-3">
-   <p class="text-sm font-bold" data-t="appearance"></p>
-   <div class="grid sm:grid-cols-2 gap-2">
-    <div><label class="text-xs dim" data-t="theme"></label>
-     <select id="thSel2" onchange="setTheme(this.value);syncSelects()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-      <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
-      <option value="gray" data-t="thGray"></option></select></div>
-    <div><label class="text-xs dim" data-t="mainCountry"></label>
-     <div class="flex gap-2 mt-1">
-      <select id="mcSel" class="flex-1 inp rounded-xl px-3 py-2 text-sm"></select>
-      <button onclick="saveMainCountry()" id="btnMc" class="grad rounded-xl px-3 py-2 text-xs font-bold"></button>
+  <!-- ══ PROXY ══ -->
+  <section data-pg="proxy" class="hidden">
+   <div class="card p-4">
+    <b class="text-base" data-t="pxTitle"></b>
+    <p class="text-xs dim mt-1 mb-3" data-t="pxHint"></p>
+    <textarea id="pBulk" rows="3" spellcheck="false" class="inp mono"
+      placeholder="socks5://1.1.1.1:5866"></textarea>
+    <p class="text-xs dim mt-1" data-t="pxLineHint"></p>
+    <button onclick="addBulk()" class="btn w-full mt-2" data-t="pxAddLines"></button>
+    <details class="mt-3">
+     <summary class="text-xs dim" style="cursor:pointer" data-t="pxAdvanced"></summary>
+     <div class="g3 mt-3">
+      <label class="fld"><span class="text-xs dim" data-t="pxKind"></span>
+       <select id="pKind" class="inp"><option value="socks5">SOCKS5</option>
+        <option value="socks4">SOCKS4</option><option value="http">HTTP</option></select></label>
+      <label class="fld"><span class="text-xs dim" data-t="pxHost"></span>
+       <input id="pHost" class="inp mono" placeholder="1.2.3.4"></label>
+      <label class="fld"><span class="text-xs dim" data-t="pxPort"></span>
+       <input id="pPort" type="number" class="inp mono" placeholder="1080"></label>
+      <label class="fld"><span class="text-xs dim" data-t="pxUser"></span>
+       <input id="pUser" class="inp mono"></label>
+      <label class="fld"><span class="text-xs dim" data-t="pxPass"></span>
+       <input id="pPass" type="password" class="inp mono"></label>
+      <label class="fld"><span class="text-xs dim" data-t="remarkPh"></span>
+       <input id="pRem" class="inp"></label>
      </div>
-     <p class="text-[10px] dim mt-1" data-t="flagsHint"></p></div>
-    <div><label class="text-xs dim" data-t="language"></label>
-     <select id="langSel2" onchange="setLang(this.value);syncSelects()" class="w-full inp rounded-xl px-3 py-2 text-sm mt-1">
-      <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select></div>
-   </div>
-  </div>
-  <div class="card rounded-2xl p-4 space-y-2">
-   <p class="text-sm font-bold" data-t="changePw"></p>
-   <input id="pwCur" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm">
-   <input id="pwNew" type="password" class="w-full inp rounded-xl px-3 py-2 text-sm">
-   <p class="text-[11px] dim" data-t="pwRule"></p>
-   <button onclick="doChangePw()" id="btnPw" class="grad rounded-xl py-2 px-4 font-bold text-sm text-white"></button>
-   <p id="pwMsg" class="text-xs"></p>
-  </div>
-  <div class="card rounded-2xl p-4 space-y-2">
-   <p class="text-sm font-bold" data-t="serverInfo"></p>
-   <div id="srvBox" class="space-y-1 text-xs"></div>
-   <p class="text-[11px] dim pt-1" data-t="envNote"></p>
-  </div>
-
-  <!-- ══ BACKUP & RESTORE ══ -->
-  <div class="card rounded-2xl p-4 space-y-3">
-   <p class="text-sm font-bold" data-t="backupTitle"></p>
-   <p class="text-[11px] dim" data-t="backupHint"></p>
-   <div id="bkInfo" class="text-[11px] space-y-1"></div>
-   <div class="flex flex-wrap gap-2 text-xs">
-    <label class="flex items-center gap-1.5 rounded-full soft px-3 py-1.5 cursor-pointer">
-     <input type="checkbox" id="bkPw" checked> <span data-t="bkInclPw"></span></label>
-    <label class="flex items-center gap-1.5 rounded-full soft px-3 py-1.5 cursor-pointer">
-     <input type="checkbox" id="bkPxCreds" checked> <span data-t="bkInclProxyCreds"></span></label>
-    <label class="flex items-center gap-1.5 rounded-full soft px-3 py-1.5 cursor-pointer">
-     <input type="checkbox" id="bkTraffic"> <span data-t="bkInclTraffic"></span></label>
-   </div>
-   <p class="text-[11px] rounded-xl px-3 py-2 leading-relaxed"
-      style="background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);color:var(--warn)"
-      data-t="bkSecretWarn"></p>
-   <button onclick="doBackup()" id="btnBackup"
-     class="grad rounded-xl py-2 px-4 font-bold text-sm text-white w-full sm:w-auto"></button>
-
-   <div class="pt-3 border-t space-y-2" style="border-color:var(--line)">
-    <p class="text-sm font-bold" data-t="restoreTitle"></p>
-    <p class="text-[11px] dim" data-t="restoreHint"></p>
-    <input type="file" id="bkFile" accept=".ixpbak,application/json,.json"
-      onchange="pickBackup()" class="w-full inp rounded-xl px-3 py-2 text-xs">
-    <div id="bkPreview" class="text-[11px] space-y-1"></div>
-    <div id="bkOpts" class="hidden space-y-2">
-     <label class="block text-xs dim" data-t="restoreMode"></label>
-     <select id="bkMode" class="w-full inp rounded-xl px-3 py-2 text-sm">
-      <option value="merge"></option><option value="replace"></option></select>
-     <label class="flex items-center gap-2 text-xs">
-      <input type="checkbox" id="bkRestorePw"> <span data-t="bkRestorePwLbl"></span></label>
-     <button onclick="doRestore()" id="btnRestore"
-       class="grad rounded-xl py-2 px-4 font-bold text-sm text-white w-full"></button>
+    </details>
+    <div class="g2 mt-3">
+     <button onclick="addProxy()" class="btn" data-t="pxAdd"></button>
+     <button onclick="testAllProxies()" class="btn btn-soft" data-t="pxTestAll"></button>
     </div>
-    <p id="bkMsg" class="text-xs"></p>
+    <p id="pxMsg" class="text-xs dim mt-2" style="margin-bottom:0"></p>
    </div>
-  </div>
- </section>
 
- <!-- ══ LOGS ══ -->
- <section data-pg="logs" class="hidden">
-  <div class="card rounded-2xl p-4">
-   <p class="text-sm font-bold mb-3" data-t="logs"></p>
-   <div id="logRows" class="space-y-1"></div>
-  </div>
- </section>
+   <div class="card p-4 mt-4 space-y-3">
+    <div class="flex items-center gap-3">
+     <div class="flex-1">
+      <b class="text-base" data-t="pxStrict"></b>
+      <p class="text-xs dim" style="margin:0" data-t="pxStrictHint"></p>
+     </div>
+     <button id="pxStrictBtn" onclick="toggleStrict()" class="sw"></button>
+    </div>
+    <label class="fld"><span class="text-xs dim" data-t="pxFlagSrc"></span>
+     <select id="pxFlagSel" onchange="saveFlagSource()" class="inp">
+      <option value="proxy" data-t="pxFlagProxy"></option>
+      <option value="entry" data-t="pxFlagEntry"></option></select></label>
+   </div>
 
- <!-- ══ LIVE CONNECTIONS ══ -->
- <section data-pg="live" class="hidden">
-  <p class="text-sm font-bold mb-3 flex items-center gap-2">
-   <span data-t="liveTitle"></span>
-   <span id="liveCount" class="text-xs font-normal" style="color:var(--dim)"></span>
-  </p>
-  <div class="card rounded-2xl p-0 overflow-hidden">
-   <div id="liveRows" class="divide-y" style="border-color:var(--line)"></div>
-   <div id="liveEmpty" class="p-6 text-center text-sm" style="color:var(--dim)" data-t="liveEmpty"></div>
-  </div>
- </section>
-</main>
+   <div class="card p-4 mt-4">
+    <p class="text-xs dim" style="margin:0 0 12px" data-t="pxAutoNote"></p>
+    <div id="pxRows" class="space-y-2"></div>
+   </div>
+  </section>
 
-<div id="modal" class="fixed inset-0 z-[60] hidden items-center justify-center bg-black/70 p-4">
- <div class="card rounded-2xl w-full max-w-md p-5 max-h-[85vh] overflow-y-auto sheet">
-  <div class="flex items-center mb-3"><p id="mTitle" class="font-bold"></p>
-   <button onclick="closeModal()" class="ms-auto dim hover:opacity-70">✕</button></div>
+  <!-- ══ SETTINGS ══ -->
+  <section data-pg="settings" class="hidden">
+   <div class="card p-4">
+    <b class="text-base" data-t="appearance"></b>
+    <div class="g3 mt-3">
+     <label class="fld"><span class="text-xs dim" data-t="theme"></span>
+      <select id="thSel2" onchange="setTheme(this.value);syncSelects()" class="inp">
+       <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
+       <option value="gray" data-t="thGray"></option></select></label>
+     <label class="fld"><span class="text-xs dim" data-t="language"></span>
+      <select id="langSel2" onchange="setLang(this.value);syncSelects()" class="inp">
+       <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select></label>
+     <label class="fld"><span class="text-xs dim" data-t="mainCountry"></span>
+      <div class="flex gap-2">
+       <select id="mcSel" class="inp flex-1"></select>
+       <button onclick="saveMainCountry()" id="btnMc" class="btn"></button>
+      </div>
+      <span class="text-xs dim" data-t="flagsHint"></span></label>
+    </div>
+   </div>
+
+   <div class="card p-4 mt-4 space-y-2">
+    <b class="text-base" data-t="changePw"></b>
+    <input id="pwCur" type="password" class="inp">
+    <input id="pwNew" type="password" class="inp">
+    <p class="text-xs dim" style="margin:0" data-t="pwRule"></p>
+    <button onclick="doChangePw()" id="btnPw" class="btn w-full"></button>
+    <p id="pwMsg" class="text-sm" style="margin:0"></p>
+   </div>
+
+   <div class="card p-4 mt-4 space-y-2">
+    <b class="text-base" data-t="serverInfo"></b>
+    <div id="srvBox" class="space-y-2 text-sm"></div>
+    <p class="text-xs dim" style="margin:0" data-t="envNote"></p>
+   </div>
+
+   <!-- ══ BACKUP & RESTORE ══ -->
+   <div class="card p-4 mt-4 space-y-3">
+    <b class="text-base" data-t="backupTitle"></b>
+    <p class="text-xs dim" style="margin:0" data-t="backupHint"></p>
+    <div id="bkInfo" class="space-y-2 text-sm"></div>
+    <div class="flex flex-wrap gap-2 text-sm">
+     <label class="chip" style="cursor:pointer"><input type="checkbox" id="bkPw" checked> <span data-t="bkInclPw"></span></label>
+     <label class="chip" style="cursor:pointer"><input type="checkbox" id="bkPxCreds" checked> <span data-t="bkInclProxyCreds"></span></label>
+     <label class="chip" style="cursor:pointer"><input type="checkbox" id="bkTraffic"> <span data-t="bkInclTraffic"></span></label>
+    </div>
+    <p class="notice" style="margin:0" data-t="bkSecretWarn"></p>
+    <button onclick="doBackup()" id="btnBackup" class="btn w-full"></button>
+
+    <div class="pt-3 space-y-2" style="border-top:1px solid var(--line)">
+     <b class="text-base" data-t="restoreTitle"></b>
+     <p class="text-xs dim" style="margin:0" data-t="restoreHint"></p>
+     <input type="file" id="bkFile" accept=".ixpbak,application/json,.json"
+       onchange="pickBackup()" class="inp" style="font-size:12px">
+     <div id="bkPreview" class="space-y-2 text-sm"></div>
+     <div id="bkOpts" class="hidden space-y-2">
+      <label class="fld"><span class="text-xs dim" data-t="restoreMode"></span>
+       <select id="bkMode" class="inp"><option value="merge"></option><option value="replace"></option></select></label>
+      <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="bkRestorePw"> <span data-t="bkRestorePwLbl"></span></label>
+      <button onclick="doRestore()" id="btnRestore" class="btn w-full"></button>
+     </div>
+     <p id="bkMsg" class="text-sm" style="margin:0"></p>
+    </div>
+   </div>
+  </section>
+
+  <!-- ══ EVENTS ══ -->
+  <section data-pg="logs" class="hidden">
+   <div class="card p-4">
+    <b class="text-base" data-t="logs"></b>
+    <div id="logRows" class="space-y-2 mt-3"></div>
+   </div>
+  </section>
+
+  <!-- ══ LIVE CONNECTIONS ══ -->
+  <section data-pg="live" class="hidden">
+   <div class="card" style="overflow:hidden">
+    <div class="card-head">
+     <b class="text-base" data-t="liveTitle"></b>
+     <span id="liveCount" class="text-xs dim"></span>
+    </div>
+    <div id="liveRows"></div>
+    <div id="liveEmpty" class="p-4 text-sm dim" style="text-align:center" data-t="liveEmpty"></div>
+   </div>
+  </section>
+ </main>
+</div>
+
+<div id="modal" class="hidden">
+ <div class="modal-card">
+  <div class="modal-head"><b id="mTitle"></b>
+   <button onclick="closeModal()" class="icon-btn ms-auto">✕</button></div>
   <div id="mBody" class="space-y-3 text-sm"></div>
  </div>
 </div>
 
 <script>
-/* ─── drawer position depends on writing direction ─── */
-function placeNav(open){
- const rtl=I18N[LANG].dir==='rtl';
- nav.style.left = rtl?'auto':'0';
- nav.style.right= rtl?'0':'auto';
- nav.style.transform = open?'translateX(0)':(rtl?'translateX(100%)':'translateX(-100%)');
- /* A drawer that is only pushed aside still takes up layout width, so any sideways
-    scroll (long proxy rows caused exactly that) dragged it back into view. Pulling it
-    out of the layout keeps it hidden until it is actually asked for. */
- nav.style.visibility    = open?'visible':'hidden';
- nav.style.pointerEvents = open?'auto':'none';
-}
-let navOpen=false;
-function toggleNav(force){
- navOpen = force===undefined?!navOpen:force;
- placeNav(navOpen);
- scrim.classList.toggle('hidden',!navOpen);
-}
-placeNav(false);
+const esc=(s)=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-/* ─── country flags + inline icons ───
-   `var` and function declarations on purpose: paintStatic() runs during boot, before
-   this point in the script, and `const` would throw a temporal-dead-zone error that
-   aborts the whole panel script. */
+const ICO={
+ cfg:'<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3c2.5 2.4 3.8 5.4 3.8 9s-1.3 6.6-3.8 9c-2.5-2.4-3.8-5.4-3.8-9S9.5 5.4 12 3z"/></svg>',
+ ips:'<svg class="ic" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M8 20h8M12 16.5V20"/></svg>',
+ edit:'<svg class="ic" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M14 6l4 4"/></svg>',
+ del:'<svg class="ic" viewBox="0 0 24 24"><path d="M5 7h14M9.5 7V5h5v2M7 7l1 13h8l1-13"/></svg>',
+ pause:'<svg class="ic" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M9.5 5v14M14.5 5v14"/></svg>',
+ play:'<svg class="ic" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M7.5 5.2l11 6.8-11 6.8z"/></svg>',
+ x:'<svg class="ic" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+ ping:'<svg class="ic" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>',
+ copy:'<svg class="ic" viewBox="0 0 24 24" style="width:15px;height:15px"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 012-2h9"/></svg>',
+ key:'<svg class="ic" viewBox="0 0 24 24" style="width:14px;height:14px"><circle cx="8" cy="15" r="3.5"/><path d="M10.5 13L19 4.5M16 7.5l2 2M13.5 10l2 2"/></svg>'
+};
+
+/* ─── responsive shell: rail on desktop, drawer on mobile ─── */
+const isDesktop=()=>window.matchMedia('(min-width:1024px)').matches;
+let navMini=localStorage.getItem('navMini')==='1';
+let navOpen=false;
+function applyNav(){
+ document.body.classList.toggle('nav-mini',isDesktop()&&navMini);
+ document.body.classList.toggle('nav-open',!isDesktop()&&navOpen);
+ scrim.classList.toggle('hidden',isDesktop()||!navOpen);
+}
+function toggleNav(force){
+ if(isDesktop()){
+  navMini = force===undefined ? !navMini : !!force;
+  localStorage.setItem('navMini',navMini?'1':'0');
+ }else{
+  navOpen = force===undefined ? !navOpen : !!force;
+ }
+ applyNav();
+}
+function closeDrawer(){ if(!isDesktop()){navOpen=false;applyNav()} }
+window.addEventListener('resize',applyNav);
+
+/* ─── country flags + helpers ─── */
 var CC=['DE','NL','FR','GB','FI','SE','PL','AT','CH','ES','IT','RO','TR','RU','AE','QA','OM',
         'AM','GE','IN','SG','JP','KR','HK','CA','US','BR','AU','DK','NO','BE','CZ','HU','LT',
         'LV','EE','IE','UA','KZ','IR'];
@@ -4848,17 +5051,7 @@ function fillCountry(sel,cur){
   CC.map(c=>'<option value="'+c+'">'+flagOf(c)+' '+c+'</option>').join('');
  sel.value=cur||'';
 }
-var SVG_PAUSE='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M9.5 5v14M14.5 5v14"/></svg>';
-var SVG_PLAY='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M7.5 5.2l11 6.8-11 6.8z"/></svg>';
-var SVG_X='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M6 6l12 12M18 6L6 18"/></svg>';
 var MAIN_CC='';
-var SVG_PING='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>';
-var SVG_ARM='<svg class="ic" style="width:14px;height:14px" viewBox="0 0 24 24">'+
-  '<path d="M13 3L5 14h5l-1 7 8-11h-5z"/></svg>';
 var PROXIES=[],PX_SUB=[],PX_ACTIVE=0,PX_STRICT=true,PX_FLAG='proxy';
 
 /* ─── routing ─── */
@@ -4869,23 +5062,20 @@ function go(p){
  document.querySelectorAll('.navi').forEach(n=>n.classList.toggle('on',n.dataset.page===p));
  crumb.textContent=T({dash:'navDash',users:'navUsers',clean:'navClean',
    proxy:'navProxy',live:'navLive',settings:'navSettings',logs:'navLogs'}[p]);
- toggleNav(false);
+ closeDrawer();
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
  if(p==='settings'){renderServer();loadBackupInfo()}
  if(p==='live')loadLive(); else stopLive();
 }
 
-/* ─── helpers ─── */
+/* ─── formatting helpers ─── */
 const fmt=b=>{if(!b)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0,n=b;
  while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(i?1:0)+' '+u[i]};
 const dt=t=>t?new Date(t*1000).toLocaleString(LANG==='fa'?'fa-IR':'en-GB'):T('never');
 const statusTxt=s=>({disabled:T('statusDisabled'),expired:T('statusExpired'),
  quota:T('statusQuota')}[s]||s);
 const trTxt=t=>({ws:T('trWs'),xhttp:T('trXhttp'),both:T('trBoth')}[t]||t);
-// Per-user TLS options, mirrored from the server-side lists in main.py. A client
-// ignores a fingerprint name it does not know, and an empty ALPN means "this
-// transport's own default" — both keep an untouched account's links unchanged.
 const FP_OPTIONS=['unsafe','chrome','firefox','safari','ios','android','edge','ie','qq','random'];
 const ALPN_OPTIONS=['','http/1.1','h2','h2,http/1.1'];
 function fillSelect(sel,opts,blankLbl){
@@ -4924,43 +5114,48 @@ function paintStatic(){
  nTr.options[0].textContent=T('trBoth');
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
- fillSelect(nFp, FP_OPTIONS, T('fpLbl'));
- fillSelect(nAlpn, ALPN_OPTIONS, T('alpnDef'));
+ fillSelect(nFp,FP_OPTIONS,T('fpLbl'));
+ fillSelect(nAlpn,ALPN_OPTIONS,T('alpnDef'));
  cAddr.placeholder=T('addrPh'); cRem.placeholder=T('remarkPh'); cBulk.placeholder=T('bulkPh');
  fillCountry(document.getElementById('cCty'),document.getElementById('cCty')?.value||'');
  fillCountry(document.getElementById('mcSel'),MAIN_CC);
  const _mb=document.getElementById('btnMc'); if(_mb)_mb.textContent=T('save');
  pwCur.placeholder=T('curPw'); pwNew.placeholder=T('newPw');
- placeNav(navOpen);
+ applyNav();
 }
 window.rerender=()=>{paintStatic();go(PAGE);renderUsers();renderCips();
  renderProto();renderServer();renderLogs()};
-paintStatic(); syncSelects();
 
-/* ─── data ─── */
+/* ─── charts / dashboard ─── */
 function paintChart(){
- const c1=getComputedStyle(document.body).getPropertyValue('--a1').trim()||'#818cf8';
+ const cs=getComputedStyle(document.body);
+ const c1=cs.getPropertyValue('--a1').trim()||'#008771';
+ const grid=cs.getPropertyValue('--line').trim()||'#2c3950';
+ const dim=cs.getPropertyValue('--dim').trim()||'#8fa3c0';
  const labels=(stats.series||[]).map(x=>new Date(x.h*1000).getHours()+':00');
  const data=(stats.series||[]).map(x=>(x.up+x.down)/1048576);
  if(!chart){
   chart=new Chart(document.getElementById('chart'),{type:'line',
    data:{labels,datasets:[{label:'MB',data,fill:true,tension:.4,borderColor:c1,
-    backgroundColor:c1+'33',pointRadius:0,borderWidth:2}]},
-   options:{plugins:{legend:{display:false}},scales:{
-    x:{grid:{color:'#8882'},ticks:{color:'#94a3b8',font:{size:10}}},
-    y:{grid:{color:'#8882'},ticks:{color:'#94a3b8',font:{size:10}}}}}});
+    backgroundColor:c1+'2e',pointRadius:0,borderWidth:2}]},
+   options:{plugins:{legend:{display:false}},maintainAspectRatio:false,scales:{
+    x:{grid:{color:grid},ticks:{color:dim,font:{size:10}}},
+    y:{grid:{color:grid},ticks:{color:dim,font:{size:10}}}}}});
  }else{Object.assign(chart.data,{labels});
   chart.data.datasets[0].data=data;
   chart.data.datasets[0].borderColor=c1;
-  chart.data.datasets[0].backgroundColor=c1+'33';chart.update()}
+  chart.data.datasets[0].backgroundColor=c1+'2e';
+  ['x','y'].forEach(k=>{const sc=chart.options&&chart.options.scales&&chart.options.scales[k];
+   if(sc){sc.grid.color=grid;sc.ticks.color=dim}});
+  chart.update()}
 }
 function renderProto(){
  const bp=stats.by_proto||{};
  const pairs=[['ws',T('trWs'),'var(--a1)'],['xhttp',T('trXhttp'),'var(--a2)']];
  protoBox.innerHTML=pairs.map(([k,lbl,col])=>`
-  <div class="rounded-xl soft px-3 py-2 flex items-center gap-2">
-   <span class="h-2 w-2 rounded-full" style="background:${col}"></span>
-   <span>${lbl}</span><span class="font-bold">${bp[k]||0}</span></div>`).join('');
+  <div class="chip" style="font-size:12px;padding:7px 12px">
+   <span style="width:8px;height:8px;border-radius:50%;background:${col}"></span>
+   <span class="dim">${lbl}</span><b>${bp[k]||0}</b></div>`).join('');
 }
 function renderServer(){
  srvBox.innerHTML=[
@@ -4971,14 +5166,11 @@ function renderServer(){
   [T('xSessions'),stats.xhttp_sessions??'—'],
   [T('relayLbl'),stats.relay_domain||T('relayNone')],
   [T('keepAliveLbl'),stats.keepalive?T('onLbl'):T('offLbl')],
- ].map(([k,v])=>`<div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
-   <span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`).join('')
+ ].map(([k,v])=>`<div class="kv"><span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`).join('')
  +(stats.xhttp_mode==='packet-up'
-   ?`<p class="text-[11px] rounded-xl px-3 py-2 leading-relaxed mt-1"
-       style="background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent)">
-      <span class="font-bold" style="color:var(--warn)">${T('trWarnTitle')}</span>
+  ?`<p class="notice" style="margin-top:8px"><b style="color:var(--warn)">${T('trWarnTitle')}</b>
       <span class="dim">${T('xhModeHint')}</span></p>`
-   :'');
+  :'');
 }
 
 async function loadStats(){
@@ -5010,78 +5202,83 @@ async function loadLogs(){logItems=await api('/api/logs');renderLogs()}
 
 let liveTimer=null;
 async function loadLive(){
-  try{
-    const d=await api('/api/live');
-    const rows=d.connections||[];
-    liveCount.textContent=rows.length?`(${rows.length})`:'';
-    if(!rows.length){liveRows.innerHTML='';liveEmpty.style.display='';return}
-    liveEmpty.style.display='none';
-    const fmtDur=s=>{s=Math.max(0,Math.floor(s));const m=Math.floor(s/60),sec=s%60;
-      return m?`${m}m ${sec}s`:`${sec}s`};
-    liveRows.innerHTML=rows.map(c=>`<div class="p-3 flex items-center gap-3 text-sm">
-      <span class="text-[10px] px-2 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--info) 16%,transparent);color:var(--info)">${(c.transport||'').toUpperCase()}</span>
-      <div class="flex-1 min-w-0">
-        <p class="font-bold truncate">${esc(c.user||'—')}</p>
-        <p class="text-xs truncate" style="color:var(--dim)">${esc(c.ip||'')} · ${esc(c.route||'')}${c.mux?' · mux':''}</p>
-      </div>
-      <span class="text-xs font-mono" style="color:var(--dim)">${fmtDur(c.connected_for)}</span>
-    </div>`).join('');
-  }catch(e){/* keep last render on transient error */}
-  clearTimeout(liveTimer);
-  liveTimer=setTimeout(loadLive,4000);   // auto-refresh every 4s
+ try{
+  const d=await api('/api/live');
+  const rows=d.connections||[];
+  liveCount.textContent=rows.length?`(${rows.length})`:'';
+  if(!rows.length){liveRows.innerHTML='';liveEmpty.style.display='';return}
+  liveEmpty.style.display='none';
+  const fmtDur=s=>{s=Math.max(0,Math.floor(s));const m=Math.floor(s/60),sec=s%60;
+   return m?`${m}m ${sec}s`:`${sec}s`};
+  liveRows.innerHTML=rows.map(c=>`<div class="lrow">
+    <span class="chip blue">${esc((c.transport||'').toUpperCase())}</span>
+    <div class="flex-1" style="min-width:120px">
+      <b class="text-base">${esc(c.user||'—')}</b>
+      <div class="text-xs dim mono truncate">${esc(c.ip||'')} · ${esc(c.route||'')}${c.mux?' · mux':''}</div>
+    </div>
+    <span class="text-xs mono dim">${fmtDur(c.connected_for)}</span>
+   </div>`).join('');
+ }catch(e){/* keep last render on transient error */}
+ clearTimeout(liveTimer);
+ liveTimer=setTimeout(loadLive,4000);
 }
 function stopLive(){clearTimeout(liveTimer);liveTimer=null}
 
+/* ─── renderers ─── */
 function renderUsers(){
  const term=(q.value||'').toLowerCase();
  rows.innerHTML=users.filter(u=>u.name.toLowerCase().includes(term)).map(u=>{
   const pct=u.quota_bytes?Math.min(100,u.used_bytes/u.quota_bytes*100):0;
   const badge=u.active
-   ?`<span class="text-[10px] px-2 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)">${T('active')}</span>`
-   :`<span class="text-[10px] px-2 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${statusTxt(u.status)}</span>`;
-  const dev=u.device_limit?`${u.devices_now}/${u.device_limit}`:`${u.devices_now}/♾️`;
-  const liveTag=u.devices_live?`<span class="text-[10px] px-1.5 py-0.5 rounded-full" style="background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)">● ${u.devices_live}</span>`:'';
-  const devCol=u.device_limit&&u.devices_now>=u.device_limit?'var(--bad)':'var(--info)';
-  return `<div class="p-4 border-b" style="border-color:var(--line)">
-   <div class="flex items-center gap-2 flex-wrap">
-    <p class="font-bold">${u.name}</p>${badge}
-    <span class="text-[10px] px-2 py-0.5 rounded-full soft">${trTxt(u.transport)}</span>
-    <span class="text-[11px]" style="color:${devCol}">📱 ${dev}</span>${liveTag}
-    <div class="flex-1"></div>
-    <button onclick="showConfig(${u.id})" class="text-[11px] px-2 py-1 rounded-lg" style="background:color-mix(in srgb,var(--a1) 22%,transparent)">${T('config')}</button>
-    <button onclick="showIps(${u.id})" class="text-[11px] px-2 py-1 rounded-lg" style="background:color-mix(in srgb,var(--info) 20%,transparent)">${T('ipsBtn')}</button>
-    <button onclick="showEdit(${u.id})" class="text-[11px] px-2 py-1 rounded-lg soft">${T('edit')}</button>
+   ?`<span class="chip green">${T('active')}</span>`
+   :`<span class="chip red">${statusTxt(u.status)}</span>`;
+  const dev=u.device_limit?`${u.devices_now}/${u.device_limit}`:'∞';
+  const liveTag=u.devices_live?`<span class="chip green">● ${u.devices_live}</span>`:'';
+  const devWarn=u.device_limit&&u.devices_now>=u.device_limit;
+  return `<div class="urow">
+   <div class="u-av">${esc((u.name||'?').slice(0,1).toUpperCase())}</div>
+   <div class="u-main">
+    <div class="flex items-center gap-2 flex-wrap">
+     <b class="text-base">${esc(u.name)}</b>${badge}
+     <span class="chip teal">${trTxt(u.transport)}</span>${liveTag}
+    </div>
+    <div class="progress mt-2${pct>=85?' hot':''}"><i style="width:${pct}%"></i></div>
+    <div class="flex flex-wrap gap-3 text-xs dim mt-1">
+     <span>${T('used')}: ${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</span>
+     <span>${T('expiry')}: ${dt(u.expire_at)}</span>
+    </div>
    </div>
-   <div class="mt-2 h-1.5 rounded-full overflow-hidden soft">
-    <div class="h-full grad" style="width:${pct}%"></div></div>
-   <div class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[11px] dim">
-    <span>${T('used')}: ${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</span>
-    <span>${T('expiry')}: ${dt(u.expire_at)}</span>
-   </div></div>`}).join('')||`<p class="p-6 text-center text-sm dim">${T('noUsers')}</p>`;
+   <div class="u-dev" style="color:${devWarn?'var(--bad)':'var(--info)'}">📱 ${dev}</div>
+   <div class="u-actions">
+    <button class="icon-btn" title="${T('config')}" onclick="showConfig(${u.id})">${ICO.cfg}</button>
+    <button class="icon-btn" title="${T('ipsBtn')}" onclick="showIps(${u.id})">${ICO.ips}</button>
+    <button class="icon-btn" title="${T('edit')}" onclick="showEdit(${u.id})">${ICO.edit}</button>
+   </div></div>`}).join('')
+  ||`<div class="p-4 text-sm dim" style="text-align:center">${T('noUsers')}</div>`;
 }
 
 function renderCips(){
  cipRows.innerHTML=cips.map(x=>`
-  <div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
-   <span class="h-2 w-2 rounded-full" style="background:${x.enabled?'var(--ok)':'var(--dim)'}"></span>
-   ${x.flag?`<span class="text-sm">${x.flag}</span>`:''}
-   <span class="mono text-[11px]">${x.address}</span>
-   ${x.remark?`<span class="text-[10px] dim">${x.remark}</span>`:''}
+  <div class="flex items-center gap-2 soft" style="border-radius:10px;padding:9px 12px">
+   <span style="width:8px;height:8px;border-radius:50%;background:${x.enabled?'var(--ok)':'var(--dim)'}"></span>
+   ${x.flag?`<span>${x.flag}</span>`:''}
+   <span class="mono text-sm truncate">${esc(x.address)}</span>
+   ${x.remark?`<span class="text-xs dim truncate">${esc(x.remark)}</span>`:''}
    <div class="flex-1"></div>
-   <button onclick="toggleCip(${x.id})" class="icbox px-2 py-1 rounded-lg soft">${x.enabled?SVG_PAUSE:SVG_PLAY}</button>
-   <button onclick="delCip(${x.id})" class="icbox px-2 py-1 rounded-lg" style="color:var(--bad)">${SVG_X}</button>
-  </div>`).join('')||`<p class="text-xs dim">${T('noCleanIps')}</p>`;
+   <button onclick="toggleCip(${x.id})" class="icon-btn">${x.enabled?ICO.pause:ICO.play}</button>
+   <button onclick="delCip(${x.id})" class="icon-btn danger">${ICO.x}</button>
+  </div>`).join('')||`<p class="text-xs dim" style="margin:0">${T('noCleanIps')}</p>`;
 }
 
 function renderLogs(){
  const box=document.getElementById('logRows');
  box.innerHTML=logItems.map(l=>`
-  <div class="flex items-center gap-2 rounded-xl soft px-3 py-2 text-[11px]">
-   <span class="font-bold">${l.event}</span>
-   <span class="mono dim">${l.ip||''}</span>
-   <span class="dim">${l.detail||''}</span>
+  <div class="lrow">
+   <span class="chip teal">${esc(l.event)}</span>
+   <span class="mono dim">${esc(l.ip||'')}</span>
+   <span class="dim flex-1 truncate">${esc(l.detail||'')}</span>
    <span class="ms-auto dim">${dt(l.ts)}</span></div>`).join('')
-  ||`<p class="text-xs dim">${T('noLogs')}</p>`;
+ ||`<p class="text-xs dim" style="margin:0">${T('noLogs')}</p>`;
 }
 
 /* ─── actions ─── */
@@ -5131,40 +5328,39 @@ function renderProxies(){
  const fs=document.getElementById('pxFlagSel');
  if(fs)fs.value=PX_FLAG;
  pxRows.innerHTML=PROXIES.map(x=>{
-  // An enabled proxy is already in every subscription — nothing to press.
   const on=PX_SUB.indexOf(x.id)>-1;
   const dot=x.healthy?'var(--ok)':(x.checked_at?'var(--bad)':'var(--dim)');
   const state=x.healthy?T('pxHealthy'):(x.checked_at?T('pxDown'):T('pxUntested'));
-  const geo=[x.country_name||'',x.city||''].filter(Boolean).join(' \u00b7 ');
-  return `<div class="rounded-xl soft px-3 py-2 ${on?'ring-2':''}" style="${on?'outline:2px solid var(--a1)':''}">
+  const geo=[x.country_name||'',x.city||''].filter(Boolean).join(' · ');
+  return `<div class="prow ${on?'on':''}">
    <div class="flex items-center gap-2 flex-wrap">
-    <span class="h-2 w-2 rounded-full" style="background:${dot}"></span>
-    <span class="text-base">${x.flag||'\u{1F310}'}</span>
-    <span class="mono text-[11px] min-w-0 break-all">${x.label}</span>
-    ${x.has_auth?'<span class="text-[10px] dim">\u{1F511}</span>':''}
-    ${on?`<span class="text-[10px] font-bold" style="color:var(--a2)">${T('pxInSub')}</span>`:''}
+    <span style="width:8px;height:8px;border-radius:50%;background:${dot}"></span>
+    <span>${x.flag||'🌐'}</span>
+    <span class="mono text-sm break-all">${esc(x.label)}</span>
+    ${x.has_auth?ICO.key:''}
+    ${on?`<span class="chip teal">${T('pxInSub')}</span>`:''}
     <div class="flex-1"></div>
-    <button onclick="testProxy(${x.id})" title="${T('pxTest')}" class="icbox px-2 py-1 rounded-lg soft">${SVG_PING}</button>
-    <button onclick="toggleProxy(${x.id},${x.enabled?1:0})" class="icbox px-2 py-1 rounded-lg soft">${x.enabled?SVG_PAUSE:SVG_PLAY}</button>
-    <button onclick="delProxy(${x.id})" class="icbox px-2 py-1 rounded-lg" style="color:var(--bad)">${SVG_X}</button>
+    <button onclick="testProxy(${x.id})" title="${T('pxTest')}" class="icon-btn">${ICO.ping}</button>
+    <button onclick="toggleProxy(${x.id},${x.enabled?1:0})" class="icon-btn">${x.enabled?ICO.pause:ICO.play}</button>
+    <button onclick="delProxy(${x.id})" class="icon-btn danger">${ICO.x}</button>
    </div>
-   <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1 text-[10px] dim">
+   <div class="flex flex-wrap gap-3 text-xs dim mt-2">
     <span>${state}</span>
     ${x.latency_ms?`<span>${T('pxLatency')}: ${x.latency_ms} ms</span>`:''}
-    ${x.exit_ip?`<span class="mono">${T('pxExitIp')}: ${x.exit_ip}</span>`:''}
-    ${geo?`<span>${geo}</span>`:''}
-    ${x.isp?`<span>${x.isp}</span>`:''}
-    ${x.remark?`<span>${x.remark}</span>`:''}
-    ${x.last_error?`<span style="color:var(--bad)">${x.last_error}</span>`:''}
+    ${x.exit_ip?`<span class="mono">${T('pxExitIp')}: ${esc(x.exit_ip)}</span>`:''}
+    ${geo?`<span>${esc(geo)}</span>`:''}
+    ${x.isp?`<span>${esc(x.isp)}</span>`:''}
+    ${x.remark?`<span>${esc(x.remark)}</span>`:''}
+    ${x.last_error?`<span style="color:var(--bad)">${esc(x.last_error)}</span>`:''}
    </div>
-  </div>`}).join('')||`<p class="text-xs dim">${T('pxNone')}</p>`;
+  </div>`}).join('')||`<p class="text-xs dim" style="margin:0">${T('pxNone')}</p>`;
 }
 async function addProxy(){
  pxMsg.textContent=T('pxTesting');
  try{const r=await api('/api/proxies',{method:'POST',body:JSON.stringify({
    kind:pKind.value,host:pHost.value.trim(),port:parseInt(pPort.value||'0',10),
    username:pUser.value.trim(),password:pPass.value,remark:pRem.value.trim()})});
-  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} \u00b7 ${r.exit_ip||''} \u00b7 ${r.latency_ms}ms`
+  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} · ${r.exit_ip||''} · ${r.latency_ms}ms`
                        :`${T('pxDown')}: ${r.error||''}`;
   pHost.value='';pPort.value='';pUser.value='';pPass.value='';pRem.value='';
   loadProxies();
@@ -5177,8 +5373,8 @@ async function addBulk(){
  try{const r=await api('/api/proxies/bulk',{method:'POST',body:JSON.stringify({text:text})});
   const rows=r.results||[], good=rows.filter(x=>x.ok).length;
   pxMsg.innerHTML=rows.map(x=>x.ok
-    ?`<span style="color:var(--ok)">${x.flag||''} ${x.label} · ${x.country_name||''} ${x.latency_ms||0}ms</span>`
-    :`<span style="color:var(--bad)">${x.label}: ${x.error||''}</span>`).join('<br>')+
+    ?`<span style="color:var(--ok)">${x.flag||''} ${esc(x.label)} · ${esc(x.country_name||'')} ${x.latency_ms||0}ms</span>`
+    :`<span style="color:var(--bad)">${esc(x.label)}: ${esc(x.error||'')}</span>`).join('<br>')+
    `<br>${good}/${rows.length}`;
   if(good)pBulk.value='';
   loadProxies();
@@ -5187,7 +5383,7 @@ async function addBulk(){
 async function testProxy(id){
  pxMsg.textContent=T('pxTesting');
  try{const r=await api('/api/proxies/'+id+'/test',{method:'POST'});
-  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} \u00b7 ${r.exit_ip||''} \u00b7 ${r.latency_ms}ms`
+  pxMsg.textContent=r.ok?`${r.flag||''} ${r.country_name||''} · ${r.exit_ip||''} · ${r.latency_ms}ms`
                        :`${T('pxDown')}: ${r.error||''}`;
   loadProxies();
  }catch(e){pxMsg.textContent=e.message}
@@ -5226,19 +5422,19 @@ function closeModal(){modal.classList.add('hidden');modal.classList.remove('flex
 async function showConfig(id){
  const c=await api('/api/users/'+id+'/config');
  const cfgs=c.configs.map(x=>`
-  <div class="rounded-xl soft p-2">
-   <p class="text-[11px] font-bold mb-1">${x.label}</p>
-   <p class="mono text-[9px] break-all dim">${x.uri}</p>
-   <button onclick="copy(this,'${x.uri.replace(/'/g,"\\'")}')" class="mt-1 w-full rounded-lg soft py-1 text-[10px]">${T('copy')}</button>
+  <div class="soft" style="border-radius:10px;padding:10px">
+   <b class="text-sm">${esc(x.label)}</b>
+   <p class="mono text-xs dim break-all" style="margin:5px 0">${esc(x.uri)}</p>
+   <button onclick="copy(this,'${x.uri.replace(/'/g,"\\'")}')" class="btn btn-soft w-full" style="padding:6px;font-size:11px">${T('copy')}</button>
   </div>`).join('');
  openModal(T('config'),`
-  <p class="text-xs dim">${T('subLink')}</p>
-  <div class="rounded-xl soft p-2 mono text-[10px] break-all">${c.sub_link}</div>
-  <button onclick="copy(this,'${c.sub_link}')" class="w-full grad rounded-xl py-2 text-xs font-bold text-white">${T('copySub')}</button>
-  <div id="qr" class="grid place-items-center bg-white p-3 rounded-xl"></div>
-  <p class="text-xs dim pt-2">UUID</p>
-  <div class="rounded-xl soft p-2 mono text-[10px] break-all">${c.uuid}</div>
-  <p class="text-xs dim pt-2">${T('singleCfg')} — ${trTxt(c.transport)}</p>${cfgs}`);
+  <label class="fld"><span class="text-xs dim">${T('subLink')}</span>
+   <div class="soft mono text-xs break-all" style="border-radius:10px;padding:10px">${esc(c.sub_link)}</div></label>
+  <button onclick="copy(this,'${c.sub_link}')" class="btn w-full">${ICO.copy} ${T('copySub')}</button>
+  <div id="qr" style="display:grid;place-items:center;background:#fff;padding:12px;border-radius:12px"></div>
+  <label class="fld"><span class="text-xs dim">UUID</span>
+   <div class="soft mono text-xs break-all" style="border-radius:10px;padding:10px">${esc(c.uuid)}</div></label>
+  <p class="text-xs dim" style="margin:0">${T('singleCfg')} — ${trTxt(c.transport)}</p>${cfgs}`);
  new QRCode(document.getElementById('qr'),{text:c.sub_link,width:180,height:180});
 }
 
@@ -5254,34 +5450,33 @@ async function showIps(id){
 async function paintIps(quiet){
  let d;
  try{ d=await api('/api/users/'+ipUid+'/ips'+(ipHistory?'?history=1':'')); }
- catch(e){ if(!quiet) openModal(T('devTitle'),'<p class="text-xs" style="color:var(--bad)">'+e.message+'</p>'); return }
+ catch(e){ if(!quiet) openModal(T('devTitle'),'<p class="text-sm" style="color:var(--bad)">'+esc(e.message)+'</p>'); return }
 
  const rows=d.rows.length ? d.rows.map(x=>`
-  <div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
-   <span class="h-2 w-2 rounded-full" style="background:${x.online?'var(--ok)':(x.counted?'var(--info)':'var(--dim)')}"></span>
-   <span class="mono text-[11px]">${x.ip}</span>
-   <span class="text-[9px] px-1.5 py-0.5 rounded soft">${x.proto||'ws'}</span>
-   <span class="ms-auto text-[10px] dim">${dt(x.last_seen)}</span>
+  <div class="lrow">
+   <span style="width:8px;height:8px;border-radius:50%;background:${x.online?'var(--ok)':(x.counted?'var(--info)':'var(--dim)')}"></span>
+   <span class="mono">${esc(x.ip)}</span>
+   <span class="chip">${esc(x.proto||'ws')}</span>
+   <span class="ms-auto dim">${dt(x.last_seen)}</span>
   </div>`).join('')
-  : `<p class="text-xs dim py-2">${ipHistory?T('noConn'):T('noneNow')}</p>`;
+  : `<p class="text-xs dim" style="margin:0">${ipHistory?T('noConn'):T('noneNow')}</p>`;
 
  const body=`
-  <div class="rounded-2xl p-4 text-center soft">
-   <p class="text-[11px] dim">${T('liveNow')}</p>
-   <p class="text-4xl font-extrabold mt-1" style="color:${d.live?'var(--ok)':'var(--dim)'}">${d.live}</p>
-   <p class="text-[10px] dim mt-1">${T('inLast').replace('%s',d.live_window)}</p>
+  <div class="soft" style="border-radius:12px;padding:16px;text-align:center">
+   <p class="text-xs dim" style="margin:0">${T('liveNow')}</p>
+   <p class="font-extrabold" style="font-size:34px;margin:4px 0 0;color:${d.live?'var(--ok)':'var(--dim)'}">${d.live}</p>
+   <p class="text-xs dim" style="margin:0">${T('inLast').replace('%s',d.live_window)}</p>
   </div>
-  <div class="grid grid-cols-2 gap-2 text-[11px]">
-   <div class="rounded-xl soft px-3 py-2"><span class="dim">${T('countedFor')}</span>
-    <span class="float-end font-bold" style="color:var(--info)">${d.counted}</span></div>
-   <div class="rounded-xl soft px-3 py-2"><span class="dim">${T('totalSeen')}</span>
-    <span class="float-end font-bold">${d.total_seen}</span></div>
+  <div class="g2 text-sm">
+   <div class="kv"><span class="dim">${T('countedFor')}</span>
+    <span class="ms-auto font-bold" style="color:var(--info)">${d.counted}</span></div>
+   <div class="kv"><span class="dim">${T('totalSeen')}</span>
+    <span class="ms-auto font-bold">${d.total_seen}</span></div>
   </div>
-  <div class="space-y-1">${rows}</div>
-  <button onclick="toggleIpHistory()" class="w-full rounded-xl soft py-2 text-xs">
+  <div class="space-y-2">${rows}</div>
+  <button onclick="toggleIpHistory()" class="btn btn-soft w-full">
    ${ipHistory?T('showLive'):T('showHistory')}</button>
-  <button onclick="clearIps(${ipUid})" class="w-full rounded-xl py-2 text-xs"
-   style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${T('clearIps')}</button>`;
+  <button onclick="clearIps(${ipUid})" class="btn btn-danger w-full">${T('clearIps')}</button>`;
 
  if(quiet){ const b=document.getElementById('mBody'); if(b) b.innerHTML=body; }
  else openModal(T('devTitle'),body);
@@ -5295,33 +5490,33 @@ function showEdit(id){
  const u=users.find(x=>x.id===id);
  const days=u.expire_at?Math.max(0,Math.ceil((u.expire_at-Date.now()/1000)/86400)):0;
  const opt=v=>`<option value="${v}" ${u.transport===v?'selected':''}>${trTxt(v)}</option>`;
- openModal(T('editUser')+' · '+u.name,`
-  <label class="block text-xs dim">${T('quota')}</label>
-  <input id="eQ" type="number" step="0.5" value="${(u.quota_bytes/1073741824).toFixed(2)}" class="w-full inp rounded-xl px-3 py-2">
-  <label class="block text-xs dim">${T('remainDays')}</label>
-  <input id="eD" type="number" value="${days}" class="w-full inp rounded-xl px-3 py-2">
-  <label class="block text-xs dim">${T('allowedDev')}</label>
-  <input id="eV" type="number" value="${u.device_limit}" class="w-full inp rounded-xl px-3 py-2">
-  <label class="block text-xs dim">${T('transport')}</label>
-  <select id="eT" class="w-full inp rounded-xl px-3 py-2">${opt('both')}${opt('ws')}${opt('xhttp')}</select>
-  <label class="flex items-center gap-2 text-xs pt-1"><input id="eObf" type="checkbox" ${u.obfuscate?'checked':''}> ${T('obfLbl')}</label>
-  <label class="flex items-center gap-2 text-xs pt-1"><input id="eEch" type="checkbox" ${u.ech?'checked':''}> ${T('echLbl')}</label>
-  <div class="grid grid-cols-2 gap-2 pt-1">
-   <div><label class="block text-xs dim">${T('fpLbl')}</label>
-    <select id="eFp" class="w-full inp rounded-xl px-2 py-2 text-xs"></select></div>
-   <div><label class="block text-xs dim">${T('alpnLbl')}</label>
-    <select id="eFpAlpn" class="w-full inp rounded-xl px-2 py-2 text-xs"></select></div>
+ openModal(T('editUser')+' · '+esc(u.name),`
+  <label class="fld"><span class="text-xs dim">${T('quota')}</span>
+   <input id="eQ" type="number" step="0.5" value="${(u.quota_bytes/1073741824).toFixed(2)}" class="inp"></label>
+  <label class="fld"><span class="text-xs dim">${T('remainDays')}</span>
+   <input id="eD" type="number" value="${days}" class="inp"></label>
+  <label class="fld"><span class="text-xs dim">${T('allowedDev')}</span>
+   <input id="eV" type="number" value="${u.device_limit}" class="inp"></label>
+  <label class="fld"><span class="text-xs dim">${T('transport')}</span>
+   <select id="eT" class="inp">${opt('both')}${opt('ws')}${opt('xhttp')}</select></label>
+  <label class="flex items-center gap-2"><input id="eObf" type="checkbox" ${u.obfuscate?'checked':''}> ${T('obfLbl')}</label>
+  <label class="flex items-center gap-2"><input id="eEch" type="checkbox" ${u.ech?'checked':''}> ${T('echLbl')}</label>
+  <div class="g2">
+   <label class="fld"><span class="text-xs dim">${T('fpLbl')}</span>
+    <select id="eFp" class="inp" style="font-size:12px"></select></label>
+   <label class="fld"><span class="text-xs dim">${T('alpnLbl')}</span>
+    <select id="eFpAlpn" class="inp" style="font-size:12px"></select></label>
   </div>
-  <label class="block text-xs dim">${T('customUuid')}</label>
-  <input id="eU" value="${u.uuid}" class="w-full inp rounded-xl px-3 py-2 mono text-[11px]">
-  <label class="flex items-center gap-2 text-xs"><input id="eE" type="checkbox" ${u.enabled?'checked':''}> ${T('active')}</label>
-  <button onclick="saveEdit(${id})" class="w-full grad rounded-xl py-2 font-bold text-sm text-white">${T('saveBtn')}</button>
-  <div class="grid grid-cols-3 gap-2 pt-2">
-   <button onclick="resetTraffic(${id})" class="rounded-xl soft py-2 text-[11px]">${T('resetTraffic')}</button>
-   <button onclick="newUuid(${id})" class="rounded-xl soft py-2 text-[11px]">${T('newUuid')}</button>
-   <button onclick="delUser(${id})" class="rounded-xl py-2 text-[11px]" style="background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)">${T('del')}</button>
+  <label class="fld"><span class="text-xs dim">${T('customUuid')}</span>
+   <input id="eU" value="${esc(u.uuid)}" class="inp mono" style="font-size:11px"></label>
+  <label class="flex items-center gap-2"><input id="eE" type="checkbox" ${u.enabled?'checked':''}> ${T('active')}</label>
+  <button onclick="saveEdit(${id})" class="btn w-full">${T('saveBtn')}</button>
+  <div class="g2" style="grid-template-columns:repeat(3,1fr)">
+   <button onclick="resetTraffic(${id})" class="btn btn-soft" style="font-size:11px;padding:7px">${T('resetTraffic')}</button>
+   <button onclick="newUuid(${id})" class="btn btn-soft" style="font-size:11px;padding:7px">${T('newUuid')}</button>
+   <button onclick="delUser(${id})" class="btn btn-danger" style="font-size:11px;padding:7px">${T('del')}</button>
   </div>
-  <p id="eErr" class="text-xs" style="color:var(--bad)"></p>`);
+  <p id="eErr" class="text-sm" style="margin:0;color:var(--bad)"></p>`);
  fillSelect(eFp,FP_OPTIONS,T('fpLbl')); eFp.value=(FP_OPTIONS.indexOf(u.fp)>-1?u.fp:'unsafe');
  fillSelect(eFpAlpn,ALPN_OPTIONS,T('alpnDef')); eFpAlpn.value=(ALPN_OPTIONS.indexOf(u.alpn)>-1?u.alpn:'');
 }
@@ -5351,25 +5546,23 @@ async function doChangePw(){
 }
 
 /* ─── backup & restore ─── */
-let BK=null;                       // the parsed file waiting to be restored
+let BK=null;
 
 const bkEsc=s=>(s==null?'':String(s)).replace(/[<>&"]/g,
  c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
-const bkRow=(k,v)=>`<div class="flex items-center gap-2 rounded-xl soft px-3 py-2">
- <span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`;
+const bkRow=(k,v)=>`<div class="kv"><span class="dim">${k}</span><span class="ms-auto mono">${v}</span></div>`;
 
 async function loadBackupInfo(){
  try{
   const i=await api('/api/backup/info');
   bkInfo.innerHTML=bkRow(T('bkUsersN'),i.users)+bkRow(T('bkCipsN'),i.clean_ips)
-    +bkRow(T('bkProxN'),i.proxies)+bkRow(T('bkTrafficN'),i.traffic_rows);
+   +bkRow(T('bkProxN'),i.proxies)+bkRow(T('bkTrafficN'),i.traffic_rows);
  }catch(e){bkInfo.innerHTML=''}
 }
 
 function doBackup(){
- // A plain link download keeps the browser's Save dialog and the server-side filename.
  const qs='password='+(bkPw.checked?1:0)+'&traffic='+(bkTraffic.checked?1:0)
-   +'&proxy_creds='+(bkPxCreds.checked?1:0);
+  +'&proxy_creds='+(bkPxCreds.checked?1:0);
  const a=document.createElement('a');
  a.href='/api/backup?'+qs; a.rel='noopener';
  document.body.appendChild(a); a.click(); a.remove();
@@ -5388,23 +5581,20 @@ async function pickBackup(){
  catch(e){ bkMsg.style.color='var(--bad)'; bkMsg.textContent=T('bkBadFile'); return }
 
  try{
-  // The server validates format, version and checksum; nothing is written yet.
   const p=await api('/api/restore/preview',{method:'POST',
     body:JSON.stringify({data:parsed})});
   BK=parsed;
   bkMsg.textContent='';
   let html=bkRow(T('bkFrom'),dt(p.created_at))+bkRow(T('bkUsersN'),p.users)
-    +bkRow(T('bkCipsN'),p.clean_ips)+bkRow(T('bkProxN'),p.proxies);
+   +bkRow(T('bkCipsN'),p.clean_ips)+bkRow(T('bkProxN'),p.proxies);
   if(p.proxies_with_creds) html+=bkRow(T('bkProxCreds'),p.proxies_with_creds);
   if(p.traffic_rows) html+=bkRow(T('bkTrafficN'),p.traffic_rows);
   html+=bkRow('🔐',p.has_password?T('bkHasPw'):T('bkNoPw'));
   const diff=Object.entries(p.env_diff||{});
   if(diff.length){
-   html+=`<p class="text-[11px] rounded-xl px-3 py-2 leading-relaxed mt-1"
-     style="background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent)">
-     <span class="font-bold" style="color:var(--warn)">${T('bkEnvDiff')}</span><br>`
-     +diff.map(([k,v])=>`<span class="mono">${bkEsc(k)}</span>: <span class="mono">${bkEsc(v.current||'—')}</span> → <span class="mono">${bkEsc(v.backup||'—')}</span>`).join('<br>')
-     +`</p>`;
+   html+=`<p class="notice" style="margin-top:8px"><b style="color:var(--warn)">${T('bkEnvDiff')}</b><br>`
+    +diff.map(([k,v])=>`<span class="mono">${bkEsc(k)}</span>: <span class="mono">${bkEsc(v.current||'—')}</span> → <span class="mono">${bkEsc(v.backup||'—')}</span>`).join('<br>')
+    +`</p>`;
   }
   bkPreview.innerHTML=html;
   bkRestorePw.checked=false;
@@ -5426,10 +5616,10 @@ async function doRestore(){
     data:BK,mode,restore_password:bkRestorePw.checked})});
   bkMsg.style.color='var(--ok)';
   bkMsg.textContent=`${T('bkDone')} — ${T('bkUsersN')}: +${r.users_added}/~${r.users_updated}`
-    +` · ${T('bkCipsN')}: +${r.clean_ips_added}`
-    +` · ${T('bkProxN')}: +${r.proxies_added}/~${r.proxies_updated}`
-    +(r.users_skipped||r.proxies_skipped||r.clean_ips_skipped
-      ?` · ${T('bkSkipped')}: ${r.users_skipped+r.proxies_skipped+r.clean_ips_skipped}`:'');
+   +` · ${T('bkCipsN')}: +${r.clean_ips_added}`
+   +` · ${T('bkProxN')}: +${r.proxies_added}/~${r.proxies_updated}`
+   +(r.users_skipped||r.proxies_skipped||r.clean_ips_skipped
+     ?` · ${T('bkSkipped')}: ${r.users_skipped+r.proxies_skipped+r.clean_ips_skipped}`:'');
   BK=null; bkFile.value=''; bkOpts.classList.add('hidden'); bkPreview.innerHTML='';
   loadUsers(); loadCips(); loadStats(); loadBackupInfo();
   if(typeof loadProxies==='function') loadProxies();
@@ -5439,8 +5629,10 @@ async function doRestore(){
 }
 
 function copy(btn,t){navigator.clipboard.writeText(t);
- const old=btn.textContent;btn.textContent=T('copied');setTimeout(()=>btn.textContent=old,1200)}
+ const old=btn.innerHTML;btn.textContent=T('copied');setTimeout(()=>{btn.innerHTML=old},1200)}
 
+/* ─── boot ─── */
+paintStatic(); syncSelects();
 go(PAGE);
 loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();
 setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
