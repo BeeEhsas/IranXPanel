@@ -72,6 +72,7 @@ PANEL_TITLE    = os.getenv("PANEL_TITLE", "IranX Panel")
 BOOTSTRAP_PASS = os.getenv("ADMIN_PASSWORD", "")
 
 DEVICE_WINDOW  = int(os.getenv("DEVICE_WINDOW", "300"))   # counts toward the device limit
+IP_WINDOW      = int(os.getenv("IP_WINDOW", "300"))       # counts toward the IP limit
 LIVE_WINDOW    = int(os.getenv("LIVE_WINDOW", "60"))      # shown as "connected right now"
 SESSION_IDLE   = int(os.getenv("SESSION_IDLE", "90"))     # xhttp session reaper
 
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS users (
     used_bytes   INTEGER DEFAULT 0,
     expire_at    INTEGER DEFAULT 0,
     device_limit INTEGER DEFAULT 1,
+    ip_limit     INTEGER DEFAULT 0,
     transport    TEXT    DEFAULT 'both',
     obfuscate    INTEGER DEFAULT 0,
     ech          INTEGER DEFAULT 0,
@@ -175,6 +177,12 @@ CREATE TABLE IF NOT EXISTS user_ips (
 -- client IP plus its User-Agent, so the same phone always lands on the same row and a
 -- second device (different app or different IP) gets its own. `device_limit` counts
 -- these rows inside DEVICE_WINDOW.
+--
+-- Device limit and IP limit are two independent gates:
+--   * device_limit identifies and registers every Nth device identity and only lets
+--     those devices connect (0 = unlimited);
+--   * ip_limit counts distinct source IPs observed in user_ips inside IP_WINDOW and
+--     refuses a brand-new IP once the limit is reached (0 = unlimited).
 CREATE TABLE IF NOT EXISTS devices (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL,
@@ -233,7 +241,8 @@ def migrate():
                         ("alpn", "TEXT DEFAULT ''"),
                         ("ech_value", "TEXT DEFAULT ''"),
                         ("obf_cs", "TEXT DEFAULT ''"),
-                        ("obf_fm", "TEXT DEFAULT ''")],
+                        ("obf_fm", "TEXT DEFAULT ''"),
+                        ("ip_limit", "INTEGER DEFAULT 0")],
               "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
               "clean_ips": [("country", "TEXT DEFAULT ''")],
               "proxies": [("country", "TEXT DEFAULT ''"),
@@ -556,6 +565,41 @@ def device_allowed(uid: int, dkey: str, limit: int) -> bool:
         known = c.execute("SELECT 1 FROM devices WHERE user_id=? AND dkey=? AND last_seen>?",
                           (uid, dkey, now() - DEVICE_WINDOW)).fetchone()
     return bool(known) or active_devices(uid) < limit
+
+
+def active_ips(uid: int, window: Optional[int] = None) -> int:
+    """Distinct source IPs seen inside a window. Defaults to the IP enforcement window."""
+    w = IP_WINDOW if window is None else window
+    with db() as c:
+        r = c.execute("SELECT COUNT(*) n FROM user_ips WHERE user_id=? AND last_seen>?",
+                      (uid, now() - w)).fetchone()
+    return r["n"] if r else 0
+
+
+def live_ips(uid: int) -> int:
+    return active_ips(uid, LIVE_WINDOW)
+
+
+def touch_ip(uid: int, ip: str, proto: str):
+    """Record the source IP: user_ips keeps only the raw IP identity of a connection."""
+    if not (ip or "").strip():
+        return
+    with db() as c:
+        c.execute("""INSERT INTO user_ips(user_id,ip,proto,first_seen,last_seen,hits)
+                     VALUES(?,?,?,?,?,1)
+                     ON CONFLICT(user_id,ip) DO UPDATE
+                     SET last_seen=excluded.last_seen, proto=excluded.proto, hits=hits+1""",
+                  (uid, ip, proto, now(), now()))
+
+
+def ip_allowed(uid: int, ip: str, limit: int) -> bool:
+    """A known IP always passes; a brand-new one only while a slot is free."""
+    if limit <= 0:
+        return True
+    with db() as c:
+        known = c.execute("SELECT 1 FROM user_ips WHERE user_id=? AND ip=? AND last_seen>?",
+                          (uid, ip, now() - IP_WINDOW)).fetchone()
+    return bool(known) or active_ips(uid) < limit
 
 
 def transport_allowed(row, proto: str) -> bool:
@@ -1117,6 +1161,9 @@ def authorize(uid_str: str, ip: str, proto: str, ua: str = ""):
     if not device_allowed(row["id"], dkey, row["device_limit"]):
         return None, "device limit"
     touch_device(row["id"], dkey, ip, ua, proto)
+    if not ip_allowed(row["id"], ip, row["ip_limit"]):
+        return None, "ip limit"
+    touch_ip(row["id"], ip, proto)
     return row, None
 
 
@@ -2161,6 +2208,8 @@ def row_out(r) -> dict:
     d = dict(r)
     d["devices_now"] = active_devices(r["id"])
     d["devices_live"] = live_devices(r["id"])
+    d["ips_now"] = active_ips(r["id"])
+    d["ips_live"] = live_ips(r["id"])
     ok, reason = user_status(r)
     d["active"], d["status"] = ok, reason
     return d
@@ -2187,6 +2236,7 @@ class UserIn(BaseModel):
     quota_gb: float = 0
     expire_days: int = 0
     device_limit: int = 1
+    ip_limit: int = 0
     transport: str = "both"
     note: str = ""
     enabled: bool = True
@@ -2204,6 +2254,7 @@ class UserPatch(BaseModel):
     quota_gb: Optional[float] = None
     expire_days: Optional[int] = None
     device_limit: Optional[int] = None
+    ip_limit: Optional[int] = None
     transport: Optional[str] = None
     note: Optional[str] = None
     enabled: Optional[bool] = None
@@ -2342,12 +2393,12 @@ async def create_user(body: UserIn, _=Depends(require_admin)):
         with db() as c:
             cur = c.execute(
                 """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
-                                     used_bytes,expire_at,device_limit,transport,
+                                     used_bytes,expire_at,device_limit,ip_limit,transport,
                                      obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,created_at)
-                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (name, str(uuid.uuid4()), secrets.token_urlsafe(16), body.note,
                  1 if body.enabled else 0, int(body.quota_gb * GB), expire,
-                 max(0, body.device_limit), tr,
+                 max(0, body.device_limit), max(0, body.ip_limit), tr,
                  1 if body.obfuscate else 0,
                  1 if body.ech else 0,
                  _pick_choice(body.fp, FINGERPRINTS, "unsafe"),
@@ -2380,6 +2431,8 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
             vals.append(now() + body.expire_days * 86400 if body.expire_days > 0 else 0)
         if body.device_limit is not None:
             sets.append("device_limit=?"); vals.append(max(0, body.device_limit))
+        if body.ip_limit is not None:
+            sets.append("ip_limit=?"); vals.append(max(0, body.ip_limit))
         if body.transport is not None:
             tr = body.transport.lower()
             if tr not in TRANSPORTS:
@@ -2463,12 +2516,22 @@ async def delete_device(uid: int, did: int, _=Depends(require_admin)):
     return {"ok": True}
 
 
+@app.delete("/api/users/{uid}/ips/{ip_id}")
+async def delete_ip(uid: int, ip_id: int, _=Depends(require_admin)):
+    """Forget one recorded source IP so it frees an IP-limit slot."""
+    with db() as c:
+        c.execute("DELETE FROM user_ips WHERE id=? AND user_id=?", (ip_id, uid))
+    return {"ok": True}
+
+
 @app.get("/api/users/{uid}/ips")
 async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
     """Live view by default: only devices still connected. history=1 returns everything."""
     live_cut = now() - LIVE_WINDOW
     count_cut = now() - DEVICE_WINDOW
+    ip_cut = now() - IP_WINDOW
     cols = "id,dkey,ip,ua,client,platform,proto,first_seen,last_seen,hits"
+    ip_cols = "id,ip,proto,first_seen,last_seen,hits"
     with db() as c:
         if history:
             rows = c.execute(f"""SELECT {cols} FROM devices
@@ -2480,7 +2543,20 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
                                  ORDER BY last_seen DESC""", (uid, live_cut)).fetchall()
         total = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=?",
                           (uid,)).fetchone()["n"]
-        urow = c.execute("SELECT device_limit FROM users WHERE id=?", (uid,)).fetchone()
+        # The IP limit is a separate gate from the device identity one, so the raw
+        # source addresses are returned alongside the device list.
+        if history:
+            iprows = c.execute(f"""SELECT {ip_cols} FROM user_ips
+                                   WHERE user_id=? ORDER BY last_seen DESC LIMIT 200""",
+                               (uid,)).fetchall()
+        else:
+            iprows = c.execute(f"""SELECT {ip_cols} FROM user_ips
+                                   WHERE user_id=? AND last_seen>?
+                                   ORDER BY last_seen DESC""", (uid, live_cut)).fetchall()
+        ip_total = c.execute("SELECT COUNT(*) n FROM user_ips WHERE user_id=?",
+                             (uid,)).fetchone()["n"]
+        urow = c.execute("SELECT device_limit, ip_limit FROM users WHERE id=?",
+                         (uid,)).fetchone()
     return {
         "live": live_devices(uid),
         "counted": active_devices(uid),
@@ -2488,6 +2564,10 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
         "limit": (urow["device_limit"] if urow else 0),
         "live_window": LIVE_WINDOW,
         "device_window": DEVICE_WINDOW,
+        "ip_limit": (urow["ip_limit"] if urow else 0),
+        "ip_counted": active_ips(uid),
+        "ip_total_seen": ip_total,
+        "ip_window": IP_WINDOW,
         "history": bool(history),
         "rows": [
             {**dict(r),
@@ -2495,6 +2575,12 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
              "online": r["last_seen"] > live_cut,
              "counted": r["last_seen"] > count_cut}
             for r in rows
+        ],
+        "ip_rows": [
+            {**dict(r),
+             "online": r["last_seen"] > live_cut,
+             "counted": r["last_seen"] > ip_cut}
+            for r in iprows
         ],
     }
 
@@ -2843,17 +2929,17 @@ async def delete_proxy(pid: int, _=Depends(require_admin)):
 # lands or the database is left exactly as it was.
 
 BACKUP_FORMAT = "iranx-panel-backup"
-BACKUP_VERSION = 5          # v1 no proxies, v2 no obfuscate, v3 no ech/fp/alpn, v5 no custom ech/obf
+BACKUP_VERSION = 6          # v1 no proxies, v2 no obfuscate, v3 no ech/fp/alpn, v5 no custom ech/obf, v6 no ip_limit
 
 # Runtime settings that live in the environment, not the database. They are recorded for
 # reference and shown on restore, because a new host needs them set by hand — the panel
 # cannot rewrite its own platform variables.
 ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
-            "DEVICE_WINDOW", "LIVE_WINDOW", "SESSION_IDLE", "PANEL_TITLE",
+            "DEVICE_WINDOW", "IP_WINDOW", "LIVE_WINDOW", "SESSION_IDLE", "PANEL_TITLE",
             "KEEPALIVE", "KEEPALIVE_MINUTES")
 
 USER_FIELDS = ("name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
-               "used_bytes", "expire_at", "device_limit", "transport",
+               "used_bytes", "expire_at", "device_limit", "ip_limit", "transport",
                "obfuscate", "ech", "fp", "alpn", "ech_value", "obf_cs", "obf_fm",
                "created_at")
 CIP_FIELDS = ("address", "remark", "country", "enabled", "added_at")
@@ -2882,6 +2968,7 @@ def current_env() -> dict:
         "XHTTP_PATH": XHTTP_PATH,
         "XHTTP_MODE": XHTTP_MODE,
         "DEVICE_WINDOW": str(DEVICE_WINDOW),
+        "IP_WINDOW": str(IP_WINDOW),
         "LIVE_WINDOW": str(LIVE_WINDOW),
         "SESSION_IDLE": str(SESSION_IDLE),
         "PANEL_TITLE": PANEL_TITLE,
@@ -2991,6 +3078,8 @@ def _clean_user(u: dict) -> Optional[dict]:
         "used_bytes": num("used_bytes"),
         "expire_at": num("expire_at"),
         "device_limit": num("device_limit", 1),
+        # Missing in v5 (and older) backups: 0 = unlimited IPs.
+        "ip_limit": num("ip_limit", 0),
         "transport": tr if tr in TRANSPORTS else "both",
         # Missing in v2 backups: default off, exactly like a fresh user.
         "obfuscate": 1 if u.get("obfuscate") else 0,
@@ -3103,12 +3192,12 @@ def apply_backup(payload: dict, mode: str = "merge",
                 conn.execute(
                     """UPDATE users SET name=?, uuid=?, sub_token=?, note=?, enabled=?,
                            quota_bytes=?, used_bytes=?, expire_at=?, device_limit=?,
-                           transport=?, obfuscate=?, ech=?, fp=?, alpn=?,
+                           ip_limit=?, transport=?, obfuscate=?, ech=?, fp=?, alpn=?,
                            ech_value=?, obf_cs=?, obf_fm=?,
                            created_at=? WHERE id=?""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
-                     u["device_limit"], u["transport"], u["obfuscate"],
+                     u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
                      u["ech"], u["fp"], u["alpn"],
                      u["ech_value"], u["obf_cs"], u["obf_fm"],
                      u["created_at"], existing["id"]))
@@ -3117,13 +3206,13 @@ def apply_backup(payload: dict, mode: str = "merge",
             try:
                 conn.execute(
                     """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
-                                         used_bytes,expire_at,device_limit,transport,
+                                         used_bytes,expire_at,device_limit,ip_limit,transport,
                                          obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
                                          created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
-                     u["device_limit"], u["transport"], u["obfuscate"],
+                     u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
                      u["ech"], u["fp"], u["alpn"],
                      u["ech_value"], u["obf_cs"], u["obf_fm"],
                      u["created_at"]))
@@ -3133,13 +3222,13 @@ def apply_backup(payload: dict, mode: str = "merge",
                 try:
                     conn.execute(
                         """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
-                                             used_bytes,expire_at,device_limit,transport,
+                                             used_bytes,expire_at,device_limit,ip_limit,transport,
                                              obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
                                              created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (u["name"], u["uuid"], secrets.token_urlsafe(16), u["note"],
                          u["enabled"], u["quota_bytes"], u["used_bytes"], u["expire_at"],
-                         u["device_limit"], u["transport"], u["obfuscate"],
+                         u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
                          u["ech"], u["fp"], u["alpn"],
                          u["ech_value"], u["obf_cs"], u["obf_fm"],
                          u["created_at"]))
@@ -3354,6 +3443,8 @@ async def stats(_=Depends(require_admin)):
                         (now() - LIVE_WINDOW,)).fetchone()
         lu = c.execute("SELECT COUNT(DISTINCT user_id) n FROM devices WHERE last_seen>?",
                        (now() - LIVE_WINDOW,)).fetchone()
+        ipt = c.execute("SELECT COUNT(*) n FROM user_ips WHERE last_seen>?",
+                        (now() - IP_WINDOW,)).fetchone()
         cip = c.execute("SELECT COUNT(*) n FROM clean_ips WHERE enabled=1").fetchone()
         byp = c.execute("SELECT proto, COUNT(*) n FROM devices WHERE last_seen>? "
                         "GROUP BY proto", (now() - DEVICE_WINDOW,)).fetchall()
@@ -3362,13 +3453,14 @@ async def stats(_=Depends(require_admin)):
                            (now() - 86400,)).fetchall()
     return {"users": tot["n"], "active_users": act["n"], "online_users": onl["n"],
             "live_users": lu["n"], "online_devices": dev["n"], "live_devices": liv["n"],
+            "counted_ips": ipt["n"],
             "total_bytes": tot["b"], "clean_ips": cip["n"],
             "by_proto": {r["proto"]: r["n"] for r in byp},
             "xhttp_sessions": len(SESSIONS),
             "series": [dict(r) for r in series],
             "ws_path": WS_PATH, "xhttp_path": XHTTP_PATH,
             "xhttp_mode": XHTTP_MODE,
-            "device_window": DEVICE_WINDOW, "live_window": LIVE_WINDOW,
+            "device_window": DEVICE_WINDOW, "ip_window": IP_WINDOW, "live_window": LIVE_WINDOW,
             "keepalive": KEEPALIVE, "keepalive_mins": KEEPALIVE_MINS,
             "relay_domain": RELAY_DOMAIN}
 
@@ -4028,6 +4120,8 @@ def render_sub_page(
     transport: str = "both",
     device_limit: int = 0,
     devices_now: int = 0,
+    ip_limit: int = 0,
+    ips_now: int = 0,
     panel_url: str = "",
     update_interval: int = 12,
 ) -> str:
@@ -4065,6 +4159,8 @@ def render_sub_page(
         "remainHours": remain_secs % 86400 // 3600,
         "deviceLimit": int(device_limit or 0),
         "devicesNow": int(devices_now or 0),
+        "ipLimit": int(ip_limit or 0),
+        "ipsNow": int(ips_now or 0),
         "updateInterval": int(update_interval or 12),
         "configs": cfgs,
         "allConfigs": "\n".join(c["uri"] for c in cfgs if c["uri"]),
@@ -4206,6 +4302,7 @@ transition:.2s;pointer-events:none;text-align:center}
         <div class="stat"><b id="sRemain">—</b><span id="lRemain"></span></div>
         <div class="stat"><b id="sDays">—</b><span id="lDays"></span></div>
         <div class="stat"><b id="sDev">—</b><span id="lDev"></span></div>
+        <div class="stat"><b id="sIp">—</b><span id="lIp"></span></div>
       </div>
       <div class="bar" id="bar"><i style="width:0%"></i></div>
       <div class="meta"><span id="mUsed">—</span><span id="mQuota">—</span></div>
@@ -4240,7 +4337,7 @@ const esc = (s)=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&
 /* ── i18n ── */
 const T = {
   fa:{brand:"IranX · اشتراک من", remainVol:"حجم باقی‌مانده", remainTime:"زمان باقی‌مانده",
-    devices:"دستگاه مجاز", used:"مصرف‌شده", total:"کل", copySub:"کپی لینک اشتراک",
+    devices:"دستگاه مجاز", ipAddr:"آی‌پی مجاز", used:"مصرف‌شده", total:"کل", copySub:"کپی لینک اشتراک",
     copyAll:"کپی همه کانفیگ‌ها", addTo:"افزودن به", configs:"کانفیگ‌ها", downloads:"دانلود برنامه‌ها",
     noConfigs:"کانفیگ فعالی وجود ندارد.", showQr:"نمایش QR", copyCfg:"کپی کانفیگ",
     scanHint:"با دوربین برنامه اسکن کنید<br>تا اشتراک خودکار اضافه شود",
@@ -4252,7 +4349,7 @@ const T = {
     importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گزینهٔ Add from clipboard را بزنید",
     allVersions:"همه نسخه‌ها", theme:"تم", light:"روشن", dark:"تیره", subName:"اشتراک"},
   en:{brand:"IranX · My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
-    devices:"Devices", used:"Used", total:"Total", copySub:"Copy subscription link",
+    devices:"Devices", ipAddr:"Allowed IPs", used:"Used", total:"Total", copySub:"Copy subscription link",
     copyAll:"Copy all configs", addTo:"Add to", configs:"Configs", downloads:"Download apps",
     noConfigs:"No active config.", showQr:"Show QR", copyCfg:"Copy config",
     scanHint:"Scan with your client app<br>to add the subscription",
@@ -4348,11 +4445,13 @@ function render(){
   $("#lRemain").textContent = t("remainVol");
   $("#lDays").textContent = t("remainTime");
   $("#lDev").textContent = t("devices");
+  $("#lIp").textContent = t("ipAddr");
   $("#sRemain").textContent = D.quota ? D.remainText : t("unlimited");
   $("#sDays").textContent = D.expireAt
     ? (D.remainDays > 0 ? num(D.remainDays)+" "+t("days") : num(D.remainHours)+" "+t("hours"))
     : t("unlimited");
   $("#sDev").textContent = D.deviceLimit ? num(D.devicesNow)+" / "+num(D.deviceLimit) : t("unlimited");
+  $("#sIp").textContent = D.ipLimit ? num(D.ipsNow)+" / "+num(D.ipLimit) : t("unlimited");
   $("#mUsed").textContent = t("used")+": "+D.usedText;
   $("#mQuota").textContent = t("total")+": "+D.quotaText;
   $("#bar").firstElementChild.style.width = (D.quota ? D.pct : 0) + "%";
@@ -4436,6 +4535,8 @@ async def subscription(token: str, request: Request):
             transport=row["transport"],
             device_limit=row["device_limit"],
             devices_now=active_devices(row["id"]),
+            ip_limit=row["ip_limit"],
+            ips_now=active_ips(row["id"]),
             panel_url=("https" + "://") + origin_domain(request) + "/",
         ))
 
@@ -4721,22 +4822,23 @@ const I18N={
   traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'سشن‌های XHTTP',liveTitle:'اتصالات زنده',liveEmpty:'هیچ اتصالی فعال نیست',
   chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تقسیم بر اساس ترنسپورت',
   newUser:'ساخت کاربر جدید',users:'کاربران',
-  name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',
+  name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',ipLimit:'تعداد آی‌پی',
   transport:'ترنسپورت',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 هر دو',
-  add:'افزودن',zeroInf:'۰ = بی‌نهایت. هر دستگاه از روی IP و User-Agent کلاینت شناسایی و ثبت می‌شود؛ «تعداد دستگاه» یعنی چند دستگاه هم‌زمان مجاز است.',
+  add:'افزودن',zeroInf:'۰ = بی‌نهایت. «تعداد دستگاه» هر دستگاه را از روی IP و User-Agent کلاینت شناسایی و ثبت می‌کند و فقط همان دستگاه‌ها اجازه اتصال دارند؛ «تعداد آی‌پی» جداست و روی آدرس‌های متمایز اعمال می‌شود.',
   search:'جستجو…',noUsers:'کاربری نیست',
-  config:'کانفیگ',ipsBtn:'دستگاه‌ها',edit:'ویرایش',
+  config:'کانفیگ',ipsBtn:'دستگاه‌ها و آی‌پی‌ها',edit:'ویرایش',
   used:'مصرف',expiry:'انقضا',never:'بی‌نهایت',
   subLink:'لینک اشتراک (Subscription)',copySub:'کپی لینک اشتراک',
   singleCfg:'کانفیگ‌های تکی',copy:'کپی',copied:'کپی شد ✓',
   devTitle:'دستگاه‌های متصل',noConn:'هنوز اتصالی ثبت نشده',
-  clearIps:'پاک کردن همه دستگاه‌ها',delDevice:'حذف دستگاه',delDeviceWarn:'این دستگاه از لیست حذف شود؟ (یک جای خالی آزاد می‌شود)',unknownClient:'ناشناس',devLimitLbl:'مجاز',onlineTag:'آنلاین',offlineTag:'آفلاین',
+  clearIps:'پاک کردن دستگاه‌ها و آی‌پی‌ها',delDevice:'حذف دستگاه',delDeviceWarn:'این دستگاه از لیست حذف شود؟ (یک جای خالی آزاد می‌شود)',unknownClient:'ناشناس',devLimitLbl:'مجاز',onlineTag:'آنلاین',offlineTag:'آفلاین',
+  devSec:'دستگاه‌ها',ipSec:'آی‌پی‌ها',ipCounted:'آی‌پی‌های شمرده‌شده',ipsTotal:'کل آی‌پی‌های دیده‌شده',delIp:'حذف آی‌پی',delIpWarn:'این آی‌پی از لیست حذف شود؟ (یک جای خالی آزاد می‌شود)',
   liveNow:'الان متصل',noneNow:'همین الان هیچ دستگاهی متصل نیست',
   countedFor:'شمرده‌شده برای محدودیت',totalSeen:'کل دستگاه‌های دیده‌شده',
   showHistory:'نمایش تاریخچه',showLive:'نمایش فقط متصل‌ها',
   inLast:'در %s ثانیه اخیر',refresh:'به‌روزرسانی',
   liveDevices:'دستگاه‌های فعال الان',
-  editUser:'ویرایش',remainDays:'مدت باقی‌مانده (روز)',allowedDev:'تعداد دستگاه مجاز',
+  editUser:'ویرایش',remainDays:'مدت باقی‌مانده (روز)',allowedDev:'تعداد دستگاه مجاز',allowedIp:'تعداد آی‌پی مجاز',
   active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
   customUuid:'UUID دستی',del:'حذف',
   obfLbl:'مبهم‌ساز (Fragment + Cipher mask)',
@@ -4819,6 +4921,7 @@ const I18N={
   relayLbl:'دامنه رله',keepAliveLbl:'جلوگیری از خواب',relayNone:'ندارد',
   onLbl:'فعال',offLbl:'خاموش',
   devWinLbl:'پنجره شمارش دستگاه',seconds:'ثانیه',
+  ipWinLbl:'پنجره شمارش آی‌پی',
   envNote:'این مقادیر از متغیرهای محیطی خوانده می‌شوند و در Railway قابل تغییرند.',
   logout:'خروج',logs:'رخدادها',noLogs:'رخدادی نیست',
   navFilter:'فیلتر سایت',
@@ -4858,22 +4961,23 @@ const I18N={
   traffic:'Total traffic',cleanIps:'Clean IPs',xSessions:'XHTTP sessions',liveTitle:'Live connections',liveEmpty:'No active connections',
   chart24:'Last 24 hours',protoSplit:'Split by transport',
   newUser:'Create user',users:'Users',
-  name:'Name',quota:'Quota (GB)',days:'Days',devLimit:'Devices',
+  name:'Name',quota:'Quota (GB)',days:'Days',devLimit:'Devices',ipLimit:'IPs',
   transport:'Transport',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 Both',
-  add:'Add',zeroInf:'0 = unlimited. Every device is identified and recorded from its IP and client User-Agent; "Devices" is how many may connect at once.',
+  add:'Add',zeroInf:'0 = unlimited. "Devices" identifies and registers every device from its IP and client User-Agent and only lets those devices connect; "IPs" is separate and counts distinct source addresses.',
   search:'Search…',noUsers:'No users yet',
-  config:'Config',ipsBtn:'Devices',edit:'Edit',
+  config:'Config',ipsBtn:'Devices & IPs',edit:'Edit',
   used:'Used',expiry:'Expires',never:'Never',
   subLink:'Subscription link',copySub:'Copy subscription link',
   singleCfg:'Individual configs',copy:'Copy',copied:'Copied ✓',
   devTitle:'Connected devices',noConn:'No connections recorded yet',
-  clearIps:'Clear all devices',delDevice:'Remove device',delDeviceWarn:'Remove this device from the list? (frees a slot)',unknownClient:'Unknown',devLimitLbl:'Allowed',onlineTag:'Online',offlineTag:'Offline',
+  clearIps:'Clear devices & IPs',delDevice:'Remove device',delDeviceWarn:'Remove this device from the list? (frees a slot)',unknownClient:'Unknown',devLimitLbl:'Allowed',onlineTag:'Online',offlineTag:'Offline',
+  devSec:'Devices',ipSec:'IP addresses',ipCounted:'IPs counted toward the limit',ipsTotal:'Total IPs ever seen',delIp:'Remove IP',delIpWarn:'Remove this IP from the list? (frees a slot)',
   liveNow:'Connected now',noneNow:'No device connected right now',
   countedFor:'Counted toward the limit',totalSeen:'Total devices ever seen',
   showHistory:'Show history',showLive:'Show only connected',
   inLast:'in the last %ss',refresh:'Refresh',
   liveDevices:'Devices live now',
-  editUser:'Edit',remainDays:'Days remaining',allowedDev:'Allowed devices',
+  editUser:'Edit',remainDays:'Days remaining',allowedDev:'Allowed devices',allowedIp:'Allowed IPs',
   active:'Enabled',saveBtn:'Save',resetTraffic:'Reset traffic',newUuid:'New UUID',
   customUuid:'Custom UUID',del:'Delete',
   obfLbl:'Obfuscation (Fragment + Cipher mask)',
@@ -4957,6 +5061,7 @@ const I18N={
   relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
   onLbl:'on',offLbl:'off',
   devWinLbl:'Device counting window',seconds:'seconds',
+  ipWinLbl:'IP counting window',
   envNote:'These come from environment variables and can be changed in Railway.',
   logout:'Sign out',logs:'Events',noLogs:'No events yet',
   navFilter:'Site filter',
@@ -5211,6 +5316,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
      <label class="fld"><span class="text-xs dim" data-t="quota"></span><input id="nQuota" type="number" step="0.5" value="30" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="days"></span><input id="nDays" type="number" value="30" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="devLimit"></span><input id="nDev" type="number" value="1" class="inp"></label>
+     <label class="fld"><span class="text-xs dim" data-t="ipLimit"></span><input id="nIp" type="number" value="0" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="transport"></span>
       <select id="nTr" class="inp"><option value="both"></option><option value="ws"></option><option value="xhttp"></option></select></label>
     </div>
@@ -5582,7 +5688,7 @@ function paintStatic(){
  bkMode.options[0].textContent=T('bkMerge');
  bkMode.options[1].textContent=T('bkReplace');
  nName.placeholder=T('name'); nQuota.placeholder=T('quota');
- nDays.placeholder=T('days'); nDev.placeholder=T('devLimit');
+ nDays.placeholder=T('days'); nDev.placeholder=T('devLimit'); nIp.placeholder=T('ipLimit');
  q.placeholder=T('search');
  nTr.options[0].textContent=T('trBoth');
  nTr.options[1].textContent=T('trWs');
@@ -5636,6 +5742,7 @@ function renderServer(){
   [T('xhPathLbl'),'/'+(stats.xhttp_path||'—')],
   [T('xhModeLbl'),stats.xhttp_mode||'—'],
   [T('devWinLbl'),(stats.device_window||'—')+' '+T('seconds')],
+  [T('ipWinLbl'),(stats.ip_window||'—')+' '+T('seconds')],
   [T('xSessions'),stats.xhttp_sessions??'—'],
   [T('relayLbl'),stats.relay_domain||T('relayNone')],
   [T('keepAliveLbl'),stats.keepalive?T('onLbl'):T('offLbl')],
@@ -5708,12 +5815,15 @@ function renderUsers(){
   const dev=u.device_limit?`${u.devices_now}/${u.device_limit}`:'∞';
   const liveTag=u.devices_live?`<span class="chip green">● ${u.devices_live}</span>`:'';
   const devWarn=u.device_limit&&u.devices_now>=u.device_limit;
+  const ipN=u.ip_limit?`${u.ips_now}/${u.ip_limit}`:'∞';
+  const ipWarn=u.ip_limit&&u.ips_now>=u.ip_limit;
+  const ipTag=u.ips_live?`<span class="chip green">● ${u.ips_live}</span>`:'';
   return `<div class="urow">
    <div class="u-av">${esc((u.name||'?').slice(0,1).toUpperCase())}</div>
    <div class="u-main">
     <div class="flex items-center gap-2 flex-wrap">
      <b class="text-base">${esc(u.name)}</b>${badge}
-     <span class="chip teal">${trTxt(u.transport)}</span>${liveTag}
+     <span class="chip teal">${trTxt(u.transport)}</span>${liveTag}${ipTag}
     </div>
     <div class="progress mt-2${pct>=85?' hot':''}"><i style="width:${pct}%"></i></div>
     <div class="flex flex-wrap gap-3 text-xs dim mt-1">
@@ -5721,7 +5831,10 @@ function renderUsers(){
      <span>${T('expiry')}: ${dt(u.expire_at)}</span>
     </div>
    </div>
-   <div class="u-dev" style="color:${devWarn?'var(--bad)':'var(--info)'}">📱 ${dev}</div>
+   <div class="u-dev">
+    <div style="color:${devWarn?'var(--bad)':'var(--info)'}">📱 ${dev}</div>
+    <div style="color:${ipWarn?'var(--bad)':'var(--info)'}">🌐 ${ipN}</div>
+   </div>
    <div class="u-actions">
     <button class="icon-btn" title="${T('config')}" onclick="showConfig(${u.id})">${ICO.cfg}</button>
     <button class="icon-btn" title="${T('ipsBtn')}" onclick="showIps(${u.id})">${ICO.ips}</button>
@@ -5761,6 +5874,7 @@ async function createUser(){
   await api('/api/users',{method:'POST',body:JSON.stringify({
    name:nName.value.trim(),quota_gb:parseFloat(nQuota.value||0),
    expire_days:parseInt(nDays.value||0),device_limit:parseInt(nDev.value||0),
+   ip_limit:parseInt(nIp.value||0),
    transport:nTr.value,obfuscate:nObf.checked,
    ech:nEch.checked,fp:nFp.value||'unsafe',alpn:nAlpn.value,
    ech_value:nEchVal.value.trim(),obf_cs:nObfCs.value.trim(),obf_fm:nObfFm.value.trim()})});
@@ -5985,12 +6099,25 @@ async function paintIps(quiet){
   </div>`).join('')
   : `<p class="text-xs dim" style="margin:0">${ipHistory?T('noConn'):T('noneNow')}</p>`;
 
+ const ipRows=d.ip_rows.length ? d.ip_rows.map(x=>`
+  <div class="lrow">
+   <span style="width:8px;height:8px;border-radius:50%;background:${x.online?'var(--ok)':(x.counted?'var(--info)':'var(--dim)')}"></span>
+   <div style="min-width:0;flex:1">
+    <div class="font-bold mono truncate">${esc(x.ip)}</div>
+    <div class="text-xs dim mono truncate">${esc(x.proto||'ws')}${x.hits?' · '+x.hits+'x':''}</div>
+   </div>
+   <span class="text-xs dim">${dt(x.last_seen)}</span>
+   <button class="icon-btn danger" title="${T('delIp')}" onclick="delIp(${ipUid},${x.id})">${ICO.del}</button>
+  </div>`).join('')
+  : `<p class="text-xs dim" style="margin:0">${ipHistory?T('noConn'):T('noneNow')}</p>`;
+
  const body=`
   <div class="soft" style="border-radius:12px;padding:16px;text-align:center">
    <p class="text-xs dim" style="margin:0">${T('liveNow')}</p>
    <p class="font-extrabold" style="font-size:34px;margin:4px 0 0;color:${d.live?'var(--ok)':'var(--dim)'}">${d.live}</p>
    <p class="text-xs dim" style="margin:0">${T('inLast').replace('%s',d.live_window)}</p>
   </div>
+  <b class="text-base">${T('devSec')}</b>
   <div class="g2 text-sm">
    <div class="kv"><span class="dim">${T('countedFor')}</span>
     <span class="ms-auto font-bold" style="color:var(--info)">${d.counted}${d.limit?' / '+d.limit:' / ∞'}</span></div>
@@ -5998,6 +6125,14 @@ async function paintIps(quiet){
     <span class="ms-auto font-bold">${d.total_seen}</span></div>
   </div>
   <div class="space-y-2">${rows}</div>
+  <b class="text-base">${T('ipSec')}</b>
+  <div class="g2 text-sm">
+   <div class="kv"><span class="dim">${T('ipCounted')}</span>
+    <span class="ms-auto font-bold" style="color:var(--info)">${d.ip_counted}${d.ip_limit?' / '+d.ip_limit:' / ∞'}</span></div>
+   <div class="kv"><span class="dim">${T('ipsTotal')}</span>
+    <span class="ms-auto font-bold">${d.ip_total_seen}</span></div>
+  </div>
+  <div class="space-y-2">${ipRows}</div>
   <button onclick="toggleIpHistory()" class="btn btn-soft w-full">
    ${ipHistory?T('showLive'):T('showHistory')}</button>
   <button onclick="clearIps(${ipUid})" class="btn btn-danger w-full">${T('clearIps')}</button>`;
@@ -6016,6 +6151,12 @@ async function delDevice(uid,did){
  catch(e){}
 }
 
+async function delIp(uid,iid){
+ if(!confirm(T('delIpWarn')))return;
+ try{await api('/api/users/'+uid+'/ips/'+iid,{method:'DELETE'});paintIps(true);loadUsers();loadStats();}
+ catch(e){}
+}
+
 function showEdit(id){
  const u=users.find(x=>x.id===id);
  const days=u.expire_at?Math.max(0,Math.ceil((u.expire_at-Date.now()/1000)/86400)):0;
@@ -6027,6 +6168,8 @@ function showEdit(id){
    <input id="eD" type="number" value="${days}" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('allowedDev')}</span>
    <input id="eV" type="number" value="${u.device_limit}" class="inp"></label>
+  <label class="fld"><span class="text-xs dim">${T('allowedIp')}</span>
+   <input id="eIp" type="number" value="${u.ip_limit}" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('transport')}</span>
    <select id="eT" class="inp">${opt('both')}${opt('ws')}${opt('xhttp')}</select></label>
   <label class="flex items-center gap-2"><input id="eObf" type="checkbox" ${u.obfuscate?'checked':''}> ${T('obfLbl')}</label>
@@ -6065,7 +6208,7 @@ async function saveEdit(id){
  try{
   const u=users.find(x=>x.id===id);
   const payload={quota_gb:parseFloat(eQ.value||0),expire_days:parseInt(eD.value||0),
-   device_limit:parseInt(eV.value||0),transport:eT.value,enabled:eE.checked,
+   device_limit:parseInt(eV.value||0),ip_limit:parseInt(eIp.value||0),transport:eT.value,enabled:eE.checked,
    obfuscate:eObf.checked,ech:eEch.checked,
    fp:eFp.value||'unsafe',alpn:eFpAlpn.value,
    ech_value:eEchVal.value.trim(),obf_cs:eObfCs.value.trim(),obf_fm:eObfFm.value.trim()};
