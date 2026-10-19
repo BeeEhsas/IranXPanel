@@ -43,7 +43,7 @@ import struct
 import socket
 import sqlite3
 import ipaddress
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlencode
 from contextlib import asynccontextmanager
 from typing import Optional, Callable, Awaitable, Any
 
@@ -132,6 +132,8 @@ CREATE TABLE IF NOT EXISTS users (
     ech_value    TEXT    DEFAULT '',
     obf_cs       TEXT    DEFAULT '',
     obf_fm       TEXT    DEFAULT '',
+    reset_days   INTEGER DEFAULT 0,
+    last_reset   INTEGER DEFAULT 0,
     created_at   INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS clean_ips (
@@ -242,7 +244,9 @@ def migrate():
                         ("ech_value", "TEXT DEFAULT ''"),
                         ("obf_cs", "TEXT DEFAULT ''"),
                         ("obf_fm", "TEXT DEFAULT ''"),
-                        ("ip_limit", "INTEGER DEFAULT 0")],
+                        ("ip_limit", "INTEGER DEFAULT 0"),
+                        ("reset_days", "INTEGER DEFAULT 0"),
+                        ("last_reset", "INTEGER DEFAULT 0")],
               "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
               "clean_ips": [("country", "TEXT DEFAULT ''")],
               "proxies": [("country", "TEXT DEFAULT ''"),
@@ -471,6 +475,64 @@ def user_status(row) -> tuple[bool, str]:
     if row["quota_bytes"] and row["used_bytes"] >= row["quota_bytes"]:
         return False, "quota"
     return True, "ok"
+
+
+def apply_auto_reset(uid: int, reset_days: int, last_reset: int) -> bool:
+    """Zero a user's usage counter once its reset cycle has fully elapsed.
+
+    reset_days == 0 means the feature is off for that user. last_reset is the
+    anchor of the current cycle (set when the cycle is chosen or the usage is
+    reset by hand), so a 30-day cycle always starts on the day it was enabled.
+    """
+    try:
+        reset_days = int(reset_days or 0)
+        last_reset = int(last_reset or 0)
+    except (TypeError, ValueError):
+        return False
+    if reset_days <= 0:
+        return False
+    if not last_reset:                     # safety net: start the first cycle now
+        with db() as c:
+            c.execute("UPDATE users SET last_reset=? WHERE id=?", (now(), uid))
+        return False
+    if now() - last_reset < reset_days * 86400:
+        return False
+    with db() as c:
+        c.execute("UPDATE users SET used_bytes=0, last_reset=? WHERE id=?",
+                  (now(), uid))
+    audit("auto_reset", "", f"user {uid} · {reset_days}d cycle")
+    return True
+
+
+def maybe_auto_reset(row):
+    """Run the auto-reset check for one user row; returns a fresh row if it fired."""
+    try:
+        rd, lr = row["reset_days"], row["last_reset"]
+    except (IndexError, KeyError):
+        return row
+    if not rd:
+        return row
+    if now() - (lr or 0) < rd * 86400:
+        return row
+    if apply_auto_reset(row["id"], rd, lr):
+        with db() as c:
+            fresh = c.execute("SELECT * FROM users WHERE id=?",
+                              (row["id"],)).fetchone()
+        return fresh or row
+    return row
+
+
+async def resetter():
+    """Hourly sweep so usage cycles fire even when a user never reconnects."""
+    while True:
+        try:
+            with db() as c:
+                rows = c.execute("SELECT * FROM users WHERE reset_days>0").fetchall()
+            for r in rows:
+                maybe_auto_reset(r)
+        except Exception as e:
+            print("resetter error:", e)
+        await asyncio.sleep(3600)
 
 
 # ── device fingerprinting ──
@@ -1152,6 +1214,7 @@ def authorize(uid_str: str, ip: str, proto: str, ua: str = ""):
     row = lookup_user(uid_str)
     if not row:
         return None, "unknown uuid"
+    row = maybe_auto_reset(row)
     ok, reason = user_status(row)
     if not ok:
         return None, reason
@@ -1620,6 +1683,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(flusher()),
         asyncio.create_task(reaper()),
         asyncio.create_task(keepalive()),
+        asyncio.create_task(resetter()),
+        asyncio.create_task(tg_autobackup()),
     ]
     yield
     for t in tasks:
@@ -2204,7 +2269,251 @@ def build_info_lines(row, host: str) -> list[str]:
     return [info_uri(clean_label(info_label(row)), host)]
 
 
+# ───────────── subscription container formats: Clash / sing-box ─────────────
+#
+# The classic subscription is a base64 list of vless:// URIs, which v2ray-family
+# clients understand. Clash.Meta (mihomo) and sing-box need their own container,
+# so the same generated configs are re-expressed here. The vless URIs the panel
+# itself issued are parsed back into their parts — no second source of truth,
+# so flags, labels, clean-IP routes and proxy routes stay identical everywhere.
+
+def parse_vless_uri(uri: str) -> Optional[dict]:
+    """Split one of our own vless:// URIs into its parts, or None if not ours."""
+    try:
+        rest = uri[len("vless://"):]
+        frag = ""
+        if "#" in rest:
+            rest, frag = rest.split("#", 1)
+        userinfo, hostpart = rest.split("@", 1)
+        q = {}
+        if "?" in hostpart:
+            hostpart, query = hostpart.split("?", 1)
+            for kv in query.split("&"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    q[k] = unquote(v)
+        addr, port = hostpart.rsplit(":", 1)
+        return {"uuid": userinfo,
+                "address": addr,
+                "port": int(port),
+                "sni": q.get("sni", ""),
+                "host": q.get("host", ""),
+                "path": q.get("path", ""),
+                "net": q.get("type", "ws"),
+                "mode": q.get("mode", "auto"),
+                "fp": q.get("fp", ""),
+                "alpn": [a for a in q.get("alpn", "").split(",") if a],
+                "name": unquote(frag)}
+    except Exception:
+        return None
+
+
+def _config_proxies(configs) -> list[dict]:
+    """Parsed vless URIs from build_configs(), minus the INFO placeholder."""
+    out, seen = [], set()
+    for c in configs or []:
+        p = parse_vless_uri(c.get("uri", "") or "")
+        if not p or p["uuid"] == INFO_UUID or not p["name"]:
+            continue
+        if p["name"] in seen:
+            continue
+        seen.add(p["name"])
+        out.append(p)
+    return out
+
+
+def _xhttp_mode(mode: str) -> str:
+    return mode if mode in ("auto", "packet-up", "stream-up") else "auto"
+
+
+def _clash_proxies(configs) -> list[dict]:
+    """Map parsed configs to Clash.Meta (mihomo) vless proxy dicts."""
+    out = []
+    for p in _config_proxies(configs):
+        pr = {"name": p["name"], "type": "vless", "server": p["address"],
+              "port": p["port"], "uuid": p["uuid"], "udp": True, "tls": True,
+              "servername": p["sni"] or p["host"]}
+        if p["fp"] and p["fp"] != "unsafe":
+            pr["client-fingerprint"] = p["fp"]
+        if p["alpn"]:
+            pr["alpn"] = p["alpn"]
+        if p["net"] == "xhttp":
+            pr["network"] = "xhttp"
+            pr["xhttp-opts"] = {"path": p["path"] or "/", "mode": _xhttp_mode(p["mode"])}
+        else:
+            pr["network"] = "ws"
+            pr["ws-opts"] = {"path": p["path"] or "/"}
+            if p["host"]:
+                pr["ws-opts"]["headers"] = {"Host": p["host"]}
+        out.append(pr)
+    return out
+
+
+def _yaml_str(v) -> str:
+    s = str(v)
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _clash_yaml_line(key: str, v, indent: str = "    ") -> str:
+    if isinstance(v, bool) or isinstance(v, int):
+        return f"{indent}{key}: {str(v).lower() if isinstance(v, bool) else v}"
+    return f"{indent}{key}: {_yaml_str(v)}"
+
+
+def _clash_yaml(proxies: list[dict]) -> str:
+    """Hand-rolled emitter: a fixed schema of scalars, lists and one-level maps.
+
+    Every string is double-quoted and escaped, so emoji flags, Persian names and
+    URLs land in the file exactly as generated — no PyYAML dependency needed.
+    """
+    names = [p["name"] for p in proxies]
+    group = "\U0001f680 IranX"
+    auto = "\u26a1 Auto"
+    lines = [
+        "# IranX Panel — Clash.Meta / mihomo configuration (auto-generated)",
+        "# Keep this subscription URL private: it carries your account.",
+        "mixed-port: 7890",
+        "allow-lan: false",
+        "mode: rule",
+        "log-level: warning",
+        "unified-delay: true",
+        "tcp-concurrent: true",
+        "proxies:",
+    ]
+    for p in proxies:
+        lines.append("  - " + _clash_yaml_line("name", p["name"]).strip())
+        for k in ("type", "server", "port", "uuid", "udp", "tls", "servername",
+                  "client-fingerprint", "network"):
+            if k in p:
+                lines.append(_clash_yaml_line(k, p[k]))
+        if "alpn" in p:
+            lines.append("    alpn: [" + ", ".join(_yaml_str(a) for a in p["alpn"]) + "]")
+        if "ws-opts" in p:
+            lines.append("    ws-opts:")
+            lines.append(_clash_yaml_line("path", p["ws-opts"]["path"], indent="      "))
+            if "headers" in p["ws-opts"]:
+                lines.append("      headers:")
+                for hk, hv in p["ws-opts"]["headers"].items():
+                    lines.append(_clash_yaml_line(hk, hv, indent="        "))
+        if "xhttp-opts" in p:
+            lines.append("    xhttp-opts:")
+            lines.append(_clash_yaml_line("path", p["xhttp-opts"]["path"], indent="      "))
+            lines.append(_clash_yaml_line("mode", p["xhttp-opts"]["mode"], indent="      "))
+    if not proxies:
+        lines.append("  []")
+    lines += [
+        "proxy-groups:",
+        "  - name: " + _yaml_str(group),
+        "    type: select",
+        "    proxies:",
+    ]
+    lines += ["      - " + _yaml_str(n) for n in names]
+    lines.append("      - DIRECT")
+    if proxies:
+        lines += [
+            "  - name: " + _yaml_str(auto),
+            "    type: url-test",
+            "    url: " + _yaml_str("http://www.gstatic.com/generate_204"),
+            "    interval: 300",
+            "    tolerance: 80",
+            "    proxies:",
+        ]
+        lines += ["      - " + _yaml_str(n) for n in names]
+    lines += [
+        "rules:",
+        "  - MATCH," + group,
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _singbox_outbound(p: dict) -> dict:
+    """Map one parsed config to a sing-box vless outbound."""
+    ob = {"type": "vless", "tag": p["name"], "server": p["address"],
+          "server_port": p["port"], "uuid": p["uuid"]}
+    tls = {"enabled": True, "server_name": p["sni"] or p["host"], "insecure": False}
+    if p["alpn"]:
+        tls["alpn"] = p["alpn"]
+    if p["fp"] and p["fp"] != "unsafe":
+        tls["utls"] = {"enabled": True, "fingerprint": p["fp"]}
+    ob["tls"] = tls
+    if p["net"] == "xhttp":
+        ob["transport"] = {"type": "xhttp", "path": p["path"] or "/",
+                           "mode": _xhttp_mode(p["mode"])}
+    else:
+        tr = {"type": "ws", "path": p["path"] or "/"}
+        if p["host"]:
+            tr["headers"] = {"Host": p["host"]}
+        ob["transport"] = tr
+    return ob
+
+
+def _singbox_config(configs, title: str) -> dict:
+    """A complete, standalone sing-box config around the user's outbounds.
+
+    Kept intentionally small: one mixed inbound, a selector on top of the user's
+    nodes, and a direct fallback. Apps that import subscriptions (Hiddify,
+    Karing, Happ…) pick the outbounds; a bare sing-box run uses the file as-is.
+    """
+    nodes = [_singbox_outbound(p) for p in _config_proxies(configs)]
+    # Tags must be unique for the selector to stay valid.
+    seen, tags = {}, []
+    for n in nodes:
+        tag, i = n["tag"], 2
+        while tag in seen:
+            tag = f"{n['tag']} #{i}"
+            i += 1
+        n["tag"] = tag
+        seen[tag] = True
+        tags.append(tag)
+    if tags:
+        outbounds = ([{"type": "selector", "tag": "IranX",
+                       "outbounds": tags + ["direct"],
+                       "default": tags[0]}]
+                     + nodes + [{"type": "direct", "tag": "direct"}])
+        final = "IranX"
+    else:
+        outbounds = [{"type": "direct", "tag": "direct"}]
+        final = "direct"
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": [{"type": "mixed", "tag": "mixed-in",
+                      "listen": "127.0.0.1", "listen_port": 2080}],
+        "outbounds": outbounds,
+        "route": {"rules": [], "final": final},
+    }
+
+
+def _sub_headers(row, request: Request) -> dict:
+    """Header block shared by every subscription container format."""
+    return {
+        "profile-title": "base64:" + base64.b64encode(
+            clean_label(row["name"]).encode()).decode(),
+        "profile-update-interval": "12",
+        "profile-web-page-url": f"https://{origin_domain(request)}/",
+        "subscription-userinfo":
+            f"upload=0; download={row['used_bytes']}; "
+            f"total={row['quota_bytes']}; expire={row['expire_at']}",
+    }
+
+
+def sub_response_clash(row, d, ips, request: Request) -> PlainTextResponse:
+    ok, _reason = user_status(row)
+    h = _sub_headers(row, request)
+    h["content-type"] = "text/yaml; charset=utf-8"
+    h["cache-control"] = "no-store"
+    return PlainTextResponse(_clash_yaml(_clash_proxies(
+        build_configs(row, d, ips) if ok else [])), headers=h)
+
+
+def sub_response_singbox(row, d, ips, request: Request) -> JSONResponse:
+    ok, _reason = user_status(row)
+    h = _sub_headers(row, request)
+    return JSONResponse(_singbox_config(
+        build_configs(row, d, ips) if ok else [], row["name"]), headers=h)
+
+
 def row_out(r) -> dict:
+    r = maybe_auto_reset(r)            # refresh a stale cycle right on panel load
     d = dict(r)
     d["devices_now"] = active_devices(r["id"])
     d["devices_live"] = live_devices(r["id"])
@@ -2235,6 +2544,7 @@ class UserIn(BaseModel):
     name: str
     quota_gb: float = 0
     expire_days: int = 0
+    reset_days: int = 0
     device_limit: int = 1
     ip_limit: int = 0
     transport: str = "both"
@@ -2253,6 +2563,7 @@ class UserPatch(BaseModel):
     name: Optional[str] = None
     quota_gb: Optional[float] = None
     expire_days: Optional[int] = None
+    reset_days: Optional[int] = None
     device_limit: Optional[int] = None
     ip_limit: Optional[int] = None
     transport: Optional[str] = None
@@ -2307,6 +2618,12 @@ class RestoreIn(BaseModel):
     mode: str = "merge"            # merge | replace
     restore_password: bool = False
     force: bool = False            # accept a file whose checksum does not match
+
+
+class TgIn(BaseModel):
+    bot_token: str = ""            # empty = keep the stored one
+    chat_id: str = ""
+    auto: Optional[bool] = None
 
 
 # ────────────────────────────── SETUP & AUTH ──────────────────────────────
@@ -2389,13 +2706,15 @@ async def create_user(body: UserIn, _=Depends(require_admin)):
     if tr not in TRANSPORTS:
         raise HTTPException(400, "transport must be ws, xhttp or both")
     expire = now() + body.expire_days * 86400 if body.expire_days > 0 else 0
+    reset_days = min(365, max(0, int(body.reset_days or 0)))
     try:
         with db() as c:
             cur = c.execute(
                 """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                      used_bytes,expire_at,device_limit,ip_limit,transport,
-                                     obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,created_at)
-                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                     obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
+                                     reset_days,last_reset,created_at)
+                   VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (name, str(uuid.uuid4()), secrets.token_urlsafe(16), body.note,
                  1 if body.enabled else 0, int(body.quota_gb * GB), expire,
                  max(0, body.device_limit), max(0, body.ip_limit), tr,
@@ -2406,7 +2725,7 @@ async def create_user(body: UserIn, _=Depends(require_admin)):
                  (body.ech_value or "").strip()[:2000],
                  (body.obf_cs or "").strip()[:4000],
                  (body.obf_fm or "").strip()[:4000],
-                 now()))
+                 reset_days, now(), now()))
             row = c.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
     except sqlite3.IntegrityError:
         raise HTTPException(409, "this name already exists")
@@ -2429,6 +2748,11 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
         if body.expire_days is not None:
             sets.append("expire_at=?")
             vals.append(now() + body.expire_days * 86400 if body.expire_days > 0 else 0)
+        if body.reset_days is not None:
+            rd = min(365, max(0, int(body.reset_days or 0)))
+            sets.append("reset_days=?"); vals.append(rd)
+            # turning the cycle on (or changing it) starts a fresh one from today
+            sets.append("last_reset=?"); vals.append(now())
         if body.device_limit is not None:
             sets.append("device_limit=?"); vals.append(max(0, body.device_limit))
         if body.ip_limit is not None:
@@ -2477,7 +2801,8 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
 @app.post("/api/users/{uid}/reset-traffic")
 async def reset_traffic(uid: int, _=Depends(require_admin)):
     with db() as c:
-        c.execute("UPDATE users SET used_bytes=0 WHERE id=?", (uid,))
+        c.execute("UPDATE users SET used_bytes=0, last_reset=? WHERE id=?",
+                  (now(), uid))
     return {"ok": True}
 
 
@@ -2941,7 +3266,7 @@ ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
 USER_FIELDS = ("name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
                "used_bytes", "expire_at", "device_limit", "ip_limit", "transport",
                "obfuscate", "ech", "fp", "alpn", "ech_value", "obf_cs", "obf_fm",
-               "created_at")
+               "reset_days", "last_reset", "created_at")
 CIP_FIELDS = ("address", "remark", "country", "enabled", "added_at")
 # Health columns are deliberately included: a restore then shows the same list state the
 # old panel had, and the next test run refreshes it anyway.
@@ -3091,6 +3416,9 @@ def _clean_user(u: dict) -> Optional[dict]:
         "ech_value": str(u.get("ech_value") or "").strip()[:2000],
         "obf_cs": str(u.get("obf_cs") or "").strip()[:4000],
         "obf_fm": str(u.get("obf_fm") or "").strip()[:4000],
+        # Missing in v6 (and older) backups: 0 = no automatic reset.
+        "reset_days": min(365, num("reset_days")),
+        "last_reset": num("last_reset"),
         "created_at": num("created_at") or now(),
     }
 
@@ -3193,14 +3521,14 @@ def apply_backup(payload: dict, mode: str = "merge",
                     """UPDATE users SET name=?, uuid=?, sub_token=?, note=?, enabled=?,
                            quota_bytes=?, used_bytes=?, expire_at=?, device_limit=?,
                            ip_limit=?, transport=?, obfuscate=?, ech=?, fp=?, alpn=?,
-                           ech_value=?, obf_cs=?, obf_fm=?,
-                           created_at=? WHERE id=?""",
+                           ech_value=?, obf_cs=?, obf_fm=?, reset_days=?, last_reset=?
+                           WHERE id=?""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
                      u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
                      u["ech"], u["fp"], u["alpn"],
                      u["ech_value"], u["obf_cs"], u["obf_fm"],
-                     u["created_at"], existing["id"]))
+                     u["reset_days"], u["last_reset"], existing["id"]))
                 stats["users_updated"] += 1
                 continue
             try:
@@ -3208,14 +3536,14 @@ def apply_backup(payload: dict, mode: str = "merge",
                     """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                          used_bytes,expire_at,device_limit,ip_limit,transport,
                                          obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
-                                         created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                         reset_days,last_reset,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
                      u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
                      u["ech"], u["fp"], u["alpn"],
                      u["ech_value"], u["obf_cs"], u["obf_fm"],
-                     u["created_at"]))
+                     u["reset_days"], u["last_reset"], u["created_at"]))
                 stats["users_added"] += 1
             except sqlite3.IntegrityError:
                 # sub_token is UNIQUE too; retry once with a fresh one.
@@ -3224,14 +3552,14 @@ def apply_backup(payload: dict, mode: str = "merge",
                         """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                              used_bytes,expire_at,device_limit,ip_limit,transport,
                                              obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
-                                             created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                             reset_days,last_reset,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (u["name"], u["uuid"], secrets.token_urlsafe(16), u["note"],
                          u["enabled"], u["quota_bytes"], u["used_bytes"], u["expire_at"],
                          u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
                          u["ech"], u["fp"], u["alpn"],
                          u["ech_value"], u["obf_cs"], u["obf_fm"],
-                         u["created_at"]))
+                         u["reset_days"], u["last_reset"], u["created_at"]))
                     stats["users_added"] += 1
                 except sqlite3.IntegrityError:
                     stats["users_skipped"] += 1
@@ -3405,6 +3733,147 @@ async def restore_backup(body: RestoreIn, request: Request, _=Depends(require_ad
           f"+{stats['clean_ips_added']} clean ips, "
           f"+{stats['proxies_added']}/~{stats['proxies_updated']} proxies")
     return {"ok": True, **stats}
+
+
+# ─────────────────────── TELEGRAM BACKUP ──────────────────────
+#
+# A copy of the panel lands in a Telegram chat of the admin's choosing: on
+# demand from the settings card, or once a day from a background task. This
+# matters on Railway/Render, where the SQLite file lives in /tmp and dies with
+# the container — the chat becomes the off-site copy. The .ixpbak file sent is
+# the same JSON document the manual download produces, so /api/restore eats it
+# unchanged. Token and chat id can also come from TELEGRAM_BOT_TOKEN /
+# TELEGRAM_CHAT_ID environment variables; settings take precedence.
+
+TG_BACKUP_EVERY = 86400          # one automatic backup per day
+TG_CHECK_EVERY   = 1800          # how often the background task looks
+
+
+def tg_config() -> tuple[str, str]:
+    token = (get_setting("tg_bot_token")
+             or os.environ.get("TELEGRAM_BOT_TOKEN", "")).strip()
+    chat = (get_setting("tg_chat_id")
+            or os.environ.get("TELEGRAM_CHAT_ID", "")).strip()
+    return token, chat
+
+
+def _tg_api(token: str, method: str, *, fields: dict | None = None,
+            data: bytes | None = None, filename: str = "",
+            timeout: int = 90) -> dict:
+    """Blocking Bot-API call (stdlib only): JSON body, or multipart with a file."""
+    import urllib.request
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    if data is None:
+        body = urlencode(fields or {}).encode()
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    else:
+        boundary = "----IranXPanel" + secrets.token_hex(8)
+        parts = []
+        for k, v in (fields or {}).items():
+            parts.append((f'--{boundary}\r\nContent-Disposition: form-data; '
+                          f'name="{k}"\r\n\r\n{v}\r\n').encode())
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; '
+                      f'name="document"; filename="{filename}"\r\n'
+                      f'Content-Type: application/octet-stream\r\n\r\n').encode()
+                     + data + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(parts)
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+async def tg_send_backup(admin_ip: str = "") -> dict:
+    """Build a full backup and push it to the configured chat. Never raises."""
+    token, chat = tg_config()
+    if not token or not chat:
+        return {"ok": False, "error": "telegram not configured"}
+    doc = build_backup(include_password=True, include_traffic=False,
+                       include_proxy_creds=True)
+    body = json.dumps(doc, ensure_ascii=False).encode()
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    fname = f"iranx-backup-{stamp}.ixpbak"
+    p = doc["payload"]
+    caption = (f"🗄 IranX Panel backup · {stamp} UTC\n"
+               f"👥 {len(p['users'])} users · 🧹 {len(p['clean_ips'])} clean IPs · "
+               f"🔗 {len(p['proxies'])} proxies\n"
+               "🔒 Contains the panel password — keep it private.")
+    try:
+        res = await asyncio.to_thread(_tg_api, token, "sendDocument",
+                                      fields={"chat_id": chat, "caption": caption},
+                                      data=body, filename=fname)
+    except Exception as e:
+        audit("tg_backup_fail", admin_ip, str(e)[:200])
+        return {"ok": False, "error": str(e)[:200]}
+    if not res.get("ok"):
+        desc = str(res.get("description") or "telegram error")[:200]
+        audit("tg_backup_fail", admin_ip, desc)
+        return {"ok": False, "error": desc}
+    set_setting("tg_last_backup", str(now()))
+    audit("tg_backup_ok", admin_ip, fname)
+    return {"ok": True, "file": fname}
+
+
+async def tg_autobackup():
+    """Daily automatic backup, whenever the admin switched it on in settings."""
+    while True:
+        await asyncio.sleep(TG_CHECK_EVERY)
+        try:
+            token, chat = tg_config()
+            if not token or not chat or get_setting("tg_auto") != "1":
+                continue
+            last = int(get_setting("tg_last_backup") or 0)
+            if now() - last < TG_BACKUP_EVERY:
+                continue
+            await tg_send_backup()
+        except Exception as e:
+            print("tg_autobackup error:", e)
+
+
+@app.get("/api/telegram")
+async def tg_status(_=Depends(require_admin)):
+    token, chat = tg_config()
+    return {"chat_id": chat,
+            "auto": get_setting("tg_auto") == "1",
+            "token_set": bool(token),
+            "token_from_env": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+            "last_backup": int(get_setting("tg_last_backup") or 0)}
+
+
+@app.post("/api/telegram")
+async def tg_save(body: TgIn, request: Request, _=Depends(require_admin)):
+    if body.bot_token and body.bot_token.strip():
+        set_setting("tg_bot_token", body.bot_token.strip())
+    if body.chat_id is not None:
+        set_setting("tg_chat_id", body.chat_id.strip())
+    if body.auto is not None:
+        set_setting("tg_auto", "1" if body.auto else "0")
+    audit("tg_config", client_ip(request))
+    return {"ok": True}
+
+
+@app.post("/api/telegram/test")
+async def tg_test(_=Depends(require_admin)):
+    token, chat = tg_config()
+    if not token or not chat:
+        return {"ok": False, "error": "telegram not configured"}
+    try:
+        res = await asyncio.to_thread(
+            _tg_api, token, "sendMessage",
+            fields={"chat_id": chat,
+                    "text": "✅ IranX Panel — Telegram backup is wired up. "
+                            "Backup files will arrive in this chat."})
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+    if not res.get("ok"):
+        return {"ok": False, "error": str(res.get("description") or "error")[:200]}
+    return {"ok": True}
+
+
+@app.post("/api/telegram/backup")
+async def tg_backup_now(request: Request, _=Depends(require_admin)):
+    return await tg_send_backup(admin_ip=client_ip(request))
 
 
 # ─────────────────────────────── STATS ──────────────────────────────
@@ -4144,6 +4613,8 @@ def render_sub_page(
     payload = {
         "name": name,
         "subLink": sub_link,
+        "subLinkClash": sub_link + "?format=clash",
+        "subLinkSingbox": sub_link + "?format=singbox",
         "panelUrl": panel_url,
         "active": bool(active),
         "status": status or ("" if active else "inactive"),
@@ -4382,7 +4853,13 @@ async function copy(text,msg){
 
 /* ── one-tap import into clients ── */
 function deepLink(kind){
-  const s = D.subLink, e = encodeURIComponent(s), n = encodeURIComponent(D.name || "IranX");
+  const n = encodeURIComponent(D.name || "IranX");
+  let s = D.subLink;
+  // Clash-family and sing-box-family apps need their own container format,
+  // so their one-tap links point at the matching subscription endpoint.
+  if(kind==="clash")   s = D.subLinkClash   || (s + "?format=clash");
+  if(kind==="singbox") s = D.subLinkSingbox || (s + "?format=singbox");
+  const e = encodeURIComponent(s);
   if(kind==="v2rayng")      return "v2rayng://install-sub?url="+e+"&name="+n;
   if(kind==="hiddify")      return "hiddify://import/"+s;
   if(kind==="singbox")      return "sing-box://import-remote-profile?url="+e+"#"+n;
@@ -4393,7 +4870,10 @@ function deepLink(kind){
   return "";
 }
 async function addSub(kind){
-  await copy(D.subLink, "");
+  let s = D.subLink;
+  if(kind==="clash")   s = D.subLinkClash   || (s + "?format=clash");
+  if(kind==="singbox") s = D.subLinkSingbox || (s + "?format=singbox");
+  await copy(s, "");
   const url = deepLink(kind);
   if(!url){ toast(t("copiedSub")); return; }
   const a = document.createElement("a");
@@ -4511,6 +4991,8 @@ async def subscription(token: str, request: Request):
     if not row:
         raise HTTPException(404, "not found")
 
+    row = maybe_auto_reset(row)
+
     d = base_domain(request)
     lines = build_info_lines(row, d)
     if user_status(row)[0]:
@@ -4521,6 +5003,22 @@ async def subscription(token: str, request: Request):
     accept = request.headers.get("accept") or ""
     force_page = request.query_params.get("page") in ("1", "true")
     force_raw = request.query_params.get("raw") in ("1", "true")
+
+    # ── container formats: Clash.Meta and sing-box ──
+    # An explicit ?format= wins; otherwise the User-Agent decides, so a client
+    # that was given the plain sub URL still gets a file it can parse.
+    fmt = (request.query_params.get("format") or "").strip().lower()
+    if not fmt and not force_raw and not force_page:
+        if any(k in ua for k in ("clash", "mihomo", "stash", "flclash", "verge")):
+            fmt = "clash"
+        elif any(k in ua for k in ("sing-box", "singbox", "hiddify", "karing", "happ")):
+            fmt = "singbox"
+    if not force_raw:
+        if fmt in ("clash", "meta", "yaml", "yml"):
+            return sub_response_clash(row, d, ips, request)
+        if fmt in ("singbox", "sing-box", "json"):
+            return sub_response_singbox(row, d, ips, request)
+
     if not force_raw and (force_page or ("text/html" in accept and "mozilla" in ua)):
         ok, reason = user_status(row)
         return HTMLResponse(render_sub_page(
@@ -4541,16 +5039,8 @@ async def subscription(token: str, request: Request):
         ))
 
     body = base64.b64encode("\n".join(lines).encode()).decode()
-    headers = {
-        "profile-title": "base64:" + base64.b64encode(
-            clean_label(row["name"]).encode()).decode(),
-        "profile-update-interval": "12",
-        "profile-web-page-url": f"https://{origin_domain(request)}/",
-        "subscription-userinfo":
-            f"upload=0; download={row['used_bytes']}; "
-            f"total={row['quota_bytes']}; expire={row['expire_at']}",
-        "content-type": "text/plain; charset=utf-8",
-    }
+    headers = _sub_headers(row, request)
+    headers["content-type"] = "text/plain; charset=utf-8"
     return PlainTextResponse(body, headers=headers)
 
 
@@ -4917,6 +5407,13 @@ const I18N={
   bkReplaceWarn:'همهٔ کاربران، آی‌پی‌های تمیز و پروکسی‌های فعلی حذف و با فایل جایگزین می‌شوند. مطمئنی؟',
   bkPwChanged:'رمز پنل از فایل بازگردانی شد — دفعهٔ بعد با رمز قدیمیِ همان فایل وارد شوید.',
   bkDone:'بازگردانی انجام شد',
+  resetCycle:'ریست دوره‌ای مصرف',resetOff:'خاموش',reset7:'هر ۷ روز',reset30:'هر ۳۰ روز',
+  tgTitle:'🤖 بکاپ تلگرامی',
+  tgHint:'از پنل یک فایل پشتیبان کامل به چت تلگرام شما می‌رسد — روی Railway/Render که دیتابیس با ری‌دپلوی پاک می‌شود، این فایل نسخهٔ پشتیبان شماست. توکن را از @BotFather بگیرید و آی‌دی چت را از @userinfobot. برای گروه، آی‌دی را با -100 شروع کنید و ربات را عضو گروه کنید.',
+  tgTokenLbl:'Bot Token',tgChatLbl:'Chat ID',tgAutoLbl:'بکاپ خودکار روزانه',
+  tgTestBtn:'پیام آزمایشی',tgNowBtn:'ارسال بکاپ حالا',
+  tgWorking:'در حال اتصال به تلگرام…',tgSent:'به تلگرام ارسال شد ✓',
+  tgFromEnv:'از متغیر محیطی تنظیم شده',tgNotSet:'تنظیم نشده',
   bkAdded:'اضافه‌شده',bkUpdated:'به‌روزشده',bkSkipped:'ردشده',
   relayLbl:'دامنه رله',keepAliveLbl:'جلوگیری از خواب',relayNone:'ندارد',
   onLbl:'فعال',offLbl:'خاموش',
@@ -5057,6 +5554,13 @@ const I18N={
   bkReplaceWarn:'All current users, clean IPs and proxies will be deleted and replaced by the file. Continue?',
   bkPwChanged:'The panel password was restored from the file — sign in with that file\'s password next time.',
   bkDone:'Restore complete',
+  resetCycle:'Usage reset cycle',resetOff:'Off',reset7:'Every 7 days',reset30:'Every 30 days',
+  tgTitle:'🤖 Telegram backup',
+  tgHint:'A full panel backup lands in your Telegram chat — on Railway/Render the database dies with a redeploy, so this file is your off-site copy. Get the token from @BotFather and the chat ID from @userinfobot. For a group chat, start the ID with -100 and add the bot to the group.',
+  tgTokenLbl:'Bot Token',tgChatLbl:'Chat ID',tgAutoLbl:'Automatic daily backup',
+  tgTestBtn:'Test message',tgNowBtn:'Send backup now',
+  tgWorking:'Contacting Telegram…',tgSent:'Sent to Telegram ✓',
+  tgFromEnv:'set by environment variable',tgNotSet:'not set',
   bkAdded:'added',bkUpdated:'updated',bkSkipped:'skipped',
   relayLbl:'Relay domain',keepAliveLbl:'Keep-alive',relayNone:'none',
   onLbl:'on',offLbl:'off',
@@ -5315,6 +5819,8 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
      <label class="fld"><span class="text-xs dim" data-t="name"></span><input id="nName" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="quota"></span><input id="nQuota" type="number" step="0.5" value="30" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="days"></span><input id="nDays" type="number" value="30" class="inp"></label>
+     <label class="fld"><span class="text-xs dim" data-t="resetCycle"></span>
+      <select id="nReset" class="inp"><option value="0"></option><option value="7"></option><option value="30"></option></select></label>
      <label class="fld"><span class="text-xs dim" data-t="devLimit"></span><input id="nDev" type="number" value="1" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="ipLimit"></span><input id="nIp" type="number" value="0" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="transport"></span>
@@ -5544,6 +6050,24 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
      <p id="bkMsg" class="text-sm" style="margin:0"></p>
     </div>
    </div>
+
+   <!-- ══ TELEGRAM BACKUP ══ -->
+   <div class="card p-4 mt-4 space-y-3">
+    <b class="text-base" data-t="tgTitle"></b>
+    <p class="text-xs dim" style="margin:0" data-t="tgHint"></p>
+    <div class="g2">
+     <label class="fld"><span class="text-xs dim" data-t="tgTokenLbl"></span>
+      <input id="tgToken" type="password" autocomplete="new-password" class="inp mono" style="font-size:11px"></label>
+     <label class="fld"><span class="text-xs dim" data-t="tgChatLbl"></span>
+      <input id="tgChat" class="inp mono" style="font-size:11px" placeholder="123456789"></label>
+    </div>
+    <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="tgAuto"> <span data-t="tgAutoLbl"></span></label>
+    <div class="g2">
+     <button onclick="tgTest()" id="btnTgTest" class="btn btn-soft" style="font-size:12px"></button>
+     <button onclick="tgBackupNow()" id="btnTgNow" class="btn" style="font-size:12px"></button>
+    </div>
+    <p id="tgMsg" class="text-sm" style="margin:0"></p>
+   </div>
   </section>
 
   <!-- ══ EVENTS ══ -->
@@ -5642,7 +6166,7 @@ function go(p){
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
  if(p==='filter')loadFilter();
- if(p==='settings'){renderServer();loadBackupInfo()}
+ if(p==='settings'){renderServer();loadBackupInfo();loadTelegram()}
  if(p==='live')loadLive(); else stopLive();
 }
 
@@ -5685,11 +6209,15 @@ function paintStatic(){
  btnFrAdd.textContent=T('fltAdd'); btnFrBulk.textContent=T('fltBulk');
  btnFrClear.textContent=T('fltClear');
  btnBackup.textContent=T('btnBackupLbl'); btnRestore.textContent=T('btnRestoreLbl');
+ btnTgTest.textContent=T('tgTestBtn'); btnTgNow.textContent=T('tgNowBtn');
  bkMode.options[0].textContent=T('bkMerge');
  bkMode.options[1].textContent=T('bkReplace');
  nName.placeholder=T('name'); nQuota.placeholder=T('quota');
  nDays.placeholder=T('days'); nDev.placeholder=T('devLimit'); nIp.placeholder=T('ipLimit');
  q.placeholder=T('search');
+ nReset.options[0].textContent=T('resetOff');
+ nReset.options[1].textContent=T('reset7');
+ nReset.options[2].textContent=T('reset30');
  nTr.options[0].textContent=T('trBoth');
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
@@ -5761,7 +6289,7 @@ async function loadStats(){
  sCip.textContent=stats.clean_ips; sXs.textContent=stats.xhttp_sessions;
  pill.textContent='/'+stats.ws_path+' · /'+stats.xhttp_path;
  paintChart(); renderProto();
- if(PAGE==='settings'){renderServer();loadBackupInfo()}
+ if(PAGE==='settings'){renderServer();loadBackupInfo();loadTelegram()}
 }
 async function loadUsers(){users=await api('/api/users');renderUsers()}
 async function loadCips(){cips=await api('/api/clean-ips');renderCips()}
@@ -5873,7 +6401,7 @@ async function createUser(){
  try{
   await api('/api/users',{method:'POST',body:JSON.stringify({
    name:nName.value.trim(),quota_gb:parseFloat(nQuota.value||0),
-   expire_days:parseInt(nDays.value||0),device_limit:parseInt(nDev.value||0),
+   expire_days:parseInt(nDays.value||0),reset_days:parseInt(nReset.value||0),device_limit:parseInt(nDev.value||0),
    ip_limit:parseInt(nIp.value||0),
    transport:nTr.value,obfuscate:nObf.checked,
    ech:nEch.checked,fp:nFp.value||'unsafe',alpn:nAlpn.value,
@@ -6166,6 +6694,8 @@ function showEdit(id){
    <input id="eQ" type="number" step="0.5" value="${(u.quota_bytes/1073741824).toFixed(2)}" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('remainDays')}</span>
    <input id="eD" type="number" value="${days}" class="inp"></label>
+  <label class="fld"><span class="text-xs dim">${T('resetCycle')}</span>
+   <select id="eR" class="inp"><option value="0">${T('resetOff')}</option><option value="7">${T('reset7')}</option><option value="30">${T('reset30')}</option></select></label>
   <label class="fld"><span class="text-xs dim">${T('allowedDev')}</span>
    <input id="eV" type="number" value="${u.device_limit}" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('allowedIp')}</span>
@@ -6203,11 +6733,14 @@ function showEdit(id){
   <p id="eErr" class="text-sm" style="margin:0;color:var(--bad)"></p>`);
  fillSelect(eFp,FP_OPTIONS,T('fpLbl')); eFp.value=(FP_OPTIONS.indexOf(u.fp)>-1?u.fp:'unsafe');
  fillSelect(eFpAlpn,ALPN_OPTIONS,T('alpnDef')); eFpAlpn.value=(ALPN_OPTIONS.indexOf(u.alpn)>-1?u.alpn:'');
+ eR.value=String(u.reset_days||0);
+ if(eR.selectedIndex<0){const o=document.createElement('option');o.value=o.textContent=(u.reset_days||0)+' '+T('days');eR.appendChild(o);eR.value=String(u.reset_days||0);}
 }
 async function saveEdit(id){
  try{
   const u=users.find(x=>x.id===id);
   const payload={quota_gb:parseFloat(eQ.value||0),expire_days:parseInt(eD.value||0),
+   reset_days:parseInt(eR.value||0),
    device_limit:parseInt(eV.value||0),ip_limit:parseInt(eIp.value||0),transport:eT.value,enabled:eE.checked,
    obfuscate:eObf.checked,ech:eEch.checked,
    fp:eFp.value||'unsafe',alpn:eFpAlpn.value,
@@ -6243,6 +6776,39 @@ async function loadBackupInfo(){
   bkInfo.innerHTML=bkRow(T('bkUsersN'),i.users)+bkRow(T('bkCipsN'),i.clean_ips)
    +bkRow(T('bkProxN'),i.proxies)+bkRow(T('bkTrafficN'),i.traffic_rows);
  }catch(e){bkInfo.innerHTML=''}
+}
+
+/* ─── telegram backup ─── */
+async function loadTelegram(){
+ try{
+  const t=await api('/api/telegram');
+  tgChat.value=t.chat_id||''; tgAuto.checked=!!t.auto;
+  tgToken.placeholder=t.token_set?(t.token_from_env?T('tgFromEnv'):'••••••••'):T('tgNotSet');
+ }catch(e){}
+}
+async function saveTelegram(){
+ const body={chat_id:tgChat.value.trim(),auto:tgAuto.checked};
+ if(tgToken.value.trim())body.bot_token=tgToken.value.trim();
+ try{await api('/api/telegram',{method:'POST',body:JSON.stringify(body)});return true}
+ catch(e){tgMsg.style.color='var(--bad)';tgMsg.textContent=e.message;return false}
+}
+async function tgTest(){
+ tgMsg.textContent=''; tgMsg.style.color='';
+ if(!await saveTelegram())return;
+ tgMsg.textContent=T('tgWorking');
+ try{const r=await api('/api/telegram/test',{method:'POST'});
+  tgMsg.style.color=r.ok?'var(--ok)':'var(--bad)';
+  tgMsg.textContent=r.ok?'✓ Telegram':(r.error||'failed');
+ }catch(e){tgMsg.style.color='var(--bad)';tgMsg.textContent=e.message}
+}
+async function tgBackupNow(){
+ tgMsg.textContent=''; tgMsg.style.color='';
+ if(!await saveTelegram())return;
+ tgMsg.textContent=T('tgWorking');
+ try{const r=await api('/api/telegram/backup',{method:'POST'});
+  tgMsg.style.color=r.ok?'var(--ok)':'var(--bad)';
+  tgMsg.textContent=r.ok?('✓ '+T('tgSent')):(r.error||'failed');
+ }catch(e){tgMsg.style.color='var(--bad)';tgMsg.textContent=e.message}
 }
 
 function doBackup(){
@@ -6306,7 +6872,7 @@ async function doRestore(){
    +(r.users_skipped||r.proxies_skipped||r.clean_ips_skipped
      ?` · ${T('bkSkipped')}: ${r.users_skipped+r.proxies_skipped+r.clean_ips_skipped}`:'');
   BK=null; bkFile.value=''; bkOpts.classList.add('hidden'); bkPreview.innerHTML='';
-  loadUsers(); loadCips(); loadStats(); loadBackupInfo();
+  loadUsers(); loadCips(); loadStats(); loadBackupInfo(); loadTelegram();
   if(typeof loadProxies==='function') loadProxies();
   if(r.password_restored) alert(T('bkPwChanged'));
  }catch(e){ bkMsg.style.color='var(--bad)'; bkMsg.textContent=e.message }

@@ -47,3 +47,13 @@ RELAY_DOMAIN = ""
 # Requires DOMAIN to be set correctly.
 KEEPALIVE         = "0"    # "1" to enable
 KEEPALIVE_MINUTES = "10"   # ping interval; must be under the host's idle timeout
+
+[telegram_backup]
+# Off-site backup: the panel sends a full .ixpbak file to a Telegram chat.
+# Prefer setting these in Panel → Settings → Telegram backup (stored in SQLite);
+# these environment variables are a fallback and work without touching the UI.
+#   * Bot token: create a bot with @BotFather
+#   * Chat ID:   message @userinfobot (groups: start with -100, add the bot)
+# When the env vars are set, the admin only has to switch on the daily auto backup.
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID   = ""
