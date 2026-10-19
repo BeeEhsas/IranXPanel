@@ -4399,9 +4399,10 @@ def svg(text: str, level: str = "M", quiet: int = 3, css_class: str = "qr") -> s
 quota, remaining time, QR codes, per-config copy buttons, one-tap import into
 the popular clients and direct client downloads.
 
-Features: Vazirmatn Persian webfont, dark (black/white) + light (white/blue)
-themes, and a Persian/English language switch. No new Python dependencies
-(QR codes come from `subpage_qr.py`).
+Features: Vazirmatn Persian webfont, dark + light themes in the same teal-on-navy
+visual language as the admin panel (3x-ui / Sanaei style), and a Persian/English
+language switch. No new Python dependencies (QR codes come from the built-in
+encoder).
 """
 
 import html
@@ -4593,12 +4594,16 @@ def render_sub_page(
     ips_now: int = 0,
     panel_url: str = "",
     update_interval: int = 12,
+    reset_days: int = 0,
+    last_reset: int = 0,
 ) -> str:
     """Return the full HTML page for one subscription token."""
     now = int(time.time())
     quota_bytes = int(quota_bytes or 0)
     used_bytes = int(used_bytes or 0)
     expire_at = int(expire_at or 0)
+    reset_days = min(365, max(0, int(reset_days or 0)))
+    last_reset = int(last_reset or 0)
 
     remain_bytes = max(0, quota_bytes - used_bytes) if quota_bytes else 0
     pct = min(100, round(used_bytes * 100 / quota_bytes)) if quota_bytes else 0
@@ -4633,6 +4638,8 @@ def render_sub_page(
         "ipLimit": int(ip_limit or 0),
         "ipsNow": int(ips_now or 0),
         "updateInterval": int(update_interval or 12),
+        "resetDays": reset_days,
+        "nextResetAt": (last_reset + reset_days * 86400) if reset_days else 0,
         "configs": cfgs,
         "allConfigs": "\n".join(c["uri"] for c in cfgs if c["uri"]),
         "clients": CLIENTS,
@@ -4668,87 +4675,147 @@ _TEMPLATE = r"""<!doctype html>
 <title>__TITLE__ &middot; Subscription</title>
 __FONTS__
 <style>
-:root{--bg:#000;--surface:#0b0b0c;--raised:#16161a;--line:rgba(255,255,255,.14);
---tx:#fff;--tx2:rgba(255,255,255,.62);--accent:#fff;--accent-tx:#000;
---ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--ring:rgba(255,255,255,.22)}
-html[data-theme=light]{--bg:#f4f8ff;--surface:#fff;--raised:#eaf1fd;--line:#d5e2f6;
---tx:#0b1c38;--tx2:#516b8f;--accent:#1d4ed8;--accent-tx:#fff;
---ok:#15803d;--warn:#b45309;--bad:#b91c1c;--ring:rgba(29,78,216,.25)}
+/* Sanaei (3x-ui) visual language: deep navy surfaces + teal-green accent */
+:root,[data-theme="dark"]{
+  --bg:#0a1222;--surface:#151f31;--surface2:#1b2740;--line:#2c3950;--line2:#222d42;
+  --tx:#e7edf7;--tx2:rgba(231,237,247,.52);--a1:#008771;--a2:#3ad3ba;
+  --ok:#3ad3ba;--warn:#ffa031;--bad:#e04141;--info:#529fff;
+  --ring:rgba(0,135,113,.5);--chip:rgba(255,255,255,.05);--chip-line:rgba(255,255,255,.09);
+  --shadow:0 10px 30px rgba(0,0,0,.4);
+  --glow:radial-gradient(1100px 480px at 50% -140px,rgba(0,135,113,.18),transparent 70%)}
+[data-theme="light"]{
+  --bg:#f0f2f5;--surface:#ffffff;--surface2:#f7f9fc;--line:#e6e9ef;--line2:#eef1f5;
+  --tx:#1f2937;--tx2:#7a8694;--a1:#008771;--a2:#009980;
+  --ok:#199270;--warn:#f37b24;--bad:#cf3c3c;--info:#0e49b5;
+  --ring:rgba(0,135,113,.3);--chip:#f3f5f8;--chip-line:#e6e9ef;
+  --shadow:0 8px 24px rgba(16,24,40,.08);
+  --glow:radial-gradient(1100px 480px at 50% -140px,rgba(0,135,113,.10),transparent 70%)}
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);min-height:100vh;padding:22px 16px 48px;
-font:16px/1.55 Vazirmatn,"Vazirmatn Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans Arabic",Tahoma,sans-serif}
-.wrap{max-width:960px;margin:0 auto}
-.top{display:flex;align-items:center;gap:10px;margin-bottom:22px;flex-wrap:wrap}
-.brand{display:flex;align-items:center;gap:9px;font-weight:650}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px rgba(74,222,128,.16)}
-.dot.off{background:var(--bad);box-shadow:0 0 0 4px rgba(248,113,113,.16)}
+body{background:var(--bg);color:var(--tx);min-height:100vh;padding:20px 16px 46px;
+  font:16px/1.55 Vazirmatn,"Vazirmatn Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Tahoma,sans-serif}
+body::before{content:"";position:fixed;inset:0;background:var(--glow);pointer-events:none}
+.wrap{position:relative;max-width:960px;margin:0 auto}
+/* ── top bar ── */
+.top{display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px rgba(58,211,186,.16)}
+.dot.off{background:var(--bad);box-shadow:0 0 0 4px rgba(224,65,65,.16)}
 .spacer{flex:1}
+.tag{font-size:11px;font-weight:700;padding:5px 11px;border-radius:99px;background:var(--chip);
+  border:1px solid var(--chip-line);color:var(--tx2)}
 .chip{border:1px solid var(--line);background:var(--surface);color:var(--tx);border-radius:99px;
-min-height:38px;padding:0 13px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
-.chip:hover{background:var(--raised)}
-.chip:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px}
-.hero{display:grid;grid-template-columns:1.4fr .6fr;gap:16px;align-items:stretch}
-@media(max-width:780px){.hero{grid-template-columns:1fr}}
-h1{margin:0 0 2px;font-size:23px;letter-spacing:-.2px}
-.sub{margin:0 0 18px;color:var(--tx2);font-size:13.5px}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
-@media(max-width:520px){.stats{grid-template-columns:1fr 1fr}}
-.stat{background:var(--raised);border-radius:12px;padding:12px 14px}
-.stat b{display:block;font-size:19px;font-weight:650;letter-spacing:-.2px}
-.stat span{color:var(--tx2);font-size:12.5px}
-.bar{height:9px;border-radius:99px;background:var(--raised);overflow:hidden}
-.bar>i{display:block;height:100%;border-radius:99px;background:var(--accent)}
+  min-height:38px;padding:0 13px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;
+  display:inline-flex;align-items:center;gap:7px}
+.chip:hover{border-color:var(--a1)}
+.chip:focus-visible,.btn:focus-visible,.tab:focus-visible,.ico:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.chip svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+/* ── cards ── */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:20px;
+  box-shadow:var(--shadow)}
+.hero{display:grid;grid-template-columns:1.5fr .9fr;gap:14px;align-items:stretch}
+@media(max-width:820px){.hero{grid-template-columns:1fr}}
+h1{margin:0;font-size:22px;letter-spacing:-.2px;word-break:break-word}
+.expline{display:flex;align-items:center;gap:7px;margin:7px 0 16px;color:var(--tx2);font-size:13px}
+.expline svg{width:15px;height:15px;flex:none;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.schip{font-size:12px;font-weight:700;padding:5px 12px;border-radius:99px;white-space:nowrap;
+  border:1px solid transparent;flex:none}
+.schip.ok{color:var(--ok);background:rgba(58,211,186,.10);border-color:rgba(58,211,186,.35)}
+.schip.warn{color:var(--warn);background:rgba(255,160,49,.10);border-color:rgba(255,160,49,.35)}
+.schip.bad{color:var(--bad);background:rgba(224,65,65,.10);border-color:rgba(224,65,65,.35)}
+[data-theme="light"] .schip.ok{background:rgba(25,146,112,.08);border-color:rgba(25,146,112,.3)}
+[data-theme="light"] .schip.warn{background:rgba(243,123,36,.08);border-color:rgba(243,123,36,.3)}
+[data-theme="light"] .schip.bad{background:rgba(207,60,60,.07);border-color:rgba(207,60,60,.3)}
+/* ── stats ── */
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
+.stat{background:var(--surface2);border:1px solid var(--line2);border-radius:12px;padding:11px 13px;
+  display:flex;align-items:center;gap:10px;min-width:0}
+.stat svg{width:19px;height:19px;flex:none;stroke:var(--a2);fill:none;stroke-width:1.8;
+  stroke-linecap:round;stroke-linejoin:round}
+.stat div{min-width:0}
+.stat b{display:block;font-size:15.5px;font-weight:700;letter-spacing:-.2px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.stat span{color:var(--tx2);font-size:11.5px}
+/* ── usage donut ── */
+.donutrow{display:flex;align-items:center;gap:18px;margin-bottom:4px;flex-wrap:wrap}
+.donutbox{position:relative;width:132px;height:132px;flex:none}
+.donut{width:132px;height:132px;transform:rotate(-90deg)}
+.donut .bgc{fill:none;stroke:var(--surface2);stroke-width:11}
+.donut .fgc{fill:none;stroke:url(#dg);stroke-width:11;stroke-linecap:round;transition:stroke-dashoffset .7s}
+.donut .fgc.hot{stroke:var(--bad)}
+.dg1{stop-color:var(--a1)}.dg2{stop-color:var(--a2)}
+.dcenter{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px}
+.dcenter b{font-size:23px;font-weight:800;letter-spacing:-.4px}
+.dcenter span{color:var(--tx2);font-size:11px}
+.donutside{flex:1 1 200px;min-width:180px}
+.bar{height:9px;border-radius:99px;background:var(--surface2);overflow:hidden;border:1px solid var(--line2)}
+.bar>i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--a1),var(--a2));transition:width .7s}
 .bar.hot>i{background:var(--bad)}
 .meta{display:flex;justify-content:space-between;color:var(--tx2);font-size:12.5px;margin-top:8px}
-.qrbox{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center}
-.qrsvg{width:186px;height:186px;background:#fff;border-radius:10px;padding:7px;display:block}
-.qrsvg.sm{width:158px;height:158px}
-.hint{margin:0;color:var(--tx2);font-size:12.5px}
+.rchip{display:inline-flex;align-items:center;gap:7px;margin-top:11px;padding:6px 12px;border-radius:99px;
+  background:var(--chip);border:1px solid var(--chip-line);color:var(--tx2);font-size:12px;font-weight:600}
+.rchip svg{width:14px;height:14px;stroke:var(--a2);fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+/* ── buttons ── */
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
-.btn{border:0;border-radius:10px;background:var(--accent);color:var(--accent-tx);font:inherit;font-size:14px;font-weight:600;
-min-height:44px;padding:0 16px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none}
-.btn.alt{background:var(--raised);color:var(--tx);border:1px solid var(--line)}
+.btn{border:1px solid transparent;border-radius:11px;background:linear-gradient(135deg,var(--a1),var(--a2));
+  color:#fff;font:inherit;font-size:14px;font-weight:700;min-height:44px;padding:0 16px;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none}
+.btn:hover{filter:brightness(1.07)}
+.btn.alt{background:var(--surface2);color:var(--tx);border-color:var(--line)}
+.btn.alt:hover{border-color:var(--a1);filter:none}
 .btn:active{transform:translateY(1px)}
-.btn:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
 .btn img{width:19px;height:19px;border-radius:5px;object-fit:cover}
-h2{font-size:17px;margin:32px 0 12px}
+/* ── QR ── */
+.qrbox{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center}
+.qrsvg{width:186px;height:186px;background:#fff;border-radius:12px;padding:8px;display:block;
+  border:1px solid var(--line)}
+.hint{margin:0;color:var(--tx2);font-size:12.5px;line-height:1.7}
+/* ── sections ── */
+h2{font-size:16.5px;margin:30px 0 12px;display:flex;align-items:center;gap:8px}
+h2::before{content:"";width:4px;height:17px;border-radius:99px;background:linear-gradient(180deg,var(--a1),var(--a2))}
 .cfg{display:flex;align-items:center;gap:10px;padding:11px 14px;border:1px solid var(--line);
-border-radius:12px;background:var(--surface);margin-bottom:8px;flex-wrap:wrap}
-.cfg .nm{flex:1 1 120px;min-width:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  border-radius:12px;background:var(--surface);margin-bottom:8px;flex-wrap:wrap;box-shadow:var(--shadow)}
+.cfg .nm{flex:1 1 120px;min-width:0;font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 @media(max-width:430px){.cfg .nm{flex:1 1 100%}}
-.tag{font-size:11px;font-weight:700;padding:4px 9px;border-radius:99px;background:var(--raised);color:var(--tx2)}
-.tag.x{color:var(--warn)}
-.ico{width:44px;height:44px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--tx);cursor:pointer;font-size:14px}
-.ico:hover{background:var(--raised)}
+.ico{width:42px;height:42px;border-radius:10px;border:1px solid var(--line);background:var(--surface2);
+  color:var(--tx);cursor:pointer;display:grid;place-items:center}
+.ico:hover{border-color:var(--a1);color:var(--a2)}
+.ico svg{width:18px;height:18px;display:block;margin:auto;stroke:currentColor;fill:none;stroke-width:1.7;
+  stroke-linecap:round;stroke-linejoin:round}
 .cfgqr{width:100%;display:flex;justify-content:center;padding:14px 0 4px}
 .cfgqr[hidden]{display:none}
-.ico svg{width:18px;height:18px;display:block;margin:auto;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-.tab{border:1px solid var(--line);background:transparent;color:var(--tx2);border-radius:99px;
-min-height:40px;padding:0 16px;font:inherit;font-size:13.5px;cursor:pointer}
-.tab[aria-selected=true]{background:var(--accent);border-color:transparent;color:var(--accent-tx);font-weight:600}
+.tab{border:1px solid var(--line);background:var(--surface);color:var(--tx2);border-radius:99px;
+  min-height:40px;padding:0 16px;font:inherit;font-size:13.5px;cursor:pointer}
+.tab:hover{border-color:var(--a1)}
+.tab[aria-selected=true]{background:linear-gradient(135deg,var(--a1),var(--a2));border-color:transparent;
+  color:#fff;font-weight:700}
 .apps{display:grid;grid-template-columns:repeat(auto-fill,minmax(244px,1fr));gap:12px}
-.app{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:16px}
+.app{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:16px;box-shadow:var(--shadow)}
 .app .head{display:flex;align-items:center;gap:11px;margin-bottom:12px}
 .logo,.mark{width:44px;height:44px;border-radius:11px;display:block;flex:none}
-.logo{object-fit:contain;background:var(--raised);padding:3px}
+.logo{object-fit:contain;background:var(--surface2);padding:3px;border:1px solid var(--line2)}
 .mark{display:grid;place-items:center;color:#fff;font-weight:800;font-size:16px}
-.app .nm{font-weight:650;font-size:15px}
+.app .nm{font-weight:700;font-size:15px}
 .app .rp{color:var(--tx2);font-size:11.5px;word-break:break-all}
 .add{width:100%;margin-bottom:9px;min-height:40px;font-size:13.5px}
 .dl{display:flex;flex-direction:column;gap:6px}
 .dl a{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:40px;padding:0 12px;
-border:1px solid var(--line);border-radius:10px;color:var(--tx);text-decoration:none;font-size:13.5px}
-.dl a:hover{background:var(--raised)}
+  border:1px solid var(--line);border-radius:10px;color:var(--tx);text-decoration:none;font-size:13.5px;
+  background:var(--surface2)}
+.dl a:hover{border-color:var(--a1)}
 .dl a .sz{color:var(--tx2);font-size:11.5px}
-.banner{display:flex;gap:10px;align-items:center;border:1px solid var(--bad);
-color:var(--bad);border-radius:12px;padding:12px 14px;font-size:13.5px;margin-bottom:16px}
-footer{margin-top:36px;text-align:center;color:var(--tx2);font-size:12px}
-.toast{position:fixed;inset-inline:0;bottom:22px;margin:auto;width:max-content;max-width:90vw;background:var(--tx);
-color:var(--bg);font-weight:650;font-size:14px;padding:11px 18px;border-radius:99px;opacity:0;transform:translateY(8px);
-transition:.2s;pointer-events:none;text-align:center}
+/* ── banner / footer / toast ── */
+.banner{display:flex;gap:10px;align-items:center;border:1px solid var(--bad);color:var(--bad);
+  border-radius:12px;padding:12px 14px;font-size:13.5px;margin-bottom:16px;background:rgba(224,65,65,.07)}
+[data-theme="light"] .banner{background:rgba(207,60,60,.05)}
+.banner svg{width:19px;height:19px;flex:none;stroke:currentColor;fill:none;stroke-width:1.9;
+  stroke-linecap:round;stroke-linejoin:round}
+footer{margin-top:34px;text-align:center;color:var(--tx2);font-size:12px;line-height:1.8}
+.toast{position:fixed;inset-inline:0;bottom:22px;margin:auto;width:max-content;max-width:90vw;
+  background:linear-gradient(135deg,var(--a1),var(--a2));color:#fff;font-weight:700;font-size:14px;
+  padding:11px 18px;border-radius:99px;opacity:0;transform:translateY(8px);transition:.2s;
+  pointer-events:none;text-align:center;box-shadow:var(--shadow);z-index:9}
 .toast.on{opacity:1;transform:none}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -4758,7 +4825,7 @@ transition:.2s;pointer-events:none;text-align:center}
   <div class="top">
     <div class="brand"><span class="dot" id="dot"></span><span id="bTitle">IranX</span></div>
     <span class="spacer"></span>
-    <span class="tag" id="trTag">—</span>
+    <span class="tag" id="trTag">&mdash;</span>
     <button class="chip" id="themeBtn" type="button"></button>
     <button class="chip" id="langBtn" type="button"></button>
   </div>
@@ -4767,16 +4834,53 @@ transition:.2s;pointer-events:none;text-align:center}
 
   <section class="hero">
     <div class="card">
-      <h1 id="uname">—</h1>
-      <p class="sub" id="usub">—</p>
-      <div class="stats">
-        <div class="stat"><b id="sRemain">—</b><span id="lRemain"></span></div>
-        <div class="stat"><b id="sDays">—</b><span id="lDays"></span></div>
-        <div class="stat"><b id="sDev">—</b><span id="lDev"></span></div>
-        <div class="stat"><b id="sIp">—</b><span id="lIp"></span></div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <h1 id="uname">&mdash;</h1><span class="spacer"></span><span class="schip ok" id="schip">&mdash;</span>
       </div>
-      <div class="bar" id="bar"><i style="width:0%"></i></div>
-      <div class="meta"><span id="mUsed">—</span><span id="mQuota">—</span></div>
+      <p class="expline">
+        <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2.5"/><path d="M8 3v4M16 3v4M3 10h18"/></svg>
+        <span id="expLine">&mdash;</span>
+      </p>
+      <div class="stats">
+        <div class="stat">
+          <svg viewBox="0 0 24 24"><path d="M12 3c-4 4.5-6.5 7.8-6.5 11a6.5 6.5 0 0013 0c0-3.2-2.5-6.5-6.5-11z"/></svg>
+          <div><b id="sRemain">&mdash;</b><span id="lRemain"></span></div>
+        </div>
+        <div class="stat">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+          <div><b id="sDays">&mdash;</b><span id="lDays"></span></div>
+        </div>
+        <div class="stat">
+          <svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>
+          <div><b id="sDev">&mdash;</b><span id="lDev"></span></div>
+        </div>
+        <div class="stat">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9h17M3.5 15h17M12 3a15 15 0 010 18M12 3a15 15 0 000 18"/></svg>
+          <div><b id="sIp">&mdash;</b><span id="lIp"></span></div>
+        </div>
+      </div>
+      <div class="donutrow">
+        <div class="donutbox">
+          <svg class="donut" viewBox="0 0 120 120" aria-hidden="true">
+            <defs>
+              <linearGradient id="dg" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" class="dg1"/><stop offset="1" class="dg2"/>
+              </linearGradient>
+            </defs>
+            <circle class="bgc" cx="60" cy="60" r="52"/>
+            <circle class="fgc" id="dfg" cx="60" cy="60" r="52" stroke-dasharray="326.726" stroke-dashoffset="326.726"/>
+          </svg>
+          <div class="dcenter"><b id="dPct">0%</b><span id="dLbl"></span></div>
+        </div>
+        <div class="donutside">
+          <div class="bar" id="bar"><i style="width:0%"></i></div>
+          <div class="meta"><span id="mUsed">&mdash;</span><span id="mQuota">&mdash;</span></div>
+          <div class="rchip" id="resetChip" hidden>
+            <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 10.4 4M20 4v7h-7"/></svg>
+            <span id="resetTxt"></span>
+          </div>
+        </div>
+      </div>
       <div class="row">
         <button class="btn" id="copySub"></button>
         <button class="btn alt" id="copyAll"></button>
@@ -4797,7 +4901,7 @@ transition:.2s;pointer-events:none;text-align:center}
   <div class="tabs" id="tabs" role="tablist"></div>
   <div class="apps" id="apps"></div>
 
-  <footer><span id="fNote"></span> · <span id="upd"></span></footer>
+  <footer><span id="fNote"></span><br><span id="upd"></span></footer>
 </div>
 <div class="toast" id="toast"></div>
 <script>
@@ -4808,27 +4912,35 @@ const esc = (s)=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&
 /* ── i18n ── */
 const T = {
   fa:{brand:"IranX · اشتراک من", remainVol:"حجم باقی‌مانده", remainTime:"زمان باقی‌مانده",
-    devices:"دستگاه مجاز", ipAddr:"آی‌پی مجاز", used:"مصرف‌شده", total:"کل", copySub:"کپی لینک اشتراک",
-    copyAll:"کپی همه کانفیگ‌ها", addTo:"افزودن به", configs:"کانفیگ‌ها", downloads:"دانلود برنامه‌ها",
-    noConfigs:"کانفیگ فعالی وجود ندارد.", showQr:"نمایش QR", copyCfg:"کپی کانفیگ",
-    scanHint:"با دوربین برنامه اسکن کنید<br>تا اشتراک خودکار اضافه شود",
+    devices:"دستگاه مجاز", ipAddr:"آی‌پی مجاز", used:"مصرف‌شده", total:"کل", usage:"مصرف",
+    copySub:"کپی لینک اشتراک", copyAll:"کپی همه کانفیگ‌ها", addTo:"افزودن به", configs:"کانفیگ‌ها",
+    downloads:"دانلود برنامه‌ها", noConfigs:"کانفیگ فعالی وجود ندارد.", showQr:"نمایش QR",
+    copyCfg:"کپی کانفیگ", scanHint:"با دوربین برنامه اسکن کنید<br>تا اشتراک خودکار اضافه شود",
     footer:"لینک اشتراک شخصی شماست — آن را با کسی به اشتراک نگذارید",
     updEvery:(h)=>"به‌روزرسانی هر "+h+" ساعت", expires:"انقضا", noExpiry:"بدون انقضا",
-    unlimited:"بی‌نهایت", inactive:"این اشتراک فعال نیست", support:"با پشتیبانی تماس بگیرید",
-    days:"روز", hours:"ساعت", cfgCount:(n)=>n+" کانفیگ فعال", copiedSub:"لینک اشتراک کپی شد ✓",
-    copiedAll:"همه کانفیگ‌ها کپی شد ✓", copiedCfg:"کانفیگ کپی شد ✓", noQr:"QR در دسترس نیست",
+    unlimited:"بی‌نهایت", support:"با پشتیبانی تماس بگیرید",
+    statusActive:"فعال", statusExpired:"اشتراک منقضی شده", statusQuota:"حجم اشتراک تمام شده",
+    statusDisabled:"اشتراک غیرفعال شده", statusInactive:"اشتراک فعال نیست",
+    resetEveryN:(n)=>"ریست مصرف هر "+n+" روز", nextReset:"ریست بعدی",
+    days:"روز", hours:"ساعت", left:"باقی‌مانده", cfgCount:(n)=>n+" کانفیگ فعال",
+    copiedSub:"لینک اشتراک کپی شد ✓", copiedAll:"همه کانفیگ‌ها کپی شد ✓",
+    copiedCfg:"کانفیگ کپی شد ✓", noQr:"QR در دسترس نیست",
     importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گزینهٔ Add from clipboard را بزنید",
     allVersions:"همه نسخه‌ها", theme:"تم", light:"روشن", dark:"تیره", subName:"اشتراک"},
   en:{brand:"IranX · My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
-    devices:"Devices", ipAddr:"Allowed IPs", used:"Used", total:"Total", copySub:"Copy subscription link",
-    copyAll:"Copy all configs", addTo:"Add to", configs:"Configs", downloads:"Download apps",
-    noConfigs:"No active config.", showQr:"Show QR", copyCfg:"Copy config",
+    devices:"Devices", ipAddr:"Allowed IPs", used:"Used", total:"Total", usage:"Used",
+    copySub:"Copy subscription link", copyAll:"Copy all configs", addTo:"Add to", configs:"Configs",
+    downloads:"Download apps", noConfigs:"No active config.", showQr:"Show QR", copyCfg:"Copy config",
     scanHint:"Scan with your client app<br>to add the subscription",
     footer:"This is your personal subscription link — do not share it",
     updEvery:(h)=>"Updates every "+h+"h", expires:"Expires", noExpiry:"No expiry",
-    unlimited:"Unlimited", inactive:"This subscription is not active", support:"please contact support",
-    days:"days", hours:"hours", cfgCount:(n)=>n+" active configs", copiedSub:"Subscription link copied ✓",
-    copiedAll:"All configs copied ✓", copiedCfg:"Config copied ✓", noQr:"QR unavailable",
+    unlimited:"Unlimited", support:"please contact support",
+    statusActive:"Active", statusExpired:"Subscription expired", statusQuota:"Out of data",
+    statusDisabled:"Subscription disabled", statusInactive:"Subscription inactive",
+    resetEveryN:(n)=>"Usage resets every "+n+" days", nextReset:"Next reset",
+    days:"days", hours:"hours", left:"left", cfgCount:(n)=>n+" active configs",
+    copiedSub:"Subscription link copied ✓", copiedAll:"All configs copied ✓",
+    copiedCfg:"Config copied ✓", noQr:"QR unavailable",
     importHint:"If the app did not open: the link is copied — use “Add from clipboard” inside the app",
     allVersions:"All versions", theme:"Theme", light:"Light", dark:"Dark", subName:"Subscription"}
 };
@@ -4837,7 +4949,9 @@ try{ LANG = localStorage.getItem("iranx_lang") || LANG; THEME = localStorage.get
 if(LANG!=="en") LANG="fa"; if(THEME!=="light") THEME="dark";
 const t = (k)=>T[LANG][k];
 const num = (n)=>Number(n).toLocaleString(LANG==="fa"?"fa-IR":"en-US");
-
+const ICON_SUN = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.6M12 18.9v2.6M2.5 12h2.6M18.9 12h2.6M5 5l1.8 1.8M17.2 17.2L19 19M19 5l-1.8 1.8M6.8 17.2L5 19"/></svg>';
+const ICON_MOON = '<svg viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 1110 3.7a7 7 0 0010.5 10.8z"/></svg>';
+const ICON_WARN = '<svg viewBox="0 0 24 24"><path d="M12 3.5L2.5 20h19L12 3.5z"/><path d="M12 10v4.5M12 17.6v.2"/></svg>';
 const ICON_QR = '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 14h3v3h-3zM20 14v3M14 20h6"/></svg>';
 const ICON_COPY = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 5.5A2.5 2.5 0 0012.5 3H6.5A2.5 2.5 0 004 5.5v6A2.5 2.5 0 006.5 14"/></svg>';
 
@@ -4855,8 +4969,6 @@ async function copy(text,msg){
 function deepLink(kind){
   const n = encodeURIComponent(D.name || "IranX");
   let s = D.subLink;
-  // Clash-family and sing-box-family apps need their own container format,
-  // so their one-tap links point at the matching subscription endpoint.
   if(kind==="clash")   s = D.subLinkClash   || (s + "?format=clash");
   if(kind==="singbox") s = D.subLinkSingbox || (s + "?format=singbox");
   const e = encodeURIComponent(s);
@@ -4882,6 +4994,27 @@ async function addSub(kind){
   try{ a.click(); }catch(e){ try{ location.href = url; }catch(_){} }
   a.remove();
   setTimeout(()=>toast(t("importHint")), 1200);
+}
+
+/* ── status helpers ── */
+function statusInfo(){
+  if(D.active) return {cls:"ok", key:"statusActive"};
+  const m = {expired:["bad","statusExpired"], quota:["warn","statusQuota"], disabled:["bad","statusDisabled"]};
+  const f = m[D.status] || ["bad","statusInactive"];
+  return {cls:f[0], key:f[1]};
+}
+function fmtDate(ts){
+  return new Date(ts*1000).toLocaleDateString(LANG==="fa"?"fa-IR":"en-GB");
+}
+const CIRC = 2*Math.PI*52;
+function paintUsage(){
+  const p = D.quota ? D.pct : 0;
+  $("#dfg").style.strokeDashoffset = (CIRC*(1-p/100)).toFixed(1);
+  $("#dfg").classList.toggle("hot", !!(D.quota && D.pct>=85));
+  $("#dPct").textContent = D.quota ? num(D.pct)+"%" : "∞";
+  $("#dLbl").textContent = t("usage");
+  $("#bar").firstElementChild.style.width = (D.quota ? D.pct : 0) + "%";
+  $("#bar").classList.toggle("hot", D.pct >= 85 && !!D.quota);
 }
 
 /* ── render ── */
@@ -4918,10 +5051,11 @@ function render(){
   const h = document.documentElement;
   h.lang = LANG; h.dir = LANG==="fa" ? "rtl" : "ltr"; h.dataset.theme = THEME;
   $("#bTitle").textContent = t("brand");
-  $("#themeBtn").textContent = (THEME==="dark" ? "☀️ " : "🌙 ") + (THEME==="dark" ? t("light") : t("dark"));
-  $("#langBtn").textContent = LANG==="fa" ? "🌐 English" : "🌐 فارسی";
-  $("#uname").textContent = D.name || t("subName");
+  $("#themeBtn").innerHTML = (THEME==="dark" ? ICON_SUN : ICON_MOON) +
+    "<span>"+(THEME==="dark" ? t("light") : t("dark"))+"</span>";
+  $("#langBtn").textContent = LANG==="fa" ? "EN" : "فا";
   $("#trTag").textContent = D.transport === "BOTH" ? "WS + XHTTP" : D.transport;
+  $("#uname").textContent = D.name || t("subName");
   $("#lRemain").textContent = t("remainVol");
   $("#lDays").textContent = t("remainTime");
   $("#lDev").textContent = t("devices");
@@ -4934,10 +5068,23 @@ function render(){
   $("#sIp").textContent = D.ipLimit ? num(D.ipsNow)+" / "+num(D.ipLimit) : t("unlimited");
   $("#mUsed").textContent = t("used")+": "+D.usedText;
   $("#mQuota").textContent = t("total")+": "+D.quotaText;
-  $("#bar").firstElementChild.style.width = (D.quota ? D.pct : 0) + "%";
-  $("#bar").classList.toggle("hot", D.pct >= 85 && !!D.quota);
-  const exp = D.expireAt ? new Date(D.expireAt*1000).toLocaleDateString(LANG==="fa"?"fa-IR":"en-GB") : t("noExpiry");
-  $("#usub").textContent = t("expires")+": "+exp+" · "+t("cfgCount")(num(D.configs.length));
+  paintUsage();
+  $("#expLine").textContent = D.expireAt
+    ? t("expires")+": "+fmtDate(D.expireAt) + (D.active ? "  ("+num(D.remainDays)+" "+t("days")+" "+t("left")+")" : "")
+    : t("noExpiry");
+  const st = statusInfo();
+  $("#schip").className = "schip "+st.cls;
+  $("#schip").textContent = t(st.key);
+  $("#dot").classList.toggle("off", !D.active);
+  $("#banner").innerHTML = D.active ? "" :
+    `<div class="banner">${ICON_WARN}<span>${esc(t(st.key))} — ${esc(t("support"))}.</span></div>`;
+  if(D.resetDays > 0){
+    $("#resetChip").hidden = false;
+    $("#resetTxt").textContent = t("resetEveryN")(num(D.resetDays)) +
+      (D.nextResetAt ? " · "+t("nextReset")+": "+fmtDate(D.nextResetAt) : "");
+  }else{
+    $("#resetChip").hidden = true;
+  }
   $("#copySub").textContent = t("copySub");
   $("#copyAll").textContent = t("copyAll");
   $("#impHid").textContent = t("addTo")+" Hiddify";
@@ -4946,11 +5093,8 @@ function render(){
   $("#hCfg").textContent = t("configs");
   $("#hApps").textContent = t("downloads");
   $("#fNote").textContent = t("footer");
-  $("#upd").textContent = t("updEvery")(num(D.updateInterval));
+  $("#upd").textContent = t("updEvery")(num(D.updateInterval)) + " · " + t("cfgCount")(num(D.configs.length));
   $("#qrMain").innerHTML = QRS[0] || `<p class="hint">${esc(t("noQr"))}</p>`;
-  $("#dot").classList.toggle("off", !D.active);
-  $("#banner").innerHTML = D.active ? "" :
-    `<div class="banner">⚠️ ${esc(t("inactive"))}${D.status?" ("+esc(D.status)+")":""} — ${esc(t("support"))}.</div>`;
   paintConfigs();
   paintApps();
 }
@@ -5036,6 +5180,8 @@ async def subscription(token: str, request: Request):
             ip_limit=row["ip_limit"],
             ips_now=active_ips(row["id"]),
             panel_url=("https" + "://") + origin_domain(request) + "/",
+            reset_days=row["reset_days"],
+            last_reset=row["last_reset"],
         ))
 
     body = base64.b64encode("\n".join(lines).encode()).decode()
@@ -5407,7 +5553,9 @@ const I18N={
   bkReplaceWarn:'همهٔ کاربران، آی‌پی‌های تمیز و پروکسی‌های فعلی حذف و با فایل جایگزین می‌شوند. مطمئنی؟',
   bkPwChanged:'رمز پنل از فایل بازگردانی شد — دفعهٔ بعد با رمز قدیمیِ همان فایل وارد شوید.',
   bkDone:'بازگردانی انجام شد',
-  resetCycle:'ریست دوره‌ای مصرف',resetOff:'خاموش',reset7:'هر ۷ روز',reset30:'هر ۳۰ روز',
+  resetCycle:'ریست دوره‌ای مصرف',resetOff:'خاموش',reset1:'هر ۱ روز (روزانه)',reset3:'هر ۳ روز',
+  reset7:'هر ۷ روز (هفتگی)',reset14:'هر ۱۴ روز (دو هفته)',reset30:'هر ۳۰ روز (ماهانه)',
+  reset60:'هر ۶۰ روز (دو ماه)',reset90:'هر ۹۰ روز (سه ماه)',resetCustom:'دلخواه',customDays:'تعداد روز (۱ تا ۳۶۵)',
   tgTitle:'🤖 بکاپ تلگرامی',
   tgHint:'از پنل یک فایل پشتیبان کامل به چت تلگرام شما می‌رسد — روی Railway/Render که دیتابیس با ری‌دپلوی پاک می‌شود، این فایل نسخهٔ پشتیبان شماست. توکن را از @BotFather بگیرید و آی‌دی چت را از @userinfobot. برای گروه، آی‌دی را با -100 شروع کنید و ربات را عضو گروه کنید.',
   tgTokenLbl:'Bot Token',tgChatLbl:'Chat ID',tgAutoLbl:'بکاپ خودکار روزانه',
@@ -5554,7 +5702,9 @@ const I18N={
   bkReplaceWarn:'All current users, clean IPs and proxies will be deleted and replaced by the file. Continue?',
   bkPwChanged:'The panel password was restored from the file — sign in with that file\'s password next time.',
   bkDone:'Restore complete',
-  resetCycle:'Usage reset cycle',resetOff:'Off',reset7:'Every 7 days',reset30:'Every 30 days',
+  resetCycle:'Usage reset cycle',resetOff:'Off',reset1:'Daily (1 day)',reset3:'Every 3 days',
+  reset7:'Weekly (7 days)',reset14:'Every 14 days (2 weeks)',reset30:'Monthly (30 days)',
+  reset60:'Every 60 days (2 months)',reset90:'Every 90 days (3 months)',resetCustom:'Custom',customDays:'Days (1–365)',
   tgTitle:'🤖 Telegram backup',
   tgHint:'A full panel backup lands in your Telegram chat — on Railway/Render the database dies with a redeploy, so this file is your off-site copy. Get the token from @BotFather and the chat ID from @userinfobot. For a group chat, start the ID with -100 and add the bot to the group.',
   tgTokenLbl:'Bot Token',tgChatLbl:'Chat ID',tgAutoLbl:'Automatic daily backup',
@@ -5820,7 +5970,9 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
      <label class="fld"><span class="text-xs dim" data-t="quota"></span><input id="nQuota" type="number" step="0.5" value="30" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="days"></span><input id="nDays" type="number" value="30" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="resetCycle"></span>
-      <select id="nReset" class="inp"><option value="0"></option><option value="7"></option><option value="30"></option></select></label>
+      <select id="nReset" class="inp"><option value="0"></option><option value="1"></option><option value="3"></option><option value="7"></option><option value="14"></option><option value="30"></option><option value="60"></option><option value="90"></option><option value="-1"></option></select></label>
+     <label class="fld hidden" id="nResetWrap"><span class="text-xs dim" data-t="customDays"></span>
+      <input id="nResetCustom" type="number" min="1" max="365" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="devLimit"></span><input id="nDev" type="number" value="1" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="ipLimit"></span><input id="nIp" type="number" value="0" class="inp"></label>
      <label class="fld"><span class="text-xs dim" data-t="transport"></span>
@@ -6215,9 +6367,9 @@ function paintStatic(){
  nName.placeholder=T('name'); nQuota.placeholder=T('quota');
  nDays.placeholder=T('days'); nDev.placeholder=T('devLimit'); nIp.placeholder=T('ipLimit');
  q.placeholder=T('search');
- nReset.options[0].textContent=T('resetOff');
- nReset.options[1].textContent=T('reset7');
- nReset.options[2].textContent=T('reset30');
+ ['resetOff','reset1','reset3','reset7','reset14','reset30','reset60','reset90','resetCustom']
+  .forEach((k,i)=>{ if(nReset.options[i]) nReset.options[i].textContent=T(k); });
+ nReset.addEventListener('change',()=>{ nResetWrap.classList.toggle('hidden',nReset.value!=='-1'); });
  nTr.options[0].textContent=T('trBoth');
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
@@ -6396,12 +6548,19 @@ function renderLogs(){
 }
 
 /* ─── actions ─── */
+const RESET_FIXED=[0,1,3,7,14,30,60,90];
+function resolveReset(sel,custom){
+ const v=parseInt(sel||'0',10);
+ if(v!==-1)return Math.min(365,Math.max(0,v||0));
+ const c=Math.round(parseFloat(custom||'0'));
+ return Math.min(365,Math.max(0,c||0));
+}
 async function createUser(){
  cErr.textContent='';
  try{
   await api('/api/users',{method:'POST',body:JSON.stringify({
    name:nName.value.trim(),quota_gb:parseFloat(nQuota.value||0),
-   expire_days:parseInt(nDays.value||0),reset_days:parseInt(nReset.value||0),device_limit:parseInt(nDev.value||0),
+   expire_days:parseInt(nDays.value||0),reset_days:resolveReset(nReset.value,nResetCustom.value),device_limit:parseInt(nDev.value||0),
    ip_limit:parseInt(nIp.value||0),
    transport:nTr.value,obfuscate:nObf.checked,
    ech:nEch.checked,fp:nFp.value||'unsafe',alpn:nAlpn.value,
@@ -6695,7 +6854,9 @@ function showEdit(id){
   <label class="fld"><span class="text-xs dim">${T('remainDays')}</span>
    <input id="eD" type="number" value="${days}" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('resetCycle')}</span>
-   <select id="eR" class="inp"><option value="0">${T('resetOff')}</option><option value="7">${T('reset7')}</option><option value="30">${T('reset30')}</option></select></label>
+   <select id="eR" class="inp" onchange="eRCustomWrap.classList.toggle('hidden',this.value!=='-1')"><option value="0">${T('resetOff')}</option><option value="1">${T('reset1')}</option><option value="3">${T('reset3')}</option><option value="7">${T('reset7')}</option><option value="14">${T('reset14')}</option><option value="30">${T('reset30')}</option><option value="60">${T('reset60')}</option><option value="90">${T('reset90')}</option><option value="-1">${T('resetCustom')}</option></select></label>
+  <label class="fld hidden" id="eRCustomWrap"><span class="text-xs dim">${T('customDays')}</span>
+   <input id="eRCustom" type="number" min="1" max="365" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('allowedDev')}</span>
    <input id="eV" type="number" value="${u.device_limit}" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('allowedIp')}</span>
@@ -6733,14 +6894,15 @@ function showEdit(id){
   <p id="eErr" class="text-sm" style="margin:0;color:var(--bad)"></p>`);
  fillSelect(eFp,FP_OPTIONS,T('fpLbl')); eFp.value=(FP_OPTIONS.indexOf(u.fp)>-1?u.fp:'unsafe');
  fillSelect(eFpAlpn,ALPN_OPTIONS,T('alpnDef')); eFpAlpn.value=(ALPN_OPTIONS.indexOf(u.alpn)>-1?u.alpn:'');
- eR.value=String(u.reset_days||0);
- if(eR.selectedIndex<0){const o=document.createElement('option');o.value=o.textContent=(u.reset_days||0)+' '+T('days');eR.appendChild(o);eR.value=String(u.reset_days||0);}
+ const rd=parseInt(u.reset_days||0);
+ if(RESET_FIXED.includes(rd)){ eR.value=String(rd); eRCustomWrap.classList.add('hidden'); }
+ else{ eR.value='-1'; eRCustom.value=rd?(''+rd):''; eRCustomWrap.classList.remove('hidden'); }
 }
 async function saveEdit(id){
  try{
   const u=users.find(x=>x.id===id);
   const payload={quota_gb:parseFloat(eQ.value||0),expire_days:parseInt(eD.value||0),
-   reset_days:parseInt(eR.value||0),
+   reset_days:resolveReset(eR.value,eRCustom.value),
    device_limit:parseInt(eV.value||0),ip_limit:parseInt(eIp.value||0),transport:eT.value,enabled:eE.checked,
    obfuscate:eObf.checked,ech:eEch.checked,
    fp:eFp.value||'unsafe',alpn:eFpAlpn.value,
