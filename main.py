@@ -2302,8 +2302,12 @@ def parse_vless_uri(uri: str) -> Optional[dict]:
                 "net": q.get("type", "ws"),
                 "mode": q.get("mode", "auto"),
                 "fp": q.get("fp", ""),
+                "ech": q.get("ech", ""),
                 "alpn": [a for a in q.get("alpn", "").split(",") if a],
                 "name": unquote(frag)}
+        # NOTE: cs= / fm= (per-user obfuscation mask + fragment JSON) are Xray-only
+        # dial-time parameters with no Clash.Meta or sing-box equivalent, so they are
+        # intentionally not parsed here — they stay on the vless links only.
     except Exception:
         return None
 
@@ -2337,6 +2341,9 @@ def _clash_proxies(configs) -> list[dict]:
             pr["client-fingerprint"] = p["fp"]
         if p["alpn"]:
             pr["alpn"] = p["alpn"]
+        if p.get("ech"):
+            # per-user custom ECH config list (the ech= parameter on the vless URI)
+            pr["ech-opts"] = {"enabled": True, "config": [p["ech"]]}
         if p["net"] == "xhttp":
             pr["network"] = "xhttp"
             pr["xhttp-opts"] = {"path": p["path"] or "/", "mode": _xhttp_mode(p["mode"])}
@@ -2388,6 +2395,11 @@ def _clash_yaml(proxies: list[dict]) -> str:
                 lines.append(_clash_yaml_line(k, p[k]))
         if "alpn" in p:
             lines.append("    alpn: [" + ", ".join(_yaml_str(a) for a in p["alpn"]) + "]")
+        if "ech-opts" in p:
+            lines.append("    ech-opts:")
+            lines.append(_clash_yaml_line("enabled", p["ech-opts"]["enabled"], indent="      "))
+            lines.append("      config: ["
+                         + ", ".join(_yaml_str(x) for x in p["ech-opts"]["config"]) + "]")
         if "ws-opts" in p:
             lines.append("    ws-opts:")
             lines.append(_clash_yaml_line("path", p["ws-opts"]["path"], indent="      "))
@@ -2435,6 +2447,9 @@ def _singbox_outbound(p: dict) -> dict:
         tls["alpn"] = p["alpn"]
     if p["fp"] and p["fp"] != "unsafe":
         tls["utls"] = {"enabled": True, "fingerprint": p["fp"]}
+    if p.get("ech"):
+        # per-user custom ECH config list (the ech= parameter on the vless URI)
+        tls["ech"] = {"enabled": True, "config": [p["ech"]]}
     ob["tls"] = tls
     if p["net"] == "xhttp":
         ob["transport"] = {"type": "xhttp", "path": p["path"] or "/",
@@ -5592,6 +5607,7 @@ const I18N={
   echValueLbl:'مقدار کاستوم ECH',obfCsLbl:'کاستوم cs (ماسک سیفر)',obfFmLbl:'کاستوم fm (مبهم‌ساز)',
   optDefault:'پیش‌فرض پنل',
   custLbl:'مقادیر کاستوم ECH و مبهم‌ساز (اختیاری)',
+  custHint:'⚠️ این مقادیر فقط وقتی اعمال می‌شوند که تیک مربوطه در بالا زده باشد: ECH با تیک «کانفیگ ECH»؛ cs و fm فقط روی لینک WS با تیک «لینک مبهم‌ساز». بعد از ذخیره، ساب را در کلاینت دوباره به‌روزرسانی کنید.',
   statusDisabled:'غیرفعال',statusExpired:'منقضی',statusQuota:'حجم تمام',
  },
  en:{dir:'ltr',
@@ -5741,6 +5757,7 @@ const I18N={
   echValueLbl:'Custom ECH value',obfCsLbl:'Custom cipher mask (cs)',obfFmLbl:'Custom obfuscation value (fm)',
   optDefault:'Panel default',
   custLbl:'Custom ECH / obfuscation values (optional)',
+  custHint:'⚠️ These only apply when the matching toggle above is on: ECH needs the "ECH config" checkbox; cs and fm only ride the WS link with the "obfuscated link" checkbox. After saving, refresh the subscription in your client.',
   statusDisabled:'disabled',statusExpired:'expired',statusQuota:'quota used',
  }
 };
@@ -5997,6 +6014,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
        <label class="fld"><span class="text-xs dim" data-t="obfFmLbl"></span>
         <textarea id="nObfFm" rows="3" spellcheck="false" class="inp mono" style="font-size:11px"></textarea></label>
       </div>
+      <p class="text-xs mt-2" style="color:var(--warn,#e0a80d);margin:0" data-t="custHint"></p>
      </div>
     </details>
     <div class="flex flex-wrap items-center gap-3 mt-3">
@@ -6881,6 +6899,7 @@ function showEdit(id){
     <label class="fld"><span class="text-xs dim">${T('obfFmLbl')}</span>
      <textarea id="eObfFm" rows="3" spellcheck="false" class="inp mono" style="font-size:11px" placeholder="${esc(T('optDefault'))}">${esc(u.obf_fm||'')}</textarea></label>
    </div>
+   <p class="text-xs mt-2" style="color:var(--warn,#e0a80d);margin:0">${T('custHint')}</p>
   </details>
   <label class="fld"><span class="text-xs dim">${T('customUuid')}</span>
    <input id="eU" value="${esc(u.uuid)}" class="inp mono" style="font-size:11px"></label>
