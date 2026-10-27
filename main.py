@@ -747,6 +747,22 @@ async def parse_vless(stream: ByteStream):
     cmd = meta[0]
     port = struct.unpack("!H", meta[1:3])[0]
     at = meta[3]
+    # Mux sessions (command 0x03) come in two shapes. Classic clients dial the
+    # placeholder v1.mux.cool:9527 (port 0x2537, address type 1..3) and the mux
+    # frames follow the address. Xray-core 2025+ sends NO address at all: the
+    # bytes right after the command byte are already the first mux frame (its
+    # 2-byte metadata length). For mux the header address is ignored anyway —
+    # every sub-stream carries its own target — so when the trio does not look
+    # like a placeholder address, hand back a placeholder and leave the mux
+    # frames untouched in the stream.
+    if cmd == 3 and not (port == 0x2537 and at in (1, 2, 3)):
+        # only the command byte belongs to the VLESS header here — bytes 1..3 we
+        # just read are the opening bytes of the first mux frame, put them back
+        try:
+            stream.buf[0:0] = meta[1:]
+        except Exception:
+            pass
+        return (uid, cmd, "v1.mux.cool", 9527)
     if at == 1:
         raw = await stream.read_exact(4)
         host = str(ipaddress.IPv4Address(raw)) if raw else None
