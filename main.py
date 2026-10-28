@@ -1929,9 +1929,10 @@ def ws_uri(row, address: str, host: str, label: str, direct: bool = False,
     # request no matter how many sites it visits. XHTTP below deliberately omits it
     # because standard clients (v2rayNG/NekoBox/Streisand) reject mux on xhttp and
     # silently fail to connect when it is forced on.
+    _a = user_alpn(row, "http/1.1")
+    alpn_part = "" if _a == "-" else f"&alpn={quote(_a, safe='')}"
     return (f"vless://{row['uuid']}@{address}:443"
-            f"?encryption=none&security=tls&sni={host}&{tls_extras(row)}"
-            f"&alpn={quote(user_alpn(row, 'http/1.1'), safe='')}"
+            f"?encryption=none&security=tls&sni={host}&{tls_extras(row)}{alpn_part}"
             f"&type=ws&host={host}&path=%2F{path}&mux=1"
             f"#{quote(label)}")
 
@@ -1987,7 +1988,10 @@ FINGERPRINTS = ("unsafe", "chrome", "firefox", "safari", "ios", "android",
 # ALPN values offered in the panel. "" means "this transport's own default"
 # (http/1.1 for ws, none for xhttp) — i.e. exactly what every link carried before
 # this setting existed, so an untouched account keeps its links as they were.
-ALPN_CHOICES = ("", "http/1.1", "h2", "h2,http/1.1")
+# "-" means "no alpn parameter at all": the link builders omit alpn= entirely and
+# the client core negotiates ALPN by itself (what v2rayNG/Hiddify users expect
+# when they clear the field).
+ALPN_CHOICES = ("", "http/1.1", "h2", "h2,http/1.1", "-")
 
 
 def _pick_choice(value, allowed, default: str) -> str:
@@ -2043,7 +2047,8 @@ def user_alpn(row, default: str) -> str:
 
     An empty stored value means "this transport's own default" (http/1.1 for ws,
     none for xhttp) — never an empty ``alpn=`` parameter, which would break every
-    link a user already has installed.
+    link a user already has installed. A stored "-" means "omit the parameter
+    completely"; the link builders turn that into no ``alpn=`` at all.
     """
     try:
         a = row["alpn"]
@@ -2076,7 +2081,7 @@ def ws_uri_obf(row, address: str, host: str, label: str, direct: bool = False,
     """The obfuscated WS link. No mux here: fragmenting plus mux confuses clients."""
     path = WS_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
     _a = user_alpn(row, "")
-    alpn_part = f"&alpn={quote(_a, safe='')}" if _a else ""
+    alpn_part = f"&alpn={quote(_a, safe='')}" if _a and _a != "-" else ""
     return (f"vless://{row['uuid']}@{address}:443"
             f"?cs={quote(obf_cs(row), safe='')}"
             f"&path={quote('/' + path, safe='')}"
@@ -2094,7 +2099,7 @@ def xhttp_uri(row, address: str, host: str, label: str, direct: bool = False,
     # WS variant only (see ws_uri).
     path = XHTTP_PATH + ("-d" if direct else ("-p%d" % pid if pid else ""))
     _a = user_alpn(row, "")
-    alpn_part = f"&alpn={quote(_a, safe='')}" if _a else ""
+    alpn_part = f"&alpn={quote(_a, safe='')}" if _a and _a != "-" else ""
     return (f"vless://{row['uuid']}@{address}:443"
             f"?encryption=none&security=tls&sni={host}&{tls_extras(row)}{alpn_part}"
             f"&type=xhttp&host={host}&path=%2F{path}&mode={XHTTP_MODE}"
@@ -5510,7 +5515,7 @@ const I18N={
   customUuid:'UUID دستی',del:'حذف',
   obfLbl:'مبهم‌ساز (Fragment + Cipher mask)',
   echLbl:'آنتی سانسور (Ech)',
-  fpLbl:'فینگرپرینت TLS',alpnLbl:'ALPN',alpnDef:'پیش‌فرض این نوع کانفیگ',
+  fpLbl:'فینگرپرینت TLS',alpnLbl:'ALPN',alpnDef:'پیش‌فرض این نوع کانفیگ',alpnNone:'بدون ALPN (حذف از لینک)',
   uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
   cleanTitle:'مدیریت Clean IP',
   cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
@@ -5659,7 +5664,7 @@ const I18N={
   customUuid:'Custom UUID',del:'Delete',
   obfLbl:'Obfuscation (Fragment + Cipher mask)',
   echLbl:'Anti-censorship (Ech)',
-  fpLbl:'TLS fingerprint',alpnLbl:'ALPN',alpnDef:'This transport\'s default',
+  fpLbl:'TLS fingerprint',alpnLbl:'ALPN',alpnDef:'This transport\'s default',alpnNone:'No ALPN (omit from link)',
   uuidWarn:'Rotate UUID? Existing configs will stop working.',delWarn:'Delete this user?',
   cleanTitle:'Clean IP manager',
   cleanHint:'Clean IPs or domains. Added to every subscription as extra configs.',
@@ -6364,12 +6369,16 @@ const statusTxt=s=>({disabled:T('statusDisabled'),expired:T('statusExpired'),
  quota:T('statusQuota')}[s]||s);
 const trTxt=t=>({ws:T('trWs'),xhttp:T('trXhttp'),both:T('trBoth')}[t]||t);
 const FP_OPTIONS=['unsafe','chrome','firefox','safari','ios','android','edge','ie','qq','random'];
-const ALPN_OPTIONS=['','http/1.1','h2','h2,http/1.1'];
+const ALPN_OPTIONS=['','http/1.1','h2','h2,http/1.1','-'];
 function fillSelect(sel,opts,blankLbl){
  if(!sel)return;
  sel.innerHTML='';
  const b=document.createElement('option');b.value='';b.textContent=blankLbl;sel.appendChild(b);
  opts.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v||'—';sel.appendChild(o)});
+}
+function fillAlpn(sel){
+ fillSelect(sel,ALPN_OPTIONS,T('alpnDef'));
+ if(sel){const o=[...sel.options].find(x=>x.value==='-');if(o)o.textContent=T('alpnNone')}
 }
 let users=[],cips=[],stats={},logItems=[],chart;
 
@@ -6408,7 +6417,7 @@ function paintStatic(){
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
  fillSelect(nFp,FP_OPTIONS,T('fpLbl'));
- fillSelect(nAlpn,ALPN_OPTIONS,T('alpnDef'));
+ fillAlpn(nAlpn);
  cAddr.placeholder=T('addrPh'); cRem.placeholder=T('remarkPh'); cBulk.placeholder=T('bulkPh');
  fillCountry(document.getElementById('cCty'),document.getElementById('cCty')?.value||'');
  fillCountry(document.getElementById('mcSel'),MAIN_CC);
@@ -6928,7 +6937,7 @@ function showEdit(id){
   </div>
   <p id="eErr" class="text-sm" style="margin:0;color:var(--bad)"></p>`);
  fillSelect(eFp,FP_OPTIONS,T('fpLbl')); eFp.value=(FP_OPTIONS.indexOf(u.fp)>-1?u.fp:'unsafe');
- fillSelect(eFpAlpn,ALPN_OPTIONS,T('alpnDef')); eFpAlpn.value=(ALPN_OPTIONS.indexOf(u.alpn)>-1?u.alpn:'');
+ fillAlpn(eFpAlpn); eFpAlpn.value=(ALPN_OPTIONS.indexOf(u.alpn)>-1?u.alpn:'');
  const rd=parseInt(u.reset_days||0);
  if(RESET_FIXED.includes(rd)){ eR.value=String(rd); eRCustomWrap.classList.add('hidden'); }
  else{ eR.value='-1'; eRCustom.value=rd?(''+rd):''; eRCustomWrap.classList.remove('hidden'); }
