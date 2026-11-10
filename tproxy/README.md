@@ -45,3 +45,14 @@ TLS terminates at the platform edge, so the relay serves **plain HTTP/WebSocket 
   asia-southeast1-eqsg3a` and can be changed later from the proxy's edit dialog —
   the service redeploys in the new region and keeps its domain, so issued links stay
   valid.
+* Deploy problems now surface in the panel instead of sticking on «در حال ساخت»:
+  before touching the platform the panel checks `tproxy/Dockerfile` on
+  raw.githubusercontent.com and fails the row in seconds when the folder was never
+  pushed; Railway's `source.repo` gets the `owner/repo` slug (a full GitHub URL is
+  rejected by the API); if the platform reports no deployment at all, or the build
+  ends in FAILED/CRASHED/SLEEPING/SKIPPED, the row turns red with that reason.
+  Railway also needs its GitHub App installed for the repo (Account Settings →
+  Integrations) — a build will never start without it.
+* The panel itself auto-detects its host (Railway/Render marker env vars): it then
+  only asks for that platform's API token and only offers that platform for new
+  proxies. `TGPW_SELF_PLATFORM` overrides, unset = both platforms offered.

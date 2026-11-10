@@ -1728,6 +1728,7 @@ NOBUF_HEADERS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    tgw_adopt_building_rows()   # restart during a build — re-watch the platform rows
     tasks = [
         asyncio.create_task(flusher()),
         asyncio.create_task(reaper()),
@@ -2687,6 +2688,70 @@ TGW_REGIONS = {
     ],
 }
 TGW_DEFAULT_REGION = {"render": "frankfurt", "railway": "europe-west4-drams3a"}
+TGW_STATE_NONE = "none"              # platform has no deployment registered (yet)
+# The platform this panel itself runs on — Railway/Render inject marker env vars at
+# runtime. The panel only asks for that platform's token (TGPW_SELF_PLATFORM overrides,
+# empty string = hosted somewhere else → both platforms stay available).
+TGW_SELF_ENV = {"railway": ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_ID",
+                            "RAILWAY_SERVICE_NAME", "RAILWAY_PUBLIC_DOMAIN"),
+                "render": ("RENDER_SERVICE_ID", "RENDER_PROJECT_ID",
+                           "RENDER_EXTERNAL_URL", "IS_RENDER")}
+# watcher tuning (env-overridable so tests can speed it up)
+TGW_POLL = float(os.environ.get("TGPW_TGW_POLL", "10") or 10)
+TGW_NODEPLOY_AFTER = float(os.environ.get("TGPW_TGW_NODEPLOY", "90") or 90)
+TGW_ERR_LIMIT = int(os.environ.get("TGPW_TGW_ERRS", "3") or 3)
+# Build pre-flight: a repo whose tproxy/ folder was never pushed can never build —
+# fail the row in seconds with the real reason instead of after a platform timeout.
+TGW_PREFLIGHT = os.environ.get("TGPW_PREFLIGHT", "1") != "0"
+GITHUB_RAW = os.environ.get("TGPW_GITHUB_RAW", "https://raw.githubusercontent.com")
+GITHUB_PAGE = os.environ.get("TGPW_GITHUB_PAGE", "https://github.com")
+
+
+def tgw_self_platform() -> str:
+    p = os.environ.get("TGPW_SELF_PLATFORM", "").strip().lower()
+    if p in TGW_SELF_ENV:
+        return p
+    for plat, keys in TGW_SELF_ENV.items():
+        if any(os.environ.get(k) for k in keys):
+            return plat
+    return ""
+
+
+def tgw_github_slug(repo_url: str) -> str:
+    """Railway's source.repo takes \"owner/repo\", not a full GitHub URL."""
+    m = re.match(r"^https://github\.com/([^/\s]+?)/([^/\s]+?)(?:\.git)?/?$",
+                 (repo_url or "").strip())
+    return ("%s/%s" % (m.group(1), m.group(2))) if m else ""
+
+
+def _http_probe(url: str) -> int:
+    """GET a URL and return just the HTTP status (−1 on transport trouble)."""
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("accept", "text/plain, text/html, */*")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return int(getattr(resp, "status", 200))
+    except urllib.error.HTTPError as e:
+        return int(e.code)
+    except Exception:
+        return -1
+
+
+async def tgw_repo_state(repo_url: str, branch: str) -> str:
+    """'ok' = raw.githubusercontent serves tproxy/Dockerfile; 'missing' = the repo is
+    public but the file is not on that branch; 'unknown' = private repo or non-GitHub
+    URL — cannot verify, let the platform decide."""
+    m = re.match(r"^https://github\.com/([^/\s]+?)/([^/\s]+?)(?:\.git)?/?$",
+                 (repo_url or "").strip())
+    if not m:
+        return "unknown"
+    owner, name = m.group(1), m.group(2)
+    if await _call(_http_probe, "%s/%s/%s/%s/tproxy/Dockerfile"
+                   % (GITHUB_RAW, owner, name, branch or "main")) == 200:
+        return "ok"
+    if await _call(_http_probe, "%s/%s/%s" % (GITHUB_PAGE, owner, name)) == 200:
+        return "missing"
+    return "unknown"
 
 
 def tgw_region_ids(platform: str) -> set:
@@ -2826,8 +2891,11 @@ async def render_deploy_status(token: str, service_id: str) -> str:
     st = (dep or {}).get("status", "")
     if st in ("live",):
         return TGW_STATE_LIVE
-    if st in ("build_failed", "update_failed", "canceled", "pre_deploy_failed", "deactivated"):
+    if st in ("build_failed", "update_failed", "canceled", "pre_deploy_failed",
+              "deactivated", "cron_canceled"):
         return TGW_STATE_FAILED
+    if not st:
+        return TGW_STATE_NONE        # no deploy registered (nothing was ever triggered)
     return TGW_STATE_BUILDING  # created / queued / build_in_progress / update_in_progress
 
 
@@ -2910,7 +2978,8 @@ async def railway_create_service(token: str, project_id: str, name: str) -> str:
 async def railway_configure_instance(token: str, service_id: str, environment_id: str,
                                      repo: str, region: str = ""):
     """Attach the repo source (rootDirectory = the tproxy folder) + healthcheck +
-    the region to build in (Railway redeploys on region changes, keeping the domain)."""
+    the region to build in (Railway redeploys on region changes, keeping the domain).
+    `repo` must already be the \"owner/repo\" slug Railway expects."""
     inp = {"source": {"repo": repo}, "rootDirectory": TGWEB_ROOT, "healthcheckPath": "/"}
     if region:
         inp["region"] = region
@@ -2980,37 +3049,68 @@ async def railway_create_domain(token: str, environment_id: str, service_id: str
     return dom.lower()
 
 
-async def railway_trigger_deploy(token: str, service_id: str, environment_id: str):
-    for m in ("serviceInstanceDeployV2", "serviceInstanceDeploy"):
+async def railway_trigger_deploy(token: str, service_id: str, environment_id: str,
+                                 project_id: str = ""):
+    """Ask Railway to build+deploy the service. The mutation has had three names across
+    schema versions; if none is accepted that is a hard failure — no build would ever
+    start and the row would sit in 'building' forever."""
+    last = ""
+    for m in ("serviceInstanceDeployV2", "serviceInstanceDeploy",
+              "environmentTriggersDeploy"):
         try:
-            await railway_gql(
-                token,
-                "mutation %s($serviceId: String!, $environmentId: String!) "
-                "{ %s(serviceId: $serviceId, environmentId: $environmentId) }" % (m, m),
-                {"serviceId": service_id, "environmentId": environment_id})
+            if m == "environmentTriggersDeploy":
+                await railway_gql(
+                    token,
+                    "mutation environmentTriggersDeploy($input: EnvironmentTriggersDeployInput!) "
+                    "{ environmentTriggersDeploy(input: $input) }",
+                    {"input": {"projectId": project_id, "serviceId": service_id,
+                               "environmentId": environment_id}})
+            else:
+                await railway_gql(
+                    token,
+                    "mutation %s($serviceId: String!, $environmentId: String!) "
+                    "{ %s(serviceId: $serviceId, environmentId: $environmentId) }" % (m, m),
+                    {"serviceId": service_id, "environmentId": environment_id})
             return
-        except PlatformError:
-            continue
+        except PlatformError as e:
+            last = str(e)
+    raise PlatformError("deploy trigger failed: %s" % (last or "all known trigger "
+                                                       "mutations rejected"))
+
+
+TGW_RL_LIVE = ("SUCCESS", "COMPLETE")
+TGW_RL_FAILED = ("FAILED", "CRASHED", "REMOVED", "CANCELLED", "CANCELED", "DELETED",
+                 "SKIPPED", "SLEEPING", "TIMEOUT")
 
 
 async def railway_deploy_status(token: str, project_id: str, service_id: str,
                                 environment_id: str) -> str:
-    try:
-        d = await railway_gql(
-            token,
-            """query deployments($input: DeploymentListInput!) {
-                 deployments(input: $input, first: 1) {
-                   edges { node { status } } } }""",
-            {"input": {"projectId": project_id, "serviceId": service_id,
-                       "environmentId": environment_id}})
-        st = (((d.get("deployments") or {}).get("edges") or [{}])[0].get("node") or {}).get("status", "")
-        if st in ("SUCCESS", "COMPLETE"):
-            return TGW_STATE_LIVE
-        if st in ("FAILED", "CRASHED", "REMOVED", "CANCELLED", "DELETED"):
-            return TGW_STATE_FAILED
-        return TGW_STATE_BUILDING
-    except PlatformError:
-        return TGW_STATE_BUILDING
+    """Map the service's latest deployment to our state. DeploymentListInput has moved
+    fields between schema versions (environmentId) — try the known shapes in order;
+    an empty list means no deployment was ever started (TGW_STATE_NONE)."""
+    last = ""
+    for inp in ({"projectId": project_id, "serviceId": service_id,
+                 "environmentId": environment_id},
+                {"projectId": project_id, "serviceId": service_id}):
+        try:
+            d = await railway_gql(
+                token,
+                """query deployments($input: DeploymentListInput!) {
+                     deployments(input: $input, first: 1) {
+                       edges { node { status } } } }""",
+                {"input": inp})
+            st = (((d.get("deployments") or {}).get("edges") or [{}])[0]
+                  .get("node") or {}).get("status", "")
+            if st in TGW_RL_LIVE:
+                return TGW_STATE_LIVE
+            if st in TGW_RL_FAILED:
+                return TGW_STATE_FAILED
+            if not st:
+                return TGW_STATE_NONE
+            return TGW_STATE_BUILDING     # QUEUED / WAITING / BUILDING / DEPLOYING
+        except PlatformError as e:
+            last = str(e)
+    raise PlatformError(last or "deployments query failed")
 
 
 async def railway_delete_service(token: str, service_id: str):
@@ -3046,28 +3146,66 @@ def tgw_slug(label: str, pid_hint: str = "") -> str:
     return ("tgp-" + (base + "-" if base else "") + tail)[:58]
 
 
-async def tgw_await_live(check, pid: int):
-    """Poll a platform until the deploy is live/failed, then persist the outcome."""
+async def tgw_await_live(check, pid: int, hint: str = ""):
+    """Poll a platform until the deploy is live/failed, then persist the outcome.
+    Consecutive poll errors and a 'no deployment was ever started' state fail the row
+    early with a real message instead of silently looping to the timeout."""
     deadline = time.time() + TGW_BUILD_TIMEOUT
+    nodeploy_since, errors = None, 0
     while time.time() < deadline:
-        await asyncio.sleep(10 if time.time() > 20 else 5)
+        await asyncio.sleep(TGW_POLL)
         try:
             state = await check()
+            errors = 0
         except PlatformError as e:
-            state = TGW_STATE_FAILED
-            with db() as c:
-                c.execute("UPDATE tg_web_proxies SET deploy_state=?, error=? WHERE id=?",
-                          (state, str(e)[:300], pid))
-            return
+            errors += 1
+            if errors >= TGW_ERR_LIMIT:
+                with db() as c:
+                    c.execute("UPDATE tg_web_proxies SET deploy_state=?,error=? WHERE id=?",
+                              (TGW_STATE_FAILED, str(e)[:300], pid))
+                return
+            continue
+        except Exception as e:      # never let the watcher itself die
+            errors += 1
+            if errors >= TGW_ERR_LIMIT:
+                with db() as c:
+                    c.execute("UPDATE tg_web_proxies SET deploy_state=?,error=? WHERE id=?",
+                              (TGW_STATE_FAILED, ("internal: %s" % e)[:300], pid))
+                return
+            continue
+        if state == TGW_STATE_NONE:  # nothing registered yet — give it a grace window
+            if nodeploy_since is None:
+                nodeploy_since = time.time()
+            elif time.time() - nodeploy_since > TGW_NODEPLOY_AFTER:
+                with db() as c:
+                    c.execute("UPDATE tg_web_proxies SET deploy_state=?,error=? WHERE id=?",
+                              (TGW_STATE_FAILED,
+                               "no deploy was started on the platform — check the repo/"
+                               "branch in the platform settings and the platform's "
+                               "dashboard for errors"[:300], pid))
+                return
+            continue
+        nodeploy_since = None
         if state == TGW_STATE_BUILDING and time.time() < deadline:
             continue
         with db() as c:
-            c.execute("UPDATE tg_web_proxies SET deploy_state=? WHERE id=?",
-                      (state, pid))
+            if state == TGW_STATE_FAILED:
+                row = c.execute("SELECT error FROM tg_web_proxies WHERE id=?",
+                                (pid,)).fetchone()
+                if row and (row["error"] or "").strip():
+                    c.execute("UPDATE tg_web_proxies SET deploy_state=? WHERE id=?",
+                              (state, pid))
+                    return
+                c.execute("UPDATE tg_web_proxies SET deploy_state=?,error=? WHERE id=?",
+                          (state, hint or "build failed — check the platform's "
+                           "dashboard logs", pid))
+                return
+            c.execute("UPDATE tg_web_proxies SET deploy_state=? WHERE id=?", (state, pid))
         return
     with db() as c:
-        c.execute("UPDATE tg_web_proxies SET deploy_state=?, error=? WHERE id=?",
-                  (TGW_STATE_FAILED, "build timeout", pid))
+        c.execute("UPDATE tg_web_proxies SET deploy_state=?,error=? WHERE id=?",
+                  (TGW_STATE_FAILED, "build timeout — check the platform's dashboard "
+                   "logs for the real error", pid))
 
 
 async def tgweb_deploy(pid: int):
@@ -3087,6 +3225,10 @@ async def tgweb_deploy(pid: int):
     region = coords.get("region") or tgw_default_region(platform)
     repo, branch = tgw_repo_url(), tgw_branch()
     try:
+        if TGW_PREFLIGHT and (await tgw_repo_state(repo, branch)) == "missing":
+            raise PlatformError(
+                "tproxy/Dockerfile not found in %s (branch %s) — push the tproxy "
+                "folder to GitHub first, then sync this proxy" % (repo, branch))
         if platform == "render":
             token = get_setting("tgweb_render_token") or ""
             owners = await render_owners(token)
@@ -3108,28 +3250,33 @@ async def tgweb_deploy(pid: int):
                 raise PlatformError("Render did not return the service URL")
             env["TGP_PUBLIC_HOSTNAME"] = host
             await render_put_env(token, sid, env)
-            await render_trigger_deploy(token, sid)
             coords.update({"ownerId": owner["id"], "name": name})
             with db() as c:
                 c.execute("""UPDATE tg_web_proxies
                              SET service_id=?, server=?, coords=?, deploy_state=?
                              WHERE id=?""",
                           (sid, host, json.dumps(coords), TGW_STATE_BUILDING, pid))
+            await render_trigger_deploy(token, sid)
             check = lambda: render_deploy_status(token, sid)
+            hint = ("Render build failed — open the service's Events/Logs page in the "
+                    "Render dashboard (repo %s, branch %s)" % (repo, branch))
         elif platform == "railway":
             token = get_setting("tgweb_railway_token") or ""
+            slug = tgw_github_slug(repo)
+            if not slug:
+                raise PlatformError("Railway builds from GitHub — the repo must look "
+                                    "like https://github.com/owner/repo (got %s)" % repo)
             owners = await railway_owners(token)
             ws = next((o for o in owners if not o["is_team"]), owners[0])
             name = tgw_slug(row["label"], str(pid))
             proj = await railway_create_project(token, ws["id"], name)
             sid = await railway_create_service(token, proj["projectId"], name)
-            await railway_configure_instance(token, sid, proj["environmentId"], repo,
+            await railway_configure_instance(token, sid, proj["environmentId"], slug,
                                              region)
             host = await railway_create_domain(token, proj["environmentId"], sid)
             await railway_upsert_vars(token, proj["projectId"], proj["environmentId"], sid,
                                       {"TGP_SECRET": row["secret"], "TGP_CARRIER": carrier,
                                        "TGP_PUBLIC_HOSTNAME": host, "TGP_PAUSED": "0"})
-            await railway_trigger_deploy(token, sid, proj["environmentId"])
             coords.update({"projectId": proj["projectId"],
                            "environmentId": proj["environmentId"]})
             with db() as c:
@@ -3137,8 +3284,13 @@ async def tgweb_deploy(pid: int):
                              SET service_id=?, server=?, coords=?, deploy_state=?
                              WHERE id=?""",
                           (sid, host, json.dumps(coords), TGW_STATE_BUILDING, pid))
+            await railway_trigger_deploy(token, sid, proj["environmentId"],
+                                         proj["projectId"])
             check = lambda: railway_deploy_status(token, proj["projectId"], sid,
                                                   proj["environmentId"])
+            hint = ("Railway build failed — open the deployment logs in the Railway "
+                    "dashboard; make sure tproxy/ is pushed to %s (branch %s) and "
+                    "Railway's GitHub app can read the repo" % (slug, branch))
         else:
             raise PlatformError("unknown platform")
     except PlatformError as e:
@@ -3154,7 +3306,7 @@ async def tgweb_deploy(pid: int):
         TGW_DEPLOY_TASKS.pop(pid, None)
         return
     TGW_DEPLOY_TASKS.pop(pid, None)
-    await tgw_await_live(check, pid)
+    await tgw_await_live(check, pid, hint)
 
 
 def tgw_spawn(pid: int):
@@ -3171,9 +3323,13 @@ def tgw_spawn_watch(pid: int):
         row = c.execute("SELECT * FROM tg_web_proxies WHERE id=?", (pid,)).fetchone()
     if not row or row["platform"] == "external":
         return
+    hint = "build failed — check the platform's dashboard logs"
+    repo, branch = tgw_repo_url(), tgw_branch()
     if row["platform"] == "render":
         token = get_setting("tgweb_render_token") or ""
         check = lambda: render_deploy_status(token, row["service_id"])
+        hint = ("Render build failed — open the service's Events/Logs page in the "
+                "Render dashboard (repo %s, branch %s)" % (repo, branch))
     else:
         try:
             coords = json.loads(row["coords"] or "{}")
@@ -3183,10 +3339,34 @@ def tgw_spawn_watch(pid: int):
         check = lambda: railway_deploy_status(token, coords.get("projectId", ""),
                                               row["service_id"],
                                               coords.get("environmentId", ""))
+        hint = ("Railway build failed — open the deployment logs in the Railway "
+                "dashboard; make sure tproxy/ is pushed to the repo (branch %s) and "
+                "Railway's GitHub app can read it" % branch)
     old = TGW_DEPLOY_TASKS.get(pid)
     if old and not old.done():
         return
-    TGW_DEPLOY_TASKS[pid] = asyncio.create_task(tgw_await_live(check, pid))
+    TGW_DEPLOY_TASKS[pid] = asyncio.create_task(tgw_await_live(check, pid, hint))
+
+
+def tgw_adopt_building_rows():
+    """After a panel restart the in-memory deploy/watch tasks are gone — any row still
+    marked 'building' would sit there forever. Re-adopt every one: rows that already
+    have a service go back to watching; rows that died mid-create redo the deploy."""
+    try:
+        with db() as c:
+            rows = c.execute("SELECT id, service_id FROM tg_web_proxies WHERE "
+                             "platform IN ('render','railway') AND deploy_state=?",
+                             (TGW_STATE_BUILDING,)).fetchall()
+    except Exception:
+        return
+    for r in rows:
+        try:
+            if r["service_id"]:
+                tgw_spawn_watch(r["id"])
+            else:
+                tgw_spawn(r["id"])
+        except Exception:
+            pass
 
 
 async def tgweb_platform_sync(row) -> dict:
@@ -3201,6 +3381,8 @@ async def tgweb_platform_sync(row) -> dict:
     except Exception:
         pass
     state, error, server = row["deploy_state"], row["error"], row["server"]
+    if platform in ("render", "railway") and not row["service_id"]:
+        return tgweb_out(row)     # create still in flight — there is no platform truth yet
     try:
         if platform == "render":
             token = get_setting("tgweb_render_token") or ""
@@ -3212,18 +3394,33 @@ async def tgweb_platform_sync(row) -> dict:
             st = svc.get("suspended")
             state = "suspended" if st == "suspended" else await render_deploy_status(
                 token, row["service_id"])
-            error = ""
+            if state == TGW_STATE_NONE:
+                state, error = row["deploy_state"], row["error"]   # no news — keep as-is
+            elif state == TGW_STATE_FAILED:
+                error = row["error"] or error      # never blur an existing reason
+            else:
+                error = ""
         elif platform == "railway":
             token = get_setting("tgweb_railway_token") or ""
-            state = await railway_deploy_status(token, coords.get("projectId", ""),
-                                                row["service_id"],
-                                                coords.get("environmentId", ""))
-            error = ""
+            st = await railway_deploy_status(token, coords.get("projectId", ""),
+                                             row["service_id"],
+                                             coords.get("environmentId", ""))
+            if st == TGW_STATE_NONE:
+                state, error = row["deploy_state"], row["error"]   # no news — keep as-is
+            elif st == TGW_STATE_FAILED:
+                state, error = st, (row["error"] or error)
+            else:
+                state, error = st, ""
         else:
             state = TGW_STATE_LIVE if server else TGW_STATE_FAILED
     except PlatformError as e:
         state, error = TGW_STATE_FAILED, str(e)[:300]
     with db() as c:
+        cur = c.execute("SELECT deploy_state, error FROM tg_web_proxies WHERE id=?",
+                        (pid,)).fetchone()
+        prev_err = ((cur or row)["error"] or "").strip()
+        if state == TGW_STATE_FAILED and prev_err:
+            error = prev_err            # never blur an already-recorded failure reason
         c.execute("UPDATE tg_web_proxies SET deploy_state=?, error=?, server=? WHERE id=?",
                   (state, error, server, pid))
     with db() as c:
@@ -4088,10 +4285,12 @@ async def list_tgweb(_=Depends(require_admin)):
 
 @app.get("/api/tgweb/regions")
 async def get_tgweb_regions(_=Depends(require_admin)):
-    """Official region lists per hosting platform + the effective defaults."""
+    """Official region lists per hosting platform + the effective defaults, plus the
+    platform this panel itself runs on ('' = hosted elsewhere)."""
     return {"render": TGW_REGIONS["render"], "railway": TGW_REGIONS["railway"],
             "default": {"render": tgw_default_region("render"),
-                        "railway": tgw_default_region("railway")}}
+                        "railway": tgw_default_region("railway")},
+            "self": tgw_self_platform()}
 
 
 @app.get("/api/tgweb/settings")
@@ -6704,9 +6903,9 @@ const I18N={
   statusDisabled:'غیرفعال',statusExpired:'منقضی',statusQuota:'حجم تمام',
   navTgweb:'وب‌پروکسی تلگرام',
   tgwNew:'ساخت وب‌پروکسی جدید',
-  tgwHint:'قابلیت WEB تلگرام: برای هر پروکسی یک سکرت جدا می‌سازی و لینک t.me/webproxy را در اختیار کاربر می‌گذاری؛ با باز کردن لینک، تلگرام خودش پروکسی را اضافه می‌کند (نوع WEB). می‌توانی میزبانی را به پنل بسپاری — پنل خودش پروکسی را روی Render یا Railway می‌سازد و لینک را صادر می‌کند — یا اگر tproxy سرور خودت را داری، گزینهٔ خارجی را انتخاب کن و فقط دامنه را بده (بدون https و بدون پورت).',
+  tgwHint:'قابلیت WEB تلگرام: برای هر پروکسی یک سکرت جدا می‌سازی و لینک t.me/webproxy را در اختیار کاربر می‌گذاری؛ با باز کردن لینک، تلگرام خودش پروکسی را اضافه می‌کند (نوع WEB). میزبانی را به پنل بسپار — پنل خودش پروکسی را روی Render یا Railway می‌سازد و لینک را صادر می‌کند.',
   tgwPlatform:'میزبان پروکسی',
-  tgwPlRender:'رندر',tgwPlRailway:'ریلوے',tgwPlExternal:'خارجی',
+  tgwPlRender:'رندر',tgwPlRailway:'ریلوی',tgwPlExternal:'خارجی',
   tgwCarrier:'حامل ارتباط',
   tgwRegion:'ریجن میزبانی',
   tgwRegionHint:'تغییر ریجن، سرویس را در ریجن جدید روی همان دامنه ری‌دپلوی می‌کند (چند دقیقه) و همهٔ لینک‌ها معتبر می‌مانند.',
@@ -6714,10 +6913,11 @@ const I18N={
   tgwTokenMissing:'توکن API این پلتفرم ذخیره نشده — اول از «تنظیمات پلتفرم» اضافه‌اش کن',
   tgwSetBtn:'تنظیمات پلتفرم',
   tgwSet:'پلتفرم میزبانی پروکسی',
-  tgwSetSub:'برای اینکه پنل خودش پروکسی‌ها را روی Render یا Railway بسازد، یک API token از همان پلتفرم اینجا ذخیره کن (Render: Account Settings → API Keys؛ Railway: Account Settings → Tokens). توکن‌ها فقط روی همین پنل ذخیره می‌شوند و فقط برای ساختن/مدیریت همین پروکسی‌ها استفاده می‌شوند. پروکسی از پوشهٔ tproxy در ریپوی زیر ساخته می‌شود.',
-  tgwRenderToken:'توکن API رندر (rnd_…)',tgwRailwayToken:'توکن API ریلوے',
-  tgwRepo:'ریپوی گیت‌هاب (شامل پوشهٔ tproxy)',tgwBranch:'برنچ',
+  tgwSetSub:'برای اینکه پنل خودش پروکسی‌ها را بسازد، توکن API پلتفرم میزبان را اینجا ذخیره کن (Render: Account Settings → API Keys؛ Railway: Account Settings → Tokens). توکن فقط روی همین پنل ذخیره می‌شود. ریپو و برنچ به‌صورت پیش‌فرض (ریپوی خود پروژه، برنچ main) استفاده می‌شوند و پروکسی از پوشهٔ tproxy در همان ریپو ساخته می‌شود — پس اول پوشهٔ tproxy را در گیت‌هاب push کن.',
+  tgwSetSubSelf:'این پنل روی {p} میزبانی می‌شود؛ فقط توکن API همان {p} برای ساختن پروکسی‌ها لازم است. توکن فقط روی همین پنل ذخیره می‌شود و پروکسی‌ها از پوشهٔ tproxy در ریپوی پیش‌فرض ساخته می‌شوند — پس اول پوشهٔ tproxy را در گیت‌هاب push کن.',
+  tgwRenderToken:'توکن API رندر (rnd_…)',tgwRailwayToken:'توکن API ریلوی',
   tgwSetSaved:'ذخیره شد ✓',
+  tgwBuildHint:'ساخت معمولاً ۲ تا ۴ دقیقه طول می‌کشد؛ اگر بیشتر شد، دکمهٔ ⟳ را بزن تا وضعیت از پلتفرم گرفته شود',
   tgwBuilding:'در حال ساخت',tgwLive:'آماده',tgwFailed:'خطا',tgwSuspended:'متوقف',
   tgwSync:'بررسی وضعیت ساخت',tgwNoServer:'بعد از استقرار، لینک همین‌جا ساخته می‌شود',
   tgwRotateWarnPl:'سکرت عوض شود؟ همهٔ لینک‌های قبلی از کار می‌افتند و سرویس روی {p} ری‌دپلوی می‌شود (چند دقیقه طول می‌کشد).',
@@ -6883,7 +7083,7 @@ const I18N={
   statusDisabled:'disabled',statusExpired:'expired',statusQuota:'quota used',
   navTgweb:'Telegram Web Proxy',
   tgwNew:'Create web proxy',
-  tgwHint:'Telegram WEB proxy: issue a separate secret per proxy and share its t.me/webproxy link — opening it in Telegram adds the WEB proxy automatically. Let the panel host it for you: it builds the proxy on Render or Railway and exports the link — or pick "External" if you already run a tproxy endpoint and just enter its bare domain (no https:// and no port).',
+  tgwHint:'Telegram WEB proxy: issue a separate secret per proxy and share its t.me/webproxy link — opening it in Telegram adds the WEB proxy automatically. Let the panel host it for you: it builds the proxy on Render or Railway and exports the link.',
   tgwPlatform:'Hosting',
   tgwPlRender:'Render',tgwPlRailway:'Railway',tgwPlExternal:'External',
   tgwCarrier:'Carrier',
@@ -6893,10 +7093,11 @@ const I18N={
   tgwTokenMissing:'No API token stored for this platform — add it in Platform settings first',
   tgwSetBtn:'Platform settings',
   tgwSet:'Proxy hosting platform',
-  tgwSetSub:'For the panel to build proxies on Render or Railway itself, store an API token of that platform here (Render: Account Settings → API Keys; Railway: Account Settings → Tokens). Tokens are stored only in this panel and are used only to create/manage these proxies. Each proxy is built from the tproxy folder of the repo below.',
+  tgwSetSub:'For the panel to build proxies itself, store an API token of the hosting platform here (Render: Account Settings → API Keys; Railway: Account Settings → Tokens). Tokens are stored only in this panel. Repo and branch use their defaults (the project repo, branch main) and each proxy is built from that repo\'s tproxy folder — so push the tproxy folder to GitHub first.',
+  tgwSetSubSelf:'This panel is hosted on {p}; only the {p} API token is needed to build proxies. The token is stored only in this panel and proxies are built from the tproxy folder of the default repo — so push the tproxy folder to GitHub first.',
   tgwRenderToken:'Render API token (rnd_…)',tgwRailwayToken:'Railway API token',
-  tgwRepo:'GitHub repo (containing the tproxy folder)',tgwBranch:'Branch',
   tgwSetSaved:'Saved ✓',
+  tgwBuildHint:'Builds usually take 2–4 minutes; if it takes longer, hit the ⟳ button to re-read the state from the platform',
   tgwBuilding:'Building',tgwLive:'Ready',tgwFailed:'Failed',tgwSuspended:'Suspended',
   tgwSync:'Check build status',tgwNoServer:'The link appears here once deployed',
   tgwRotateWarnPl:'Rotate the secret? All previous links stop working and the service on {p} redeploys (takes a few minutes).',
@@ -7323,12 +7524,8 @@ PANEL_HTML = r"""<!DOCTYPE html><html><head>
     <div class="seg" id="tgPlatSeg" style="margin:10px 0 4px">
      <button onclick="tgPickPlatform('render')" id="tgPlRender" class="on"></button>
      <button onclick="tgPickPlatform('railway')" id="tgPlRailway"></button>
-     <button onclick="tgPickPlatform('external')" id="tgPlExternal"></button>
     </div>
     <div class="g3 mt-3">
-     <label class="fld hidden" id="tgServerFld"><span class="text-xs dim" data-t="tgwServer"></span>
-      <input id="tgServer" class="inp mono" style="font-size:11.5px" dir="ltr"
-             placeholder="proxy.example.com"></label>
      <label class="fld"><span class="text-xs dim" data-t="tgwCarrier"></span>
       <select id="tgCarrier" class="inp">
        <option value="websocket">WebSocket</option>
@@ -7593,7 +7790,6 @@ function paintStatic(){
  btnTgSet.textContent='⚙️ '+T('tgwSetBtn');
  tgPlRender.textContent=T('tgwPlRender');
  tgPlRailway.textContent=T('tgwPlRailway');
- tgPlExternal.textContent=T('tgwPlExternal');
  fillTgRegions(tgPlatform);
  btnCipAdd.textContent=T('add'); btnBulk.textContent=T('bulkAdd');
  btnClearAll.textContent=T('clearAll'); btnPw.textContent=T('saveBtn');
@@ -7828,7 +8024,7 @@ async function delCip(id){await api('/api/clean-ips/'+id,{method:'DELETE'});load
 async function clearCips(){if(confirm(T('clearAll')+'?')){await api('/api/clean-ips',{method:'DELETE'});loadCips();loadStats()}}
 
 /* ─── telegram web proxy ─── */
-let tgwebs=[],tgPlatform='render',tgSettings=null,TGWREG=null;
+let tgwebs=[],tgPlatform='render',tgSettings=null,TGWREG=null,TGWSELF='';
 function genSecret(setField){
  const b=new Uint8Array(16);crypto.getRandomValues(b);
  const s=[...b].map(x=>x.toString(16).padStart(2,'0')).join('');
@@ -7841,7 +8037,10 @@ async function loadTgRegions(){
  if(TGWREG)return;
  try{TGWREG=await api('/api/tgweb/regions')}
  catch(e){TGWREG={render:[],railway:[],default:{}}}
- fillTgRegions(tgPlatform);
+ TGWSELF=TGWREG.self||'';
+ if(TGWSELF){const seg=document.getElementById('tgPlatSeg');
+  if(seg)seg.classList.add('hidden');}
+ tgPickPlatform(TGWSELF||tgPlatform);
 }
 function fillTgRegions(p){
  if(!TGWREG||!tgRegion)return;
@@ -7853,14 +8052,16 @@ function fillTgRegions(p){
  else if(cur&&rows.some(r=>r.id===cur))tgRegion.value=cur;
 }
 function tgPickPlatform(p){
+ if(TGWSELF)p=TGWSELF;
  tgPlatform=p;
- [['tgPlRender','render'],['tgPlRailway','railway'],['tgPlExternal','external']]
-  .forEach(([id,pp])=>document.getElementById(id).classList.toggle('on',pp===p));
- tgServerFld.classList.toggle('hidden',p!=='external');
- tgRegionFld.classList.toggle('hidden',p==='external');
+ [['tgPlRender','render'],['tgPlRailway','railway']]
+  .forEach(([id,pp])=>{const el=document.getElementById(id);
+   if(el)el.classList.toggle('on',pp===p)});
+ if(tgRegionFld)tgRegionFld.classList.toggle('hidden',
+  !(TGWREG&&(TGWREG[p]||[]).length));
  fillTgRegions(p);
  tgErr.textContent='';
- if(p!=='external'&&tgSettings&&!((p==='render'?tgSettings.render_token_set:tgSettings.railway_token_set)))
+ if(tgSettings&&!((p==='render'?tgSettings.render_token_set:tgSettings.railway_token_set)))
   tgErr.textContent=T('tgwTokenMissing');
 }
 async function loadTgSettings(){
@@ -7909,6 +8110,7 @@ function renderTgweb(){
      <span>${T('used')}: ${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</span>
      <span>${T('expiry')}: ${dt(u.expire_at)}</span>
      <span class="mono" dir="ltr">${esc(u.secret.slice(0,6))}…${esc(u.secret.slice(-4))}</span>
+     ${building?`<span style="color:var(--warn)">${T('tgwBuildHint')}</span>`:''}
      ${u.error?`<span style="color:var(--bad)" dir="ltr">${esc(u.error)}</span>`:''}
     </div>
    </div>
@@ -7925,45 +8127,43 @@ function renderTgweb(){
 async function createTgweb(){
  tgErr.textContent='';
  const plat=tgPlatform;
- if(plat!=='external'&&tgSettings
-    &&!((plat==='render'?tgSettings.render_token_set:tgSettings.railway_token_set))){
+ if(tgSettings&&!((plat==='render'?tgSettings.render_token_set:tgSettings.railway_token_set))){
   tgErr.textContent=T('tgwTokenMissing');return}
- if(plat==='external'&&!tgServer.value.trim()){
-  tgErr.textContent=T('tgwServer');return}
  try{
   await api('/api/tgweb',{method:'POST',body:JSON.stringify({
-   platform:plat,carrier:tgCarrier.value,region:tgRegion.value,
-   server:tgServer.value.trim(),label:tgLabel.value.trim(),
+   platform:plat,carrier:tgCarrier.value,region:tgRegion.value,label:tgLabel.value.trim(),
    secret:tgSecret.value.trim().toLowerCase(),
    quota_gb:parseFloat(tgQuota.value||0),expire_days:parseInt(tgDays.value||0)})});
-  tgServer.value='';tgLabel.value='';genSecret(true);tgQuota.value='0';tgDays.value='0';
+  tgLabel.value='';genSecret(true);tgQuota.value='0';tgDays.value='0';
   loadTgweb();
  }catch(e){tgErr.textContent=e.message}
+}
+function tgTokenField(id,hint,lbl){
+ return `<label class="fld mt-3"><span class="text-xs dim">${esc(lbl)}</span>
+  <input id="${id}" class="inp mono" style="font-size:11.5px" dir="ltr"
+         placeholder="${esc(hint||'')}" autocomplete="off"></label>`;
 }
 async function openTgSettings(){
  await loadTgSettings();
  const s=tgSettings||{};
+ const sub=TGWSELF?T('tgwSetSubSelf').replace('{p}',tgPlName(TGWSELF)):T('tgwSetSub');
+ let fields='';
+ if(TGWSELF==='railway')fields=tgTokenField('tgsRailway',s.railway_token_hint,T('tgwRailwayToken'));
+ else if(TGWSELF==='render')fields=tgTokenField('tgsRender',s.render_token_hint,T('tgwRenderToken'));
+ else fields=tgTokenField('tgsRender',s.render_token_hint,T('tgwRenderToken'))
+     +tgTokenField('tgsRailway',s.railway_token_hint,T('tgwRailwayToken'));
  openModal(T('tgwSet'),`
-  <p class="text-xs dim" style="margin:0">${T('tgwSetSub')}</p>
-  <label class="fld mt-3"><span class="text-xs dim">${T('tgwRenderToken')}</span>
-   <input id="tgsRender" class="inp mono" style="font-size:11.5px" dir="ltr"
-          placeholder="${s.render_token_hint||''}" autocomplete="off"></label>
-  <label class="fld mt-2"><span class="text-xs dim">${T('tgwRailwayToken')}</span>
-   <input id="tgsRailway" class="inp mono" style="font-size:11.5px" dir="ltr"
-          placeholder="${s.railway_token_hint||''}" autocomplete="off"></label>
-  <div class="g2 mt-2">
-   <label class="fld"><span class="text-xs dim">${T('tgwRepo')}</span>
-    <input id="tgsRepo" class="inp mono" style="font-size:11.5px" dir="ltr" value="${esc(s.repo||'')}"></label>
-   <label class="fld"><span class="text-xs dim">${T('tgwBranch')}</span>
-    <input id="tgsBranch" class="inp mono" dir="ltr" value="${esc(s.branch||'')}"></label>
-  </div>
+  <p class="text-xs dim" style="margin:0">${sub}</p>
+  ${fields}
   <button onclick="saveTgSettings()" class="btn w-full mt-3">${T('saveBtn')}</button>`);
 }
 async function saveTgSettings(){
+ const body={};
+ const rEl=document.getElementById('tgsRender'),wEl=document.getElementById('tgsRailway');
+ if(rEl)body.render_token=rEl.value.trim();
+ if(wEl)body.railway_token=wEl.value.trim();
  try{
-  await api('/api/tgweb/settings',{method:'POST',body:JSON.stringify({
-   render_token:tgsRender.value.trim(),railway_token:tgsRailway.value.trim(),
-   repo:tgsRepo.value.trim(),branch:tgsBranch.value.trim()})});
+  await api('/api/tgweb/settings',{method:'POST',body:JSON.stringify(body)});
   await loadTgSettings();tgPickPlatform(tgPlatform);
   closeModal();toast(T('tgwSetSaved'));
  }catch(e){toast(e.message)}
