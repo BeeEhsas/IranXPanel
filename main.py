@@ -2724,10 +2724,18 @@ def tgw_github_slug(repo_url: str) -> str:
     return ("%s/%s" % (m.group(1), m.group(2))) if m else ""
 
 
+# Railway's edge (Cloudflare WAF) answers Python's default "Python-urllib/3.x"
+# signature with a bare HTTP 403 "error code: 1010" — before the API ever sees the
+# token, which made a healthy token look rejected. Every outbound platform call
+# therefore presents an application User-Agent; Render and GitHub accept it too.
+PLATFORM_UA = "IranXPanel/2.0 (+https://github.com/BeeEhsas/IranXPanel)"
+
+
 def _http_probe(url: str) -> int:
     """GET a URL and return just the HTTP status (−1 on transport trouble)."""
     req = urllib.request.Request(url, method="GET")
     req.add_header("accept", "text/plain, text/html, */*")
+    req.add_header("user-agent", PLATFORM_UA)
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return int(getattr(resp, "status", 200))
@@ -2777,6 +2785,7 @@ def _http_json(method: str, url: str, token: str = "", body=None, timeout: int =
     non-2xx with the platform's own message when it has one."""
     req = urllib.request.Request(url, method=method)
     req.add_header("accept", "application/json")
+    req.add_header("user-agent", PLATFORM_UA)
     if token:
         req.add_header("authorization", "Bearer " + token)
     data = None
@@ -2789,15 +2798,28 @@ def _http_json(method: str, url: str, token: str = "", body=None, timeout: int =
             return json.loads(raw) if raw.strip() else None
     except urllib.error.HTTPError as e:
         try:
-            payload = json.loads(e.read().decode("utf-8", "replace"))
+            raw = e.read().decode("utf-8", "replace")
         except Exception:
-            payload = {}
+            raw = ""
+        payload = {}
+        if raw.strip():
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
         msg = (payload.get("message") if isinstance(payload, dict) else None) \
             or (payload.get("errors", [{}])[0].get("message")
                 if isinstance(payload, dict) and payload.get("errors") else None) \
             or {401: "token rejected", 402: "plan does not allow this operation",
                 403: "token not allowed for this action",
                 404: "service not found", 429: "rate limited"}.get(e.code, "HTTP %s" % e.code)
+        # A non-JSON body on a mapped code means an edge/WAF block answered, not the
+        # API ("error code: 1010" = Cloudflare signature ban) — surface what it said,
+        # otherwise the generic 403 text sends the user hunting for a token problem.
+        if isinstance(payload, dict) and not payload and raw.strip():
+            snippet = " ".join(raw.split())[:120]
+            if snippet and snippet.lower() not in msg.lower():
+                msg += " — edge said: %s" % snippet
         raise PlatformError(msg)
     except urllib.error.URLError as e:
         raise PlatformError("connection failed: %s" % getattr(e, "reason", e))
@@ -3382,6 +3404,18 @@ async def tgweb_platform_sync(row) -> dict:
         pass
     state, error, server = row["deploy_state"], row["error"], row["server"]
     if platform in ("render", "railway") and not row["service_id"]:
+        if row["deploy_state"] == TGW_STATE_FAILED and pid not in TGW_DEPLOY_TASKS:
+            # The create died before any service existed (edge block, token glitch…).
+            # There is nothing on the platform to re-read, so without a re-run this row
+            # can never recover — the refresh button is the retry: same path as a
+            # fresh add, one click, no duplicate while a task is still in flight.
+            with db() as c:
+                c.execute("UPDATE tg_web_proxies SET deploy_state=?, error='' WHERE id=?",
+                          (TGW_STATE_BUILDING, pid))
+            tgw_spawn(pid)
+            with db() as c:
+                row = c.execute("SELECT * FROM tg_web_proxies WHERE id=?",
+                                (pid,)).fetchone()
         return tgweb_out(row)     # create still in flight — there is no platform truth yet
     try:
         if platform == "render":
