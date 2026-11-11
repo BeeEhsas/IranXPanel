@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # IranXPanel WEB-proxy entrypoint: generate the tproxy-server config from env vars,
-# detect NAT for the MTProxy middle-end, start MTProxy on loopback, put a tiny TCP edge
-# (socat) on $PORT, then hand PID 1 to the official relay. See Dockerfile for the env
-# contract.
+# detect NAT for the MTProxy middle-end, start MTProxy on loopback, put the L7 edge
+# (tproxy-edge: Host canonicalization + one-address X-Forwarded-For) on $PORT, then
+# hand PID 1 to the official relay. See Dockerfile for the env contract and edge.go
+# for why a plain socat pipe is not enough on Railway/Render.
 #
-# Why the socat edge: upstream tproxy-server VALIDATES that its "listen" address is a
+# Why an edge at all: upstream tproxy-server VALIDATES that its "listen" address is a
 # numeric LOOPBACK address (internal/config/config.go — "must use a numeric loopback
 # address"). The reference layout is "edge -> 127.0.0.1:8080 tproxy-server", where Caddy
 # is the only thing on an external interface. Render/Railway terminate TLS at their
-# platform edge and forward plain HTTP/WebSocket to $PORT, so socat plays Caddy's L4
+# platform edge and forward plain HTTP/WebSocket to $PORT, so the edge plays Caddy's
 # role inside the container: 0.0.0.0:$PORT -> 127.0.0.1:$RELAY_PORT. Pointing the
 # config's "listen" at 0.0.0.0 instead makes the relay exit on startup and the deploy
-# die at the healthcheck stage ("Service offline").
+# die at the healthcheck stage ("Service offline"). It is an L7 hop (tproxy-edge), not
+# a raw socat pipe, because the relay also demands the original Host and exactly one
+# X-Forwarded-For address — see edge.go.
 set -euo pipefail
 
 die() { echo "entrypoint: $*" >&2; exit 1; }
@@ -21,7 +24,9 @@ HOST_PUB="${TGP_PUBLIC_HOSTNAME:-}"
 CARRIER="${TGP_CARRIER:-websocket}"
 PORT="${PORT:-8080}"
 # The relay's own loopback listener. 8081 is taken by admin_listen, 2398 by MTProxy.
-RELAY_PORT="${TGP_RELAY_PORT:-8082}"
+# Exported: tproxy-edge reads TGP_RELAY_PORT itself.
+export TGP_RELAY_PORT="${TGP_RELAY_PORT:-8082}"
+RELAY_PORT="$TGP_RELAY_PORT"
 PAUSED="${TGP_PAUSED:-}"
 
 [[ "$PORT" != "$RELAY_PORT" ]] || die "PORT and TGP_RELAY_PORT must differ"
@@ -138,14 +143,18 @@ cat > "$RUN/profiles.json" <<EOF
 EOF
 chmod 0600 "$RUN/config.json" "$RUN/profiles.json"
 
-# ── the public edge: socat owns 0.0.0.0:$PORT and pipes raw TCP to the relay's
-#    loopback listener. L4 only — the platform already terminated TLS, and WebSocket
-#    upgrades are plain bytes as far as socat is concerned. ──
-socat "TCP-LISTEN:${PORT},fork,reuseaddr" "TCP:127.0.0.1:${RELAY_PORT}" &
-SOCAT_PID=$!
+# ── the public edge: tproxy-edge owns 0.0.0.0:$PORT. Unlike the socat pipe it
+#    replaces, it is an L7 hop: it rewrites Host to the canonical public hostname
+#    (PaaS edges do not deliver it — the relay 404s every authenticated request
+#    otherwise) and collapses X-Forwarded-For to exactly one address (the relay
+#    rejects a list; Railway appends client-supplied entries). WebSocket upgrades
+#    and streaming bodies pass through untouched. ──
+echo "entrypoint: starting L7 edge 0.0.0.0:$PORT -> 127.0.0.1:$RELAY_PORT (host rewrite -> $HOST_PUB)"
+/usr/local/bin/tproxy-edge &
+EDGE_PID=$!
 sleep 0.3
-kill -0 "$SOCAT_PID" 2>/dev/null || die "socat edge could not bind 0.0.0.0:$PORT"
-echo "entrypoint: edge forwarder 0.0.0.0:$PORT -> 127.0.0.1:$RELAY_PORT (socat pid $SOCAT_PID)"
+kill -0 "$EDGE_PID" 2>/dev/null || die "tproxy-edge could not bind 0.0.0.0:$PORT"
+echo "entrypoint: edge forwarder 0.0.0.0:$PORT -> 127.0.0.1:$RELAY_PORT (tproxy-edge pid $EDGE_PID)"
 
 echo "entrypoint: handing over to tproxy-server (public_hostname=$HOST_PUB)"
 exec /usr/local/bin/tproxy-server -config "$RUN/config.json"

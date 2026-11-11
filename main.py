@@ -3606,6 +3606,11 @@ async def tgweb_platform_pause(row, paused: bool):
 
 
 async def tgweb_platform_delete(row):
+    """Delete the proxy's remote service — completely. A Railway proxy owns its whole
+    project (service + domain + deployments), and projectDelete is what actually frees
+    it — serviceDelete alone leaves an empty project shell behind and keeps consuming
+    the Trial plan's 2-domains-per-workspace quota. serviceDelete stays the fallback
+    for rows that predate project tracking or whose project is already gone."""
     platform = row["platform"]
     try:
         if platform == "render":
@@ -3613,7 +3618,23 @@ async def tgweb_platform_delete(row):
             await render_delete_service(token, row["service_id"])
         elif platform == "railway":
             token = get_setting("tgweb_railway_token") or ""
-            await railway_delete_service(token, row["service_id"])
+            try:
+                coords = json.loads(row["coords"] or "{}")
+            except Exception:
+                coords = {}
+            project_id = str(coords.get("projectId") or "").strip()
+            if project_id:
+                # raw call — railway_delete_project() swallows PlatformError, which
+                # would defeat the serviceDelete fallback below
+                try:
+                    await railway_gql(token, "mutation projectDelete($id: String!) "
+                                             "{ projectDelete(id: $id) }",
+                                      {"id": project_id})
+                except Exception:
+                    # project already gone / token scope — still strip the service shell
+                    await railway_delete_service(token, row["service_id"])
+            else:
+                await railway_delete_service(token, row["service_id"])
     except (PlatformError, Exception):
         pass  # best effort — the inventory row is removed regardless
 
@@ -6449,7 +6470,13 @@ function render(){
   $("#sDays").textContent = D.expireAt
     ? (D.remainDays > 0 ? num(D.remainDays)+" "+t("days") : num(D.remainHours)+" "+t("hours"))
     : t("unlimited");
+  // "used / limit" ratios contain a neutral "/" between two numbers, which the bidi
+  // algorithm reorders inside the RTL page — force LTR so it reads "1 / 3" in every
+  // language; the unlimited word keeps the page direction.
+  const ratio=(id,on)=>{const el=$(id);el.dir=on?"ltr":"auto"};
+  ratio("#sDev", !!D.deviceLimit);
   $("#sDev").textContent = D.deviceLimit ? num(D.devicesNow)+" / "+num(D.deviceLimit) : t("unlimited");
+  ratio("#sIp", !!D.ipLimit);
   $("#sIp").textContent = D.ipLimit ? num(D.ipsNow)+" / "+num(D.ipLimit) : t("unlimited");
   $("#mUsed").textContent = t("used")+": "+D.usedText;
   $("#mQuota").textContent = t("total")+": "+D.quotaText;
@@ -6772,7 +6799,11 @@ textarea.inp{resize:vertical;min-height:76px}
 /* ── chips / badges ── */
 .chip{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:700;
   padding:3px 9px;border-radius:999px;background:var(--chip);border:1px solid var(--chip-line);
-  color:var(--dim);white-space:nowrap}
+  color:var(--dim);white-space:nowrap;max-width:100%;overflow:hidden}
+/* long mono payloads (proxy domains) must truncate inside the card, not push it wide:
+   a block flex-item with min-width:0 lets text-overflow do the clipping */
+.chip.mono{display:block;min-width:0;text-overflow:ellipsis;text-align:center;direction:ltr;
+  unicode-bidi:isolate;overflow:hidden}
 .chip.green{background:color-mix(in srgb,var(--ok) 15%,transparent);border-color:transparent;color:var(--ok)}
 .chip.red{background:color-mix(in srgb,var(--bad) 15%,transparent);border-color:transparent;color:var(--bad)}
 .chip.blue{background:color-mix(in srgb,var(--info) 15%,transparent);border-color:transparent;color:var(--info)}
@@ -6997,7 +7028,7 @@ const I18N={
   statusDisabled:'غیرفعال',statusExpired:'منقضی',statusQuota:'حجم تمام',
   navTgweb:'وب‌پروکسی تلگرام',
   tgwNew:'ساخت وب‌پروکسی جدید',
-  tgwHint:'قابلیت WEB تلگرام: برای هر پروکسی یک سکرت جدا می‌سازی و لینک t.me/webproxy را در اختیار کاربر می‌گذاری؛ با باز کردن لینک، تلگرام خودش پروکسی را اضافه می‌کند (نوع WEB). میزبانی را به پنل بسپار — پنل خودش پروکسی را روی Render یا Railway می‌سازد و لینک را صادر می‌کند.',
+  tgwHint:'با استفاده از این قابلیت میتوانید یک پروکسی تلگرام با سکرت دلخواه بسازید؛ این قابلیت پروکسی تلگرام را با پروتکل وب پروکسی (WEB Proxy) روی حساب شما دیپلوی میکند و تحویل میدهد.',
   tgwPlatform:'میزبان پروکسی',
   tgwPlRender:'رندر',tgwPlRailway:'ریلوی',tgwPlExternal:'خارجی',
   tgwCarrier:'حامل ارتباط',
@@ -7008,7 +7039,7 @@ const I18N={
   tgwSetBtn:'تنظیمات پلتفرم',
   tgwSet:'پلتفرم میزبانی پروکسی',
   tgwSetSub:'برای اینکه پنل خودش پروکسی‌ها را بسازد، توکن API پلتفرم میزبان را اینجا ذخیره کن (Render: Account Settings → API Keys؛ Railway: Account Settings → Tokens). توکن فقط روی همین پنل ذخیره می‌شود. ریپو و برنچ به‌صورت پیش‌فرض (ریپوی خود پروژه، برنچ main) استفاده می‌شوند و پروکسی از پوشهٔ tproxy در همان ریپو ساخته می‌شود — پس اول پوشهٔ tproxy را در گیت‌هاب push کن.',
-  tgwSetSubSelf:'این پنل روی {p} میزبانی می‌شود؛ فقط توکن API همان {p} برای ساختن پروکسی‌ها لازم است. توکن فقط روی همین پنل ذخیره می‌شود و پروکسی‌ها از پوشهٔ tproxy در ریپوی پیش‌فرض ساخته می‌شوند — پس اول پوشهٔ tproxy را در گیت‌هاب push کن.',
+  tgwSetSubSelf:'این پنل روی {p} میزبانی می‌شود؛ پس برای ساخت وب پروکسی تلگرام به توکن {p} نیاز است آن را از حساب خود دریافت و در کادر زیر جای‌گذاری کنید.',
   tgwRenderToken:'توکن API رندر (rnd_…)',tgwRailwayToken:'توکن API ریلوی',
   tgwSetSaved:'ذخیره شد ✓',
   tgwBuildHint:'ساخت معمولاً ۲ تا ۴ دقیقه طول می‌کشد؛ اگر بیشتر شد، دکمهٔ ⟳ را بزن تا وضعیت از پلتفرم گرفته شود',
@@ -7177,7 +7208,7 @@ const I18N={
   statusDisabled:'disabled',statusExpired:'expired',statusQuota:'quota used',
   navTgweb:'Telegram Web Proxy',
   tgwNew:'Create web proxy',
-  tgwHint:'Telegram WEB proxy: issue a separate secret per proxy and share its t.me/webproxy link — opening it in Telegram adds the WEB proxy automatically. Let the panel host it for you: it builds the proxy on Render or Railway and exports the link.',
+  tgwHint:'With this feature you can create a Telegram proxy with a secret of your choice: it deploys a Telegram web proxy using the WEB Proxy protocol on your own account and hands it over.',
   tgwPlatform:'Hosting',
   tgwPlRender:'Render',tgwPlRailway:'Railway',tgwPlExternal:'External',
   tgwCarrier:'Carrier',
@@ -7188,7 +7219,7 @@ const I18N={
   tgwSetBtn:'Platform settings',
   tgwSet:'Proxy hosting platform',
   tgwSetSub:'For the panel to build proxies itself, store an API token of the hosting platform here (Render: Account Settings → API Keys; Railway: Account Settings → Tokens). Tokens are stored only in this panel. Repo and branch use their defaults (the project repo, branch main) and each proxy is built from that repo\'s tproxy folder — so push the tproxy folder to GitHub first.',
-  tgwSetSubSelf:'This panel is hosted on {p}; only the {p} API token is needed to build proxies. The token is stored only in this panel and proxies are built from the tproxy folder of the default repo — so push the tproxy folder to GitHub first.',
+  tgwSetSubSelf:'This panel is hosted on {p}; building a Telegram web proxy therefore needs the {p} API token — get it from your own account and paste it into the field below.',
   tgwRenderToken:'Render API token (rnd_…)',tgwRailwayToken:'Railway API token',
   tgwSetSaved:'Saved ✓',
   tgwBuildHint:'Builds usually take 2–4 minutes; if it takes longer, hit the ⟳ button to re-read the state from the platform',
@@ -8021,10 +8052,10 @@ function renderUsers(){
   const badge=u.active
    ?`<span class="chip green">${T('active')}</span>`
    :`<span class="chip red">${statusTxt(u.status)}</span>`;
-  const dev=u.device_limit?`${u.devices_now}/${u.device_limit}`:'∞';
+  const dev=u.device_limit?`<bdi dir="ltr">${u.devices_now}/${u.device_limit}</bdi>`:'∞';
   const liveTag=u.devices_live?`<span class="chip green">● ${u.devices_live}</span>`:'';
   const devWarn=u.device_limit&&u.devices_now>=u.device_limit;
-  const ipN=u.ip_limit?`${u.ips_now}/${u.ip_limit}`:'∞';
+  const ipN=u.ip_limit?`<bdi dir="ltr">${u.ips_now}/${u.ip_limit}</bdi>`:'∞';
   const ipWarn=u.ip_limit&&u.ips_now>=u.ip_limit;
   const ipTag=u.ips_live?`<span class="chip green">● ${u.ips_live}</span>`:'';
   return `<div class="urow">
@@ -8036,7 +8067,7 @@ function renderUsers(){
     </div>
     <div class="progress mt-2${pct>=85?' hot':''}"><i style="width:${pct}%"></i></div>
     <div class="flex flex-wrap gap-3 text-xs dim mt-1">
-     <span>${T('used')}: ${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</span>
+     <span>${T('used')}: <bdi dir="ltr">${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</bdi></span>
      <span>${T('expiry')}: ${dt(u.expire_at)}</span>
     </div>
    </div>
@@ -8201,7 +8232,7 @@ function renderTgweb(){
     </div>
     ${u.quota_bytes?`<div class="progress mt-2${pct>=85?' hot':''}"><i style="width:${pct}%"></i></div>`:''}
     <div class="flex flex-wrap gap-3 text-xs dim mt-1">
-     <span>${T('used')}: ${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</span>
+     <span>${T('used')}: <bdi dir="ltr">${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</bdi></span>
      <span>${T('expiry')}: ${dt(u.expire_at)}</span>
      <span class="mono" dir="ltr">${esc(u.secret.slice(0,6))}…${esc(u.secret.slice(-4))}</span>
      ${building?`<span style="color:var(--warn)">${T('tgwBuildHint')}</span>`:''}
@@ -8572,7 +8603,7 @@ async function paintIps(quiet){
   <b class="text-base">${T('devSec')}</b>
   <div class="g2 text-sm">
    <div class="kv"><span class="dim">${T('countedFor')}</span>
-    <span class="ms-auto font-bold" style="color:var(--info)">${d.counted}${d.limit?' / '+d.limit:' / ∞'}</span></div>
+    <span class="ms-auto font-bold" style="color:var(--info)"><bdi dir="ltr">${d.counted}${d.limit?' / '+d.limit:' / ∞'}</bdi></span></div>
    <div class="kv"><span class="dim">${T('totalSeen')}</span>
     <span class="ms-auto font-bold">${d.total_seen}</span></div>
   </div>
@@ -8580,7 +8611,7 @@ async function paintIps(quiet){
   <b class="text-base">${T('ipSec')}</b>
   <div class="g2 text-sm">
    <div class="kv"><span class="dim">${T('ipCounted')}</span>
-    <span class="ms-auto font-bold" style="color:var(--info)">${d.ip_counted}${d.ip_limit?' / '+d.ip_limit:' / ∞'}</span></div>
+    <span class="ms-auto font-bold" style="color:var(--info)"><bdi dir="ltr">${d.ip_counted}${d.ip_limit?' / '+d.ip_limit:' / ∞'}</bdi></span></div>
    <div class="kv"><span class="dim">${T('ipsTotal')}</span>
     <span class="ms-auto font-bold">${d.ip_total_seen}</span></div>
   </div>

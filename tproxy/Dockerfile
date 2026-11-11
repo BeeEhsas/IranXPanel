@@ -11,10 +11,13 @@
 # Listening layout: upstream tproxy-server REQUIRES a loopback "listen" (it validates
 # the config and refuses 0.0.0.0 with "must use a numeric loopback address"). The
 # official reference layout puts Caddy on the external interface; here the platform
-# (Render / Railway) already terminates TLS and forwards plain HTTP/WebSocket to $PORT,
-# so a socat edge takes Caddy's L4 role inside the container:
+# (Render / Railway) already terminates TLS and forwards plain HTTP/WebSocket to $PORT.
+# The relay additionally demands the ORIGINAL Host and exactly ONE X-Forwarded-For
+# address — PaaS edges break both (Railway rewrites Host away from the canonical
+# domain and appends client-supplied XFF entries, which Iranian carriers inject),
+# so a small Go L7 edge (edge.go) takes Caddy's role inside the container:
 #
-#     platform edge :443 -> container 0.0.0.0:$PORT (socat)
+#     platform edge :443 -> container 0.0.0.0:$PORT (tproxy-edge)
 #                         -> 127.0.0.1:$RELAY_PORT tproxy-server
 #                         -> 127.0.0.1:2398 mtproto-proxy
 #
@@ -39,7 +42,7 @@ ARG GO_IMAGE=golang:1.23-bookworm
 ARG BUILD_IMAGE=debian:bookworm
 ARG RUN_IMAGE=debian:bookworm-slim
 
-# ── stage 1: build the official relay ───────────────────────────────────────────
+# ── stage 1: build the official relay ───────────────────────────────────────
 FROM ${GO_IMAGE} AS relay
 ARG TPROXY_COMMIT=c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8
 WORKDIR /build
@@ -53,7 +56,14 @@ RUN apt-get update \
  && cd src \
  && go build -trimpath -ldflags "-s -w" -o /out/tproxy-server ./cmd/tproxy-server
 
-# ── stage 2: build the stock MTProxy backend ────────────────────────────────────
+# ── stage 2: build the in-container L7 edge (Host canonicalization + one-address
+#    X-Forwarded-For; see edge.go for why the relay cannot do without it) ──
+FROM ${GO_IMAGE} AS edge
+WORKDIR /build
+COPY go.mod edge.go ./
+RUN go build -trimpath -ldflags "-s -w" -o /out/tproxy-edge .
+
+# ── stage 3: build the stock MTProxy backend ────────────────────────────────────
 # Same pinned commit and sha256 as deploy/install-mtproxy.sh of tproxy-server.
 FROM ${BUILD_IMAGE} AS mtproxy
 ARG MTPROXY_COMMIT=f36d8af769ffaeac36978d38c2c0f6d1104c2137
@@ -70,13 +80,14 @@ RUN apt-get update \
  && tar -xzf /tmp/mtproxy.tar.gz -C /opt/MTProxy --strip-components=1 \
  && make -C /opt/MTProxy -j"$(nproc)"
 
-# ── stage 3: runtime ────────────────────────────────────────────────────────────
+# ── stage 4: runtime ────────────────────────────────────────────────────────────
 FROM ${RUN_IMAGE}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl iproute2 libssl3 zlib1g socat \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --home /nonexistent --shell /usr/sbin/nologin mtproxy
 COPY --from=relay   /out/tproxy-server            /usr/local/bin/tproxy-server
+COPY --from=edge    /out/tproxy-edge              /usr/local/bin/tproxy-edge
 COPY --from=mtproxy /opt/MTProxy/objs/bin/mtproto-proxy /opt/mtproxy/mtproto-proxy
 COPY site/ /srv/tproxy-site/
 COPY entrypoint.sh /entrypoint.sh

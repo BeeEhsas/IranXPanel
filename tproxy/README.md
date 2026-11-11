@@ -13,9 +13,17 @@ environment (`TGP_SECRET`, `TGP_PUBLIC_HOSTNAME`, `TGP_CARRIER`), and issues the
 | `tproxy-server` | official `telegramdesktop/tproxy-server`, pinned commit `c8adb8b…` | the WEB-proxy relay Telegram Desktop 7.1+ talks to (HTTPS/WebSocket carriers, bridge page, capability checks) |
 | `mtproto-proxy` | official `TelegramMessenger/MTProxy`, the same pinned commit + sha256 the upstream installer verifies | loopback backend on `127.0.0.1:2398`; the relay dials it per logical stream |
 | `site/index.html` | this folder | the neutral page unauthenticated visitors get (active-probing cover) |
+| `edge.go` | this folder | the in-container L7 edge (`tproxy-edge`): canonical `Host` rewrite + one-address XFF, WS/streaming passthrough |
 
 TLS terminates at the platform edge, so the relay serves **plain HTTP/WebSocket on
-`$PORT`** — the same job Caddy does in the official reference deployment.
+`$PORT`** — the same job Caddy does in the official reference deployment. On
+Railway/Render the front is `edge.go` (built as `tproxy-edge`), not a raw TCP pipe:
+the relay accepts authenticated traffic only when it receives the canonical public
+hostname in `Host` and **exactly one** address in `X-Forwarded-For` — PaaS edges
+deliver neither (Railway rewrites `Host` and appends client-supplied XFF entries,
+which Iranian carriers inject). The edge rewrites `Host` to `TGP_PUBLIC_HOSTNAME`
+and collapses XFF to the platform edge's observed client IP on every request;
+WebSocket upgrades and streaming bodies pass through untouched.
 
 ## Environment variables
 
