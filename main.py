@@ -2180,11 +2180,13 @@ ISO2_RE = re.compile(r"(?:^|[\s\-_\[\(#|])([A-Za-z]{2})(?:$|[\s\-_\]\)#|])")
 
 
 def flag_of(code: str) -> str:
-    """ISO-3166 alpha-2 -> regional-indicator flag (e.g. DE -> German flag)."""
+    """ISO alpha-2 -> country code shown as text.
+
+    Emoji flags render as empty boxes on many Android builds and on Windows,
+    so the panel never emits them; callers get "DE" instead of a glyph.
+    """
     c = re.sub(r"[^A-Za-z]", "", code or "")[:2].upper()
-    if len(c) != 2:
-        return ""
-    return "".join(chr(0x1F1E6 + ord(ch) - 65) for ch in c)
+    return c if len(c) == 2 else ""
 
 
 def guess_country(text: str) -> str:
@@ -6322,7 +6324,7 @@ def render_sub_page(
 
 _TEMPLATE = r"""
 <!doctype html>
-<html lang="fa" dir="rtl" data-theme="gray">
+<html lang="en" dir="ltr" data-theme="gray">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -6358,15 +6360,14 @@ html,body{margin:0;padding:0;max-width:100%;overflow-x:hidden}
 body{
   background:var(--bg);color:var(--tx);min-height:100vh;
   padding:14px 13px 40px;
-  font-family:'Inter','Vazirmatn',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,system-ui,sans-serif;
-  font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;
+  /* همان پشتهٔ فونت پنل */
+  font-family:'Vazirmatn','Vazir','IRANSansX',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,system-ui,sans-serif;
+  font-size:13.5px;line-height:1.6;-webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
   background-image:radial-gradient(circle at 50% -18%,rgba(34,239,157,.07),transparent 58%);
 }
-html[lang="fa"] body{
-  font-family:'Vazirmatn','Vazir','IRANSansX',Tahoma,'Segoe UI',system-ui,sans-serif;
-  font-size:14px;line-height:1.85;
-}
-html[lang="fa"] b,html[lang="fa"] strong{font-weight:600}
+b,strong{font-weight:600}
+button,input,select,textarea{font-family:inherit}
 .mono{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;
   font-variant-numeric:tabular-nums}
 bdi{unicode-bidi:isolate}
@@ -6592,7 +6593,6 @@ footer{text-align:center;font-size:10px;color:var(--tx3);margin-top:20px;line-he
     <div class="tools">
       <span class="tag" id="trTag" hidden></span>
       <button class="chip" id="themeBtn" type="button"></button>
-      <button class="chip" id="langBtn" type="button"></button>
     </div>
   </div>
 
@@ -6682,23 +6682,6 @@ const esc = (s)=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&
 
 /* ── i18n ── */
 const T = {
-  fa:{brand:"IranX · اشتراک من", remainVol:"حجم باقی‌مانده", remainTime:"زمان باقی‌مانده",
-    devices:"دستگاه مجاز", ipAddr:"آی‌پی مجاز", used:"مصرف‌شده", total:"کل", usage:"مصرف",
-    copySub:"کپی لینک اشتراک", copyAll:"کپی همه کانفیگ‌ها", addTo:"افزودن به",
-    configs:"کانفیگ‌ها", downloads:"دانلود برنامه‌ها", noConfigs:"کانفیگ فعالی وجود ندارد.",
-    showQr:"نمایش QR", copyCfg:"کپی کانفیگ",
-    scanHint:"با دوربین برنامه اسکن کنید تا اشتراک خودکار اضافه شود",
-    footer:"لینک اشتراک شخصی شماست — آن را با کسی به اشتراک نگذارید",
-    updEvery:(h)=>"به‌روزرسانی هر "+h+" ساعت", expires:"انقضا", noExpiry:"بدون انقضا",
-    unlimited:"بی‌نهایت", support:"با پشتیبانی تماس بگیرید",
-    statusActive:"فعال", statusExpired:"اشتراک منقضی شده", statusQuota:"حجم اشتراک تمام شده",
-    statusDisabled:"اشتراک غیرفعال شده", statusInactive:"اشتراک فعال نیست",
-    resetEveryN:(n)=>"ریست مصرف هر "+n+" روز", nextReset:"ریست بعدی",
-    days:"روز", hours:"ساعت", left:"باقی‌مانده", cfgCount:(n)=>n+" کانفیگ فعال",
-    copiedSub:"لینک اشتراک کپی شد", copiedAll:"همه کانفیگ‌ها کپی شد", copiedCfg:"کانفیگ کپی شد",
-    noQr:"QR در دسترس نیست",
-    importHint:"اگر برنامه باز نشد: لینک کپی شده — در برنامه گزینهٔ Add from clipboard را بزنید",
-    allVersions:"همه نسخه‌ها", light:"روشن", dark:"خاکستری", subName:"اشتراک"},
   en:{brand:"IranX · My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
     devices:"Devices", ipAddr:"Allowed IPs", used:"Used", total:"Total", usage:"used",
     copySub:"Copy subscription link", copyAll:"Copy all configs", addTo:"Add to",
@@ -6717,9 +6700,9 @@ const T = {
     importHint:"If the app did not open: the link is copied — use “Add from clipboard” inside the app",
     allVersions:"All versions", light:"Light", dark:"Gray", subName:"Subscription"}
 };
-let LANG="fa", THEME="gray", current=(D.osTabs&&D.osTabs[0]?D.osTabs[0][0]:"android");
-try{ LANG=localStorage.getItem("iranx_lang")||LANG; THEME=localStorage.getItem("iranx_theme")||THEME; }catch(e){}
-if(LANG!=="en") LANG="fa";
+let LANG="en", THEME="gray", current=(D.osTabs&&D.osTabs[0]?D.osTabs[0][0]:"android");
+try{ THEME=localStorage.getItem("iranx_theme")||THEME; }catch(e){}
+LANG="en";
 if(THEME!=="light") THEME="gray";
 const t = (k)=>T[LANG][k];
 /* ارقام لاتین: صفرِ فارسی و ارقام عربی-هندی روی برخی فونت‌ها شبیه نقطه دیده
@@ -6836,7 +6819,6 @@ function render(){
   $("#bTitle").textContent = t("brand");
   $("#themeBtn").innerHTML = (THEME==="light" ? ICON_MOON : ICON_SUN) +
     "<span>"+(THEME==="light" ? t("dark") : t("light"))+"</span>";
-  $("#langBtn").textContent = LANG==="fa" ? "EN" : "FA";
   const tr = D.transport === "BOTH" ? "WS + XHTTP" : D.transport;
   $("#trTag").textContent = tr || "";
   $("#trTag").hidden = !tr;
@@ -6898,8 +6880,6 @@ $("#impHid").onclick = ()=>addSub("hiddify");
 $("#impV2").onclick = ()=>addSub("v2rayng");
 $("#themeBtn").onclick = ()=>{ THEME = THEME==="light" ? "gray" : "light";
   try{ localStorage.setItem("iranx_theme", THEME); }catch(e){} render(); };
-$("#langBtn").onclick = ()=>{ LANG = LANG==="fa" ? "en" : "fa";
-  try{ localStorage.setItem("iranx_lang", LANG); }catch(e){} render(); };
 $("#cfgs").addEventListener("click",(e)=>{
   const b=e.target.closest("button"); if(!b) return;
   if(b.dataset.copy!==undefined) copy(D.configs[+b.dataset.copy].uri, t("copiedCfg"));
@@ -7426,7 +7406,8 @@ label>input[type="checkbox"]+span{font-size:12.5px;color:var(--tx2)}
   position:absolute;top:calc(100% + 5px);inset-inline:0;z-index:60;
   background:var(--s1);border:1px solid var(--line2);border-radius:10px;padding:5px;
   box-shadow:0 22px 50px -14px rgba(0,0,0,.85),0 0 0 1px rgba(255,255,255,.03);
-  max-height:270px;overflow-y:auto;
+  max-height:270px;overflow-y:auto;overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;touch-action:pan-y;
   opacity:0;transform:translateY(-6px) scale(.985);pointer-events:none;
   transition:opacity .16s var(--ease),transform .16s var(--ease);transform-origin:top center;
 }
@@ -7534,11 +7515,17 @@ html[lang="fa"] .ph h1{letter-spacing:-.1px;font-size:21px}
 
 /* ردیف ابزار: چیپ ترنسپورت کنار سه دکمه */
 .uc-tools{display:flex;align-items:center;gap:8px;min-width:0}
-/* RTL: چیپ ترنسپورت سمت راست، دکمه‌ها سمت چپ */
-.uc-tsp{flex:0 0 auto;display:inline-flex}
+/* چیپ ترنسپورت در ردیف نام، ته ردیف */
+.uc-top .uc-tsp{flex:0 0 auto;margin-inline-start:auto;align-self:center}
+.uc-tools{min-height:0}
 .uc-tools .chip{flex:0 0 auto}
-.uc-act{display:flex;gap:6px;align-items:center;flex:0 0 auto;
-  margin-inline-start:auto}
+.uc-act{display:flex;gap:6px;align-items:center;flex:0 0 auto}
+/* نماد بی‌نهایت بزرگ‌تر و هم‌تراز با عددها */
+.inf{font-family:'Vazirmatn',Tahoma,sans-serif;font-style:normal;font-size:19px;
+  font-weight:600;line-height:1;vertical-align:-2px;letter-spacing:0;
+  display:inline-block;min-width:13px}
+.uc-foot .inf{font-size:19px}
+.uc-num .inf{font-size:18px}
 .uc-act .icon-btn{width:31px;height:31px;flex:0 0 31px}
 .uc-act .icon-btn svg{width:15px;height:15px}
 
@@ -7823,187 +7810,25 @@ label.chip{display:inline-flex;align-items:center;gap:7px;line-height:1.5}
   background:rgba(168,112,0,.07);border-color:rgba(168,112,0,.3);color:#7d5a00;
 }
 [data-theme="light"] .notice::before{opacity:.75}
+
+/* ── v4.5 ── */
+/* فاصلهٔ کادرهای هشدار از همسایه‌ها (قبلاً با style="margin:0" چسبیده بود) */
+.card p.notice{margin-block:12px}
+.card p.notice:first-child{margin-block-start:0}
+.card p.notice:last-child{margin-block-end:0}
+/* دکمه‌های اکشن کارت کاربر: هم‌تراز با لبهٔ شروع کارت */
+.uc-tools{justify-content:flex-start}
+
+/* منوی کشویی: اسکرول داخل منو به صفحه سرایت نکند */
+.sel-menu{overscroll-behavior:contain}
 """
 
 
 I18N_JS = r"""
 const I18N={
- fa:{dir:'rtl',
-  unitBytes:'بایت',loadingLbl:'در حال بارگذاری…',noLive:'اتصال بازی نیست',
-  phDash:'وضعیت لحظه‌ای سرور، کاربران و ترافیک',  phUsers:'ساخت، ویرایش و پیگیری حساب‌ها',  phClean:'آی‌پی‌هایی که در لینک ساب قرار می‌گیرند',  phFilter:'دامنه‌های مسدود و مجاز',  phProxy:'استخر پروکسی و انتخاب خودکار',  phLive:'اتصال‌های باز در همین لحظه',  phTgweb:'وب‌پروکسی تلگرام',  phSettings:'ظاهر، رمز عبور، پشتیبان‌گیری و سرور',  phLogs:'آخرین رخدادهای پنل',  refreshLbl:'به‌روزرسانی',  tabBasic:'پایه',  tabLimits:'محدودیت‌ها',  tabSecurity:'امنیت',  viewAll:'همه',  r24:'۲۴ ساعت',  cancel:'انصراف',  statHintUsers:'حساب ساخته‌شده',  statHintOnline:'الان متصل',  statHintDev:'دستگاه فعال',  statHintBytes:'از زمان راه‌اندازی',  statHintCip:'در لینک ساب',  statHintLive:'نشست زنده',  zeroInfShort:'صفر یعنی بی‌نهایت.',  moreLbl:'جزئیات',  noResult:'چیزی پیدا نشد',
-  setupTitle:'تعیین رمز عبور',setupSub:'اولین ورود: یک رمز انتخاب کن.',
-  loginTitle:'ورود به پنل',loginSub:'رمز عبور',
-  password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخیره و ورود',
-  pwRule:'حداقل ۸ کاراکتر شامل حرف بزرگ، حرف کوچک و عدد',netErr:'خطای شبکه',
-  navDash:'داشبورد',navUsers:'مدیریت کاربران',navClean:'آی‌پی تمیز',
-  navProxy:'پروکسی',navLive:'اتصالات زنده',
-  navSettings:'تنظیمات پنل',navLogs:'رخدادها',menu:'منو',
-  totalUsers:'کل کاربران',online:'کاربران آنلاین',devices:'دستگاه‌های متصل',
-  traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'نشست‌های XHTTP',liveTitle:'اتصالات زنده',liveEmpty:'هیچ اتصالی فعال نیست',
-  chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تعداد اتصالات هر ترنسپورت',
-  newUser:'ساخت کاربر جدید',users:'کاربران',
-  name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',ipLimit:'تعداد آی‌پی',
-  transport:'روش اتصال',trWs:'WS + TLS',trXhttp:'XHTTP + TLS',trBoth:'هر دو',
-  add:'افزودن',zeroInf:'۰ = بی‌نهایت. هر دستگاه با IP و مشخصات کلاینتش شناخته می‌شود. سقف آی‌پی جداست و روی آدرس‌های تکراری حساب نمی‌شود.',
-  search:'جستجو…',noUsers:'کاربری نیست',
-  config:'کانفیگ',ipsBtn:'دستگاه‌ها و آی‌پی‌ها',edit:'ویرایش',
-  used:'مصرف',expiry:'انقضا',never:'بی‌نهایت',
-  subLink:'لینک اشتراک (Subscription)',copySub:'کپی لینک اشتراک',
-  singleCfg:'کانفیگ‌های تکی',copy:'کپی',copied:'کپی شد ✓',
-  devTitle:'دستگاه‌های متصل',noConn:'هنوز اتصالی ثبت نشده',
-  clearIps:'پاک کردن دستگاه‌ها و آی‌پی‌ها',delDevice:'حذف دستگاه',delDeviceWarn:'این دستگاه از لیست حذف شود؟ (یک جای خالی آزاد می‌شود)',unknownClient:'ناشناس',devLimitLbl:'مجاز',onlineTag:'آنلاین',offlineTag:'آفلاین',
-  devSec:'دستگاه‌ها',ipSec:'آی‌پی‌ها',ipCounted:'آی‌پی‌های شمرده‌شده',ipsTotal:'کل آی‌پی‌های دیده‌شده',delIp:'حذف آی‌پی',delIpWarn:'این آی‌پی از لیست حذف شود؟ (یک جای خالی آزاد می‌شود)',
-  liveNow:'الان متصل',noneNow:'همین الان هیچ دستگاهی متصل نیست',
-  countedFor:'حساب‌شده در سقف',totalSeen:'کل دستگاه‌های دیده‌شده',
-  showHistory:'نمایش تاریخچه',showLive:'نمایش فقط متصل‌ها',
-  inLast:'%s ثانیه پیش',refresh:'به‌روزرسانی',
-  liveDevices:'دستگاه‌های فعال الان',
-  editUser:'ویرایش',remainDays:'مدت باقی‌مانده (روز)',allowedDev:'تعداد دستگاه مجاز',allowedIp:'تعداد آی‌پی مجاز',
-  active:'فعال',saveBtn:'ذخیره',resetTraffic:'ریست حجم',newUuid:'UUID جدید',
-  customUuid:'UUID دستی',del:'حذف',
-  obfLbl:'پنهان‌سازی (Fragment + Cipher)',
-  echLbl:'ضد سانسور (ECH)',
-  fpLbl:'فینگرپرینت TLS',alpnLbl:'ALPN',alpnDef:'پیش‌فرض این نوع کانفیگ',alpnNone:'بدون ALPN (حذف از لینک)',
-  uuidWarn:'UUID عوض شود؟ کانفیگ‌های قبلی از کار می‌افتند.',delWarn:'این کاربر حذف شود؟',
-  cleanTitle:'مدیریت Clean IP',
-  cleanHint:'آی‌پی یا دامنه تمیز. در لینک اشتراک هر کاربر به عنوان کانفیگ اضافی اضافه می‌شود.',
-  addrPh:'مثلا 1.2.3.4 یا cdn.example.com',remarkPh:'برچسب (اختیاری)',
-  bulkPh:'چند مورد، هر خط یکی:\n1.2.3.4 # ایرانسل\n5.6.7.8 # همراه اول',
-  bulkAdd:'افزودن انبوه',clearAll:'حذف همه',
-  pxTitle:'پروکسی خروجی',
-  pxHint:'وقتی پروکسی فعال است، ترافیک کاربران از آن خارج می‌شود و سایت‌ها IP پروکسی را می‌بینند.',
-  pxKind:'نوع',pxHost:'هاست / ایپی',pxPort:'پورت',
-  pxUser:'یوزرنیم (اختیاری)',pxPass:'پسورد (اختیاری)',
-  pxAdd:'افزودن و تست',pxTestAll:'تست همه',
-  pxInSub:'در ساب',
-  pxAutoNote:'پروکسی‌های اضافه‌شده خودکار در ساب همه کاربران می‌آیند. کانفیگ مستقیم همیشه می‌ماند — تست ناموفق چیزی را حذف نمی‌کند.',
-  pxLineHint:'هر خط یک پروکسی — مانند socks5://1.1.1.1:5866 یا http://user:pass@2.2.2.2:8080',
-  pxAddLines:'افزودن لیست و تست',
-  pxAdvanced:'ورود دستی فیلدها',
-  pxDirect:'اتصال مستقیم (بدون پروکسی)',
-  pxActive:'فعال',pxArm:'فعال کردن',pxTest:'تست سلامت',
-  pxHealthy:'سالم',pxDown:'خراب',pxUntested:'تست نشده',
-  pxExitIp:'آی‌پی خروجی',pxLatency:'تاخیر',
-  pxNone:'هنوز پروکسی اضافه نشده است',
-  pxStrict:'حالت سختگیرانه',
-  pxStrictHint:'اگر پروکسی قطع شد، اتصال رد می‌شود تا آی‌پی اصلی سرور لو نرود',
-  pxFlagSrc:'منبع پرچم نام کانفیگ',
-  pxFlagProxy:'کشور پروکسی',pxFlagEntry:'کشور سرور ورودی',
-  pxTesting:'در حال تست...',pxArmed:'پروکسی فعال شد',
-  pxDelWarn:'این پروکسی حذف شود؟',
-  addedN:'افزوده شد',dupN:'تکراری',invalidN:'نامعتبر',noCleanIps:'لیست خالی است',
-  settings:'تنظیمات',appearance:'ظاهر',theme:'تم',language:'زبان',
-  thDark:'تیره (مشکی و آبی)',thLight:'روشن (سفید و آبی)',thGray:'خاکستری',
-  country:'کشور',autoCountry:'تشخیص خودکار',mainCountry:'کشور سرور اصلی',
-  flagsHint:'پرچم کشور به ابتدای نام کانفیگ‌ها در لینک اشتراک اضافه می‌شود',
-  savedOk:'ذخیره شد',save:'ذخیره',
-  changePw:'تغییر رمز عبور',curPw:'رمز فعلی',newPw:'رمز جدید',pwChanged:'رمز تغییر کرد ✓',
-  serverInfo:'اطلاعات سرور',wsPathLbl:'مسیر WebSocket',xhPathLbl:'مسیر XHTTP',
-  xhModeLbl:'حالت XHTTP',
-  xhModeHint:'packet-up برای هر تکه آپلود یک رکوئست می‌فرستد. اگر رله Cloudflare داری، stream-up را انتخاب کن تا هر اتصال فقط ۲ رکوئست شود.',
-  trWarnTitle:'مصرف رکوئست XHTTP:',
-  trWarn:'در XHTTP هر اتصال چند رکوئست می‌سازد. stream-up برای هر اتصال ۲ رکوئست؛ packet-up برای هر تکه آپلود یکی — که با رله Cloudflare سهمیه روزانه ورکر را زود تمام می‌کند. WS یک رکوئست برای کل اتصال است.',
-  backupTitle:'پشتیبان‌گیری',
-  backupHint:'همه‌ی کاربران با UUID و توکن، آی‌پی‌ها، پروکسی‌ها و تنظیمات در یک فایل .ixpbak ذخیره می‌شود.',
-  bkInclPw:'رمز پنل هم ذخیره شود',
-  bkInclProxyCreds:'یوزر و پسورد پروکسی‌ها هم ذخیره شود',
-  bkInclTraffic:'تاریخچهٔ مصرف هم ذخیره شود (حجم فایل بیشتر می‌شود)',
-  bkSecretWarn:'این فایل شامل رمز پنل و پسورد پروکسی‌هاست — مثل رمز عبور از آن مراقبت کنید.',
-  btnBackupLbl:'دانلود فایل پشتیبان',
-  restoreTitle:'بازگردانی',
-  pickFile:'انتخاب فایل ixpbak',
-  restoreHint:'فایل .ixpbak را انتخاب کن. اول محتوا نمایش داده می‌شود و تا تأیید نکنی چیزی نوشته نمی‌شود.',
-  restoreMode:'نحوهٔ بازگردانی',
-  bkMerge:'ادغام — موارد موجود به‌روز و بقیه اضافه می‌شوند',
-  bkReplace:'جایگزینی کامل — کاربران، آی‌پی‌ها و پروکسی‌های فعلی حذف می‌شوند',
-  bkRestorePwLbl:'رمز پنل هم از فایل بازگردانی شود',
-  btnRestoreLbl:'بازگردانی کن',
-  bkReading:'در حال خواندن فایل…',
-  bkBadFile:'فایل قابل خواندن نیست یا پشتیبان این پنل نیست',
-  bkFrom:'ساخته‌شده در',bkUsersN:'کاربر',bkCipsN:'آی‌پی تمیز',bkProxN:'پروکسی',
-  bkTrafficN:'رکورد مصرف',
-  bkHasPw:'شامل رمز پنل',bkNoPw:'بدون رمز پنل',
-  bkProxCreds:'پروکسی با یوزر/پسورد',
-  bkEnvDiff:'این متغیرها با پنل فعلی تفاوت دارند و باید دستی در Railway/Render ست شوند:',
-  bkReplaceWarn:'همهٔ کاربران، آی‌پی‌های تمیز و پروکسی‌های فعلی حذف و با فایل جایگزین می‌شوند. مطمئنی؟',
-  bkPwChanged:'رمز پنل از فایل بازگردانی شد — دفعهٔ بعد با رمز قدیمیِ همان فایل وارد شوید.',
-  bkDone:'بازگردانی انجام شد',
-  resetCycle:'ریست دوره‌ای مصرف',resetOff:'خاموش',reset1:'هر ۱ روز (روزانه)',reset3:'هر ۳ روز',
-  reset7:'هر ۷ روز (هفتگی)',reset14:'هر ۱۴ روز (دو هفته)',reset30:'هر ۳۰ روز (ماهانه)',
-  reset60:'هر ۶۰ روز (دو ماه)',reset90:'هر ۹۰ روز (سه ماه)',resetCustom:'دلخواه',customDays:'تعداد روز (۱ تا ۳۶۵)',
-  tgTitle:'پشتیبان تلگرامی',
-  tgHint:'فایل پشتیبان کامل به چت تلگرامت می‌رسد. توکن را از BotFather و Chat ID را از userinfobot بگیر. برای گروه، Chat ID با ‎-100 شروع می‌شود و ربات باید عضو گروه باشد.',
-  tgTokenLbl:'Bot Token',tgChatLbl:'Chat ID',tgAutoLbl:'بکاپ خودکار روزانه',
-  tgTestBtn:'پیام آزمایشی',tgNowBtn:'ارسال بکاپ حالا',
-  tgWorking:'در حال اتصال به تلگرام…',tgSent:'به تلگرام ارسال شد ✓',
-  tgFromEnv:'از متغیر محیطی تنظیم شده',tgNotSet:'تنظیم نشده',
-  bkAdded:'اضافه‌شده',bkUpdated:'به‌روزشده',bkSkipped:'ردشده',
-  relayLbl:'دامنه رله',keepAliveLbl:'جلوگیری از خواب',relayNone:'ندارد',
-  onLbl:'فعال',offLbl:'خاموش',
-  devWinLbl:'پنجره شمارش دستگاه',seconds:'ثانیه',
-  ipWinLbl:'پنجره شمارش آی‌پی',
-  envNote:'این مقادیر از متغیرهای محیطی خوانده می‌شوند و در Railway قابل تغییرند.',
-  logout:'خروج',logs:'رخدادها',noLogs:'رخدادی نیست',
-  navFilter:'فیلتر سایت',
-  fltTitle:'فیلتر و سانسور محتوا',
-  fltHint:'اتصال به سایت‌های فهرست‌شده بسته می‌شود. مقصد از همان هدر VLESS خوانده می‌شود، پس قبل از برقراری اتصال جلویش گرفته می‌شود.',
-  fltEnable:'فیلتر فعال باشد',
-  fltEnableHint:'وقتی خاموش باشد هیچ سایتی مسدود نمی‌شود.',
-  fltPorn:'مسدودسازی خودکار محتوای بزرگسال',
-  fltPornHint:'لیست آمادهٔ سایت‌ها و کلیدواژه‌های پورن.',
-  fltRules:'قوانین مسدودسازی',
-  fltKindDomain:'دامنه (و زیردامنه‌ها)',
-  fltKindKeyword:'کلیدواژه (هرجای دامنه)',
-  fltAdd:'افزودن قانون',
-  fltBulk:'افزودن انبوه (هر خط یکی)',
-  fltClear:'پاک کردن همهٔ قوانین',
-  fltClearWarn:'همهٔ قوانین فیلتر حذف شوند؟',
-  fltList:'قوانین فعلی',
-  fltNone:'هنوز قانونی اضافه نشده',
-  fltAdded:'قانون اضافه شد',
-  fltDupe:'تکراری',
-  fltDomain:'دامنه',fltKeyword:'کلیدواژه',
-  fltOn:'فیلتر روشن است',fltOff:'فیلتر خاموش است',
-  echValueLbl:'مقدار کاستوم ECH',obfCsLbl:'کاستوم cs (ماسک سیفر)',obfFmLbl:'کاستوم fm (مبهم‌ساز)',
-  optDefault:'پیش‌فرض پنل',
-  custLbl:'مقادیر کاستوم ECH و مبهم‌ساز (اختیاری)',
-  custHint:'این مقادیر فقط وقتی اعمال می‌شوند که تیک مربوطه در بالا زده باشد: ECH با تیک «کانفیگ ECH»؛ cs و fm فقط روی لینک WS با تیک «لینک مبهم‌ساز». بعد از ذخیره، ساب را در کلاینت دوباره به‌روزرسانی کنید.',
-  statusDisabled:'غیرفعال',statusExpired:'منقضی',statusQuota:'حجم تمام',
-  navTgweb:'وب‌پروکسی تلگرام',
-  tgwNew:'ساخت وب‌پروکسی جدید',
-  tgwHint:'با استفاده از این قابلیت میتوانید یک پروکسی تلگرام با سکرت دلخواه بسازید؛ این قابلیت پروکسی تلگرام را با پروتکل وب پروکسی (WEB Proxy) روی حساب شما دیپلوی میکند و تحویل میدهد.',
-  tgwPlatform:'میزبان پروکسی',
-  tgwPlRender:'رندر',tgwPlRailway:'ریلوی',tgwPlExternal:'خارجی',
-  tgwCarrier:'حامل ارتباط',
-  tgwRegion:'ریجن میزبانی',
-  tgwRegionHostDefault:'پیش‌فرض میزبان (بدون ریجن مشخص)',
-  tgwRegionHint:'تغییر ریجن، سرویس را در ریجن جدید روی همان دامنه ری‌دپلوی می‌کند (چند دقیقه) و همهٔ لینک‌ها معتبر می‌مانند. ریجن واقعی سرویس بعد از هر همگام‌سازی از خود میزبان خوانده می‌شود.',
-  tgwRegionLock:'ریجن سرویس‌های رندر بعد از ساخت قابل تغییر نیست',
-  tgwTokenMissing:'توکن API این پلتفرم ذخیره نشده — اول از «تنظیمات پلتفرم» اضافه‌اش کن',
-  tgwSetBtn:'تنظیمات پلتفرم',
-  tgwSet:'پلتفرم میزبانی پروکسی',
-  tgwSetSub:'برای اینکه پنل خودش پروکسی‌ها را بسازد، توکن API پلتفرم میزبان را اینجا ذخیره کن (Render: Account Settings → API Keys؛ Railway: Account Settings → Tokens). توکن فقط روی همین پنل ذخیره می‌شود. ریپو و برنچ به‌صورت پیش‌فرض (ریپوی خود پروژه، برنچ main) استفاده می‌شوند و پروکسی از پوشهٔ tproxy در همان ریپو ساخته می‌شود — پس اول پوشهٔ tproxy را در گیت‌هاب push کن.',
-  tgwSetSubSelf:'این پنل روی {p} میزبانی می‌شود؛ پس برای ساخت وب پروکسی تلگرام به توکن {p} نیاز است آن را از حساب خود دریافت و در کادر زیر جای‌گذاری کنید.',
-  tgwRenderToken:'توکن API رندر (rnd_…)',tgwRailwayToken:'توکن API ریلوی',
-  tgwSetSaved:'ذخیره شد ✓',
-  tgwBuildHint:'ساخت معمولاً ۲ تا ۴ دقیقه طول می‌کشد؛ اگر بیشتر شد، دکمهٔ ⟳ را بزن تا وضعیت از پلتفرم گرفته شود',
-  tgwBuilding:'در حال ساخت',tgwLive:'آماده',tgwFailed:'خطا',tgwSuspended:'متوقف',
-  tgwSync:'بررسی وضعیت ساخت',tgwNoServer:'بعد از استقرار، لینک همین‌جا ساخته می‌شود',
-  tgwRotateWarnPl:'سکرت عوض شود؟ همهٔ لینک‌های قبلی از کار می‌افتند و سرویس روی {p} ری‌دپلوی می‌شود (چند دقیقه طول می‌کشد).',
-  tgwDelWarnPl:'این پروکسی حذف شود؟ سرویس روی {p} هم از همان پلتفرم حذف می‌شود.',
-  tgwPauseWarn:'پروکسی متوقف شود؟ سرویس به خواب می‌رود ولی نام میزبانش حفظ می‌شود و بعداً با روشن کردن، همهٔ لینک‌ها سر جایشان برمی‌گردند.',
-  tgwServer:'سرور (دامنه)',tgwLabel:'برچسب (اختیاری)',tgwSecret:'سکرت (۳۲ کاراکتر hex)',
-  tgwGen:'سکرت جدید',
-  tgwZeroInf:'۰ = بی‌نهایت. حجم و مدت هر پروکسی همین‌جا ثبت می‌شود و وضعیتش (فعال / منقضی / اتمام حجم) در لیست پایین نمایش داده می‌شود.',
-  tgwList:'وب‌پروکسی‌ها',tgwNone:'هنوز وب‌پروکسی‌ای ساخته نشده',
-  tgwLink:'لینک عضویت تلگرام',tgwCopyLink:'کپی لینک',tgwOpen:'باز کردن در تلگرام',
-  tgwRotate:'تعویض سکرت این پروکسی',
-  tgwRotateWarn:'سکرت عوض شود؟ همهٔ لینک‌های قبلیِ همین پروکسی از کار می‌افتند و باید لینک جدید را در اختیار کاربر بگذاری.',
-  tgwEdit:'ویرایش وب‌پروکسی',tgwDelWarn:'این وب‌پروکسی حذف شود؟',
- },
  en:{dir:'ltr',
   unitBytes:'bytes',loadingLbl:'Loading…',noLive:'No live connections',
-  phDash:'Live server, user and traffic overview',  phUsers:'Create, edit and monitor accounts',  phClean:'IPs that go into the subscription link',  phFilter:'Blocked and allowed domains',  phProxy:'Proxy pool and auto selection',  phLive:'Connections open right now',  phTgweb:'Telegram web proxy',  phSettings:'Appearance, password, backup and server',  phLogs:'Latest panel events',  refreshLbl:'Refresh',  tabBasic:'Basics',  tabLimits:'Limits',  tabSecurity:'Security',  viewAll:'All',  r24:'24h',  cancel:'Cancel',  statHintUsers:'accounts',  statHintOnline:'online now',  statHintDev:'active devices',  statHintBytes:'since start',  statHintCip:'in subscription',  statHintLive:'live sessions',  zeroInfShort:'0 means unlimited.',  moreLbl:'Details',  noResult:'Nothing found',
+  phDash:'Live server, user and traffic overview',  phUsers:'Create, edit and monitor accounts',  phClean:'IPs that go into the subscription link',  phFilter:'Blocked and allowed domains',  phProxy:'Proxy pool and auto selection',  phLive:'Connections open right now',  phTgweb:'Build and manage Telegram web proxies',  phSettings:'Appearance, password, backup and server',  phLogs:'Latest panel events',  refreshLbl:'Refresh',  tabBasic:'Basics',  tabLimits:'Limits',  tabSecurity:'Security',  viewAll:'All',  r24:'24h',  cancel:'Cancel',  statHintUsers:'accounts',  statHintOnline:'online now',  statHintDev:'active devices',  statHintBytes:'since start',  statHintCip:'in subscription',  statHintLive:'live sessions',  zeroInfShort:'0 means unlimited.',  moreLbl:'Details',  noResult:'Nothing found',
   setupTitle:'Set a password',setupSub:'First run — choose your panel password',
   loginTitle:'Sign in',loginSub:'Enter your password',
   password:'Password',confirm:'Confirm password',enter:'Sign in',save:'Save & enter',
@@ -8176,7 +8001,7 @@ const I18N={
   tgwEdit:'Edit web proxy',tgwDelWarn:'Delete this web proxy?',
  }
 };
-let LANG=localStorage.getItem('lang')||'fa';
+let LANG='en';  /* فقط انگلیسی */
 const THEMES=['gray','light'];
 let THEME=localStorage.getItem('theme')||'gray';
 if(!THEMES.includes(THEME)){THEME=(THEME==='light')?'light':'gray';localStorage.setItem('theme',THEME)}
@@ -8186,7 +8011,7 @@ function applyChrome(){
  document.documentElement.dir=I18N[LANG].dir;
  document.documentElement.dataset.theme=THEME;
 }
-function setLang(l){LANG=l;localStorage.setItem('lang',l);applyChrome();if(window.rerender)rerender()}
+function setLang(l){LANG='en';applyChrome();if(window.rerender)rerender()}
 function setTheme(t){THEME=t;localStorage.setItem('theme',t);applyChrome();if(window.onTheme)onTheme()}
 applyChrome();
 """
@@ -8220,14 +8045,10 @@ body{min-height:100vh;display:grid;place-items:center;padding:18px;position:rela
 <div class="bg-glow"></div>
 <div class="auth">
  <div class="top">
-  <select id="langSel" class="hidden"><option value="fa">فارسی</option><option value="en">English</option></select>
   <select id="thSel" class="hidden"><option value="light"></option><option value="gray"></option></select>
   <button class="icon-btn" type="button" title="theme" id="btnTh"
     onclick="setTheme(THEMES[(THEMES.indexOf(THEME)+1)%THEMES.length])">
    <svg class="ic" viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 1110 3.7a7 7 0 0010.5 10.8z"/></svg></button>
-  <button class="icon-btn" type="button" title="language" id="btnLang"
-    onclick="setLang(LANG==='fa'?'en':'fa')">
-   <span class="mono" style="font-size:10px;font-weight:700" id="langTag">EN</span></button>
  </div>
  <img class="brandlogo" src="__LOGO__" alt="IranX">
  <h1 id="h1"></h1>
@@ -8249,11 +8070,8 @@ body{min-height:100vh;display:grid;place-items:center;padding:18px;position:rela
 </div>
 <script>
 const MODE="{{MODE}}";
-langSel.value=LANG; thSel.value=THEME;
-function syncTags(){
- const lt=document.getElementById('langTag');
- if(lt) lt.textContent = (LANG==='fa') ? 'EN' : 'FA';
-}
+thSel.value=THEME;
+function syncTags(){}
 function paint(){
  h1.textContent  = MODE==='setup'?T('setupTitle'):T('loginTitle');
  sub.textContent = MODE==='setup'?T('setupSub'):T('loginSub');
@@ -8264,8 +8082,7 @@ function paint(){
  const isSetup = MODE==='setup';
  p2wrap.classList.toggle('hidden', !isSetup);
  rule.classList.toggle('hidden', !isSetup);
- langSel.value=LANG; thSel.value=THEME;
- syncTags();
+ thSel.value=THEME;
 }
 window.rerender=paint; paint();
 async function submit(){
@@ -8286,7 +8103,7 @@ go.onclick=submit;
 </script></body></html>"""
 
 
-PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><head>
+PANEL_HTML = r"""<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>{{TITLE}}</title>
@@ -8342,9 +8159,6 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
    <select id="thSel" onchange="setTheme(this.value)" class="inp">
     <option value="light" data-t="thLight"></option>
     <option value="gray" data-t="thGray"></option></select></label>
-  <label class="fld"><span class="text-xs dim" data-t="language"></span>
-   <select id="langSel" onchange="setLang(this.value)" class="inp">
-    <option value="fa">فارسی</option><option value="en">English</option></select></label>
   <button onclick="logout()" id="btnOut" class="btn btn-danger" style="width:100%;justify-content:center"></button>
  </div>
 </aside>
@@ -8366,9 +8180,6 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
  <button class="icon-btn" onclick="setTheme(THEMES[(THEMES.indexOf(THEME)+1)%THEMES.length])"
          title="تم" aria-label="تغییر تم" style="width:34px;height:34px;flex:0 0 34px">
   <svg class="ic" viewBox="0 0 24 24" style="width:16px;height:16px"><path d="M20.5 14.5A8.5 8.5 0 1110 3.7a7 7 0 0010.5 10.8z"/></svg></button>
- <button class="icon-btn" onclick="setLang(LANG==='fa'?'en':'fa')"
-         title="زبان" aria-label="تغییر زبان" style="width:34px;height:34px;flex:0 0 34px">
-  <span class="mono" style="font-size:10.5px;font-weight:700" id="langTag">FA</span></button>
 </header>
 
  <main class="content">
@@ -8780,9 +8591,6 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
       <select id="thSel2" onchange="setTheme(this.value);syncSelects()" class="inp">
        <option value="light" data-t="thLight"></option>
        <option value="gray" data-t="thGray"></option></select></label>
-     <label class="fld"><span class="text-xs dim" data-t="language"></span>
-      <select id="langSel2" onchange="setLang(this.value);syncSelects()" class="inp">
-       <option value="fa">فارسی</option><option value="en">English</option></select></label>
      <label class="fld"><span class="text-xs dim" data-t="mainCountry"></span>
       <div class="flex gap-2">
        <select id="mcSel" class="inp flex-1"></select>
@@ -8817,7 +8625,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
      <label class="chip" style="cursor:pointer"><input type="checkbox" id="bkPxCreds" checked> <span data-t="bkInclProxyCreds"></span></label>
      <label class="chip" style="cursor:pointer"><input type="checkbox" id="bkTraffic"> <span data-t="bkInclTraffic"></span></label>
     </div>
-    <p class="notice" style="margin:0" data-t="bkSecretWarn"></p>
+    <p class="notice" data-t="bkSecretWarn"></p>
     <button onclick="doBackup()" id="btnBackup" class="btn w-full"></button>
 
     <div class="pt-3 space-y-2" style="border-top:1px solid var(--line)">
@@ -9026,7 +8834,7 @@ async function logout(){await fetch('/api/logout',{method:'POST'});location.href
 
 function syncSelects(){
  [thSel,thSel2].forEach(e=>{if(e)e.value=THEME});
- [langSel,langSel2].forEach(e=>{if(e)e.value=LANG});
+ ['langSel','langSel2'].forEach(i=>{const e=document.getElementById(i);if(e)e.value='en'});
 }
 window.onTheme=()=>{syncSelects();if(chart)paintChart()};
 
@@ -9230,19 +9038,17 @@ function renderUsers(){
    ?'<span class="chip green">'+T('active')+'</span>'
    :'<span class="chip red">'+statusTxt(u.status)+'</span>';
   const live=u.devices_live?'<span class="chip green dot">'+u.devices_live+'</span>':'';
-  const used=fmt(u.used_bytes), total=u.quota_bytes?fmt(u.quota_bytes):'∞';
+  const used=fmt(u.used_bytes), total=u.quota_bytes?fmt(u.quota_bytes):'<i class="inf">&infin;</i>';
   return '<div class="ucard">'
 
    +'<div class="uc-top">'
      +'<span class="av">'+esc((u.name||'?').charAt(0).toUpperCase())+'</span>'
      +'<span class="nm">'+esc(u.name)+'</span>'
      +badge+live
+     +'<span class="chip teal uc-tsp">'+trTxt(u.transport)+'</span>'
    +'</div>'
 
    +'<div class="uc-tools">'
-     +'<span class="uc-tsp">'
-     +'<span class="chip teal">'+trTxt(u.transport)+'</span>'
-     +'</span>'
      +'<span class="uc-act">'
        +'<button class="icon-btn" title="'+T('config')+'" aria-label="'+T('config')+'" onclick="showConfig('+u.id+')">'+ICO.cfg+'</button>'
        +'<button class="icon-btn" title="'+T('ipsBtn')+'" aria-label="'+T('ipsBtn')+'" onclick="showIps('+u.id+')">'+ICO.ips+'</button>'
@@ -9260,9 +9066,9 @@ function renderUsers(){
    +'<div class="uc-foot">'
      +'<span class="gf">'+IC.clock+'<span>'+T('expiry')+'</span> <bdi class="dt">'+dt(u.expire_at)+'</bdi></span>'
      +'<span class="gf'+(devWarn?' warn':'')+'">'+IC.phone+'<bdi class="mono">'
-       +(devL?u.devices_now+' / '+devL:'∞')+'</bdi> <span>'+T('devSec')+'</span></span>'
+       +(devL?u.devices_now+' / '+devL:'<i class="inf">&infin;</i>')+'</bdi> <span>'+T('devSec')+'</span></span>'
      +'<span class="gf'+(ipWarn?' warn':'')+'">'+IC.globe+'<bdi class="mono">'
-       +(ipL?u.ips_now+' / '+ipL:'∞')+'</bdi> <span>'+T('ipSec')+'</span></span>'
+       +(ipL?u.ips_now+' / '+ipL:'<i class="inf">&infin;</i>')+'</bdi> <span>'+T('ipSec')+'</span></span>'
    +'</div>'
 
   +'</div>';
@@ -10114,17 +9920,25 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
    el=el.parentElement; n++;
   }
  }
- let OPENED_AT=0;
+ let OPENED_AT=0, OPEN_XY=[0,0], TOUCHED=false;
  function open(api){
   closeAll(api.root);
   markOpen(api.root,true);
   OPENED_AT=Date.now();
+  OPEN_XY=[window.scrollX,window.scrollY];
+  TOUCHED=false;
   const r=api.btn.getBoundingClientRect();
   api.root.classList.toggle('up',(window.innerHeight-r.bottom)<250&&r.top>260);
   api.root.classList.add('open');
   api.btn.setAttribute('aria-expanded','true');
+  /* گزینهٔ فعلی را در دید می‌آوریم، ولی بدون اسکرول کردن صفحه
+     (scrollIntoView باعث می‌شد صفحه جابه‌جا و منو فوراً بسته شود) */
   const selOpt=api.menu.querySelector('.sopt[aria-selected="true"]');
-  if(selOpt) setTimeout(()=>selOpt.scrollIntoView({block:'center'}),0);
+  if(selOpt) setTimeout(()=>{
+   const m=api.menu;
+   if(selOpt.offsetTop<m.scrollTop||selOpt.offsetTop+selOpt.offsetHeight>m.scrollTop+m.clientHeight)
+    m.scrollTop=Math.max(0,selOpt.offsetTop-m.clientHeight/2+selOpt.offsetHeight/2);
+  },0);
  }
  function close(api){api.root.classList.remove('open');
   api.btn.setAttribute('aria-expanded','false');markOpen(api.root,false)}
@@ -10175,10 +9989,31 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
  document.addEventListener('click',()=>closeAll());
  document.addEventListener('keydown',e=>{if(e.key==='Escape')closeAll()});
  /* بستن با اسکرول — ولی نه اسکرولی که خودِ باز شدن منو ایجاد می‌کند */
- window.addEventListener('scroll',()=>{
-  if(Date.now()-OPENED_AT<420)return;
+ /* بستن با اسکرول — ولی نه با اسکرولی که خودِ باز شدن منو یا خودِ منو ایجاد می‌کند */
+function scrolledByUser(){
+  if(TOUCHED) return true;                      /* کاربر با انگشت کشیده */
+  if(Date.now()-OPENED_AT<420) return false;    /* اسکرول خودکارِ لحظهٔ باز شدن */
+  if(Math.abs(window.scrollX-OPEN_XY[0])>2||Math.abs(window.scrollY-OPEN_XY[1])>2) return true;
+  return false;                                 /* اسکرول داخلی (مثلاً خود منو) */
+}
+window.addEventListener('scroll',(e)=>{
+  const t=e.target;
+  if(t&&t.nodeType===1&&t.closest&&t.closest('.sel'))return; /* خود منو */
+  if(!scrolledByUser())return;
   closeAll();
- },true);
+},true);
+/* روی موبایل، لمسی که واقعاً جابه‌جا شود منو را می‌بندد */
+document.addEventListener('touchstart',()=>{TOUCHED=false},{passive:true,capture:true});
+document.addEventListener('touchmove',(e)=>{
+  const t=e.target;
+  if(t&&t.nodeType===1&&t.closest&&t.closest('.sel-menu'))return;
+  TOUCHED=true;
+},{passive:true,capture:true});
+document.addEventListener('wheel',(e)=>{
+  const t=e.target;
+  if(t&&t.nodeType===1&&t.closest&&t.closest('.sel-menu'))return;
+  if(Date.now()-OPENED_AT>420) closeAll();
+},{passive:true,capture:true});
  window.addEventListener('resize',()=>closeAll());
  /* هر بار پنل آپشن‌ها/متن‌ها را بازنویسی کرد، آینه به‌روز می‌شود */
  let mt=null;
