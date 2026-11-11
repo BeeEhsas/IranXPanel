@@ -6964,11 +6964,11 @@ THEME_CSS = r"""
    با ظاهر جدید پیاده می‌کند، پس هیچ‌کدام از توابع JS قدیمی نمی‌شکند.
    ══════════════════════════════════════════════════════════════════════ */
 
-:root,[data-theme="dark"]{
+:root,[data-theme="gray"]{
   --bg:#08090b; --s1:#0d0f12; --s2:#12151a; --s3:#171b21;
   --line:#1e232b; --line2:#2a313c;
   --tx:#e6e9ee; --tx2:#98a2b1; --tx3:#6b7583;
-  --acid:#c6f24e;
+  --acid:#c6f24e; --a1:#5ce1e6; --a2:#c6f24e;
   --brand:#22ef9d; --brand2:#e8112d; --gold:#e5b80b;
   --ok:#c6f24e; --warn:#ffcc66; --bad:#ff6b6b; --info:#5ce1e6;
   --cyan:#5ce1e6; --red:#ff6b6b; --amber:#ffcc66;
@@ -6980,19 +6980,12 @@ THEME_CSS = r"""
   --bg:#f4f6f8; --s1:#ffffff; --s2:#f7f9fc; --s3:#eef1f6;
   --line:#e2e7ee; --line2:#d3dae3;
   --tx:#141a22; --tx2:#5a6472; --tx3:#8b95a3;
-  --acid:#7aa800; --brand:#0c9470; --brand2:#d81f3a; --gold:#a67c00;
+  --acid:#7aa800; --a1:#1478b8; --a2:#5f8c00; --brand:#0c9470; --brand2:#d81f3a; --gold:#a67c00;
   --ok:#5f8c00; --warn:#a87000; --bad:#cf3346; --info:#1478b8;
   --cyan:#0d8f96; --red:#cf3346; --amber:#a87000;
   --accent:#7aa800;
 }
-[data-theme="gray"]{
-  --bg:#14161a; --s1:#1b1e23; --s2:#22262c; --s3:#2a2f36;
-  --line:#31373f; --line2:#3d444d;
-  --tx:#e3e7ec; --tx2:#a2abb6; --tx3:#79828e;
-  --acid:#c6f24e; --brand:#22ef9d; --brand2:#e8112d; --gold:#e5b80b;
-  --ok:#c6f24e; --warn:#ffcc66; --bad:#ff6b6b; --info:#5ce1e6;
-  --cyan:#5ce1e6; --red:#ff6b6b; --amber:#ffcc66; --accent:#c6f24e;
-}
+
 
 *{box-sizing:border-box}
 html,body{overflow-x:hidden;max-width:100%}
@@ -7401,12 +7394,252 @@ label>input[type="checkbox"]+span{font-size:12.5px;color:var(--tx2)}
   *,*::before,*::after{animation-duration:.001ms !important;animation-iteration-count:1 !important;
     transition-duration:.001ms !important}
 }
+
+
+/* ══════════════════════════════════════════════════════════════════
+   COMPONENTS v4 — مارک‌آپ واقعی، بدون تکیه بر کلاس‌های مبهم قدیمی
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ── هدر صفحه ── */
+.ph{
+  display:flex;align-items:flex-end;gap:12px;margin-bottom:16px;flex-wrap:wrap;
+}
+.ph h1{margin:0;font-size:22px;font-weight:700;letter-spacing:-.6px;line-height:1.2}
+html[lang="fa"] .ph h1{letter-spacing:-.1px;font-size:21px}
+.ph .sub{margin:3px 0 0;font-size:11.5px;color:var(--tx3);line-height:1.6}
+.ph-t{min-width:0;flex:1}
+.ph .sp{flex:1}
+.ph .acts{display:flex;gap:8px;flex-wrap:wrap}
+
+/* ── نوار آمار ── */
+.strip{
+  display:grid;grid-template-columns:repeat(3,1fr);
+  border:1px solid var(--line);border-radius:12px;overflow:hidden;
+  background:var(--s1);margin-bottom:14px;
+}
+.strip .cell{padding:13px 15px;border-inline-start:1px solid var(--line);
+  border-bottom:1px solid var(--line);min-width:0}
+.strip .cell:nth-child(3n+1){border-inline-start:0}
+.strip .cell:nth-last-child(-n+3){border-bottom:0}
+.strip .k{font-size:10.5px;letter-spacing:.4px;color:var(--tx3);
+  display:flex;align-items:center;gap:6px;margin-bottom:7px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.strip .k i{width:5px;height:5px;border-radius:1px;background:var(--acid);
+  display:block;flex:0 0 5px}
+.strip .v{font-family:'JetBrains Mono',monospace;font-size:21px;font-weight:700;
+  letter-spacing:-1px;line-height:1.1;direction:ltr;
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.strip .v u{text-decoration:none;font-size:11px;color:var(--tx3);font-weight:500;
+  margin-inline-start:2px}
+.strip .d{margin-top:5px;font-size:10.5px;color:var(--tx3);display:flex;
+  align-items:center;gap:5px;flex-wrap:wrap;line-height:1.5}
+.strip .d b{color:var(--acid);font-weight:600;font-family:'JetBrains Mono',monospace}
+.strip .d b.n{color:var(--bad)}
+
+/* ── کارت کاربر (v4.2 — بدون ستون ثابت، مخصوص موبایل) ── */
+.ucard{
+  display:flex;flex-direction:column;gap:8px;
+  padding:12px 14px;border-bottom:1px solid var(--line);
+  transition:background .14s;min-width:0;
+}
+.ucard:last-child{border-bottom:0}
+.ucard:hover{background:rgba(198,242,78,.025)}
+
+.uc-top{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
+.uc-top .av{
+  width:28px;height:28px;flex:0 0 28px;border-radius:8px;display:grid;place-items:center;
+  background:var(--s2);border:1px solid var(--line2);color:var(--acid);
+  font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:700;
+}
+.uc-top .nm{
+  font-size:13px;font-weight:600;line-height:1.4;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:46vw;
+}
+.uc-act{display:flex;gap:5px;align-items:center;margin-inline-start:auto;flex:0 0 auto}
+
+.uc-bar{
+  height:5px;border-radius:3px;background:var(--s3);overflow:hidden;direction:ltr;
+}
+.uc-bar>i{display:block;height:100%;border-radius:3px;
+  background:linear-gradient(90deg,var(--brand),var(--acid));transition:width .3s}
+.uc-bar.hot>i{background:linear-gradient(90deg,var(--amber),var(--red))}
+
+.uc-foot{
+  display:flex;align-items:center;gap:5px 13px;flex-wrap:wrap;
+  font-size:10.5px;color:var(--tx3);line-height:1.75;min-width:0;
+}
+.uc-foot>span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;min-width:0}
+.uc-foot>span.mono{font-size:10px;color:var(--tx2);direction:ltr}
+.uc-foot b{color:var(--tx2);font-weight:600;font-family:'JetBrains Mono',monospace;
+  direction:ltr;unicode-bidi:isolate}
+.uc-foot svg{width:11.5px;height:11.5px;flex:0 0 11.5px;stroke:currentColor;
+  fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;opacity:.75}
+.uc-foot .warn{color:var(--amber)}
+.uc-foot .pct{margin-inline-start:auto;color:var(--tx3);font-size:10px;
+  font-family:'JetBrains Mono',monospace;direction:ltr}
+
+@media(max-width:560px){
+  .uc-top .nm{max-width:38vw}
+  .uc-foot{gap:4px 11px}
+}
+
+/* ── مودال / شیت تنظیمات کاربر ── */
+.mwrap{
+  position:fixed;inset:0;z-index:75;display:flex;align-items:flex-end;
+  justify-content:center;background:rgba(4,5,7,.74);backdrop-filter:blur(3px);
+  padding:0;
+}
+.mwrap.hidden{display:none}
+@media(min-width:640px){ .mwrap{align-items:center;padding:18px} }
+
+.sheet{
+  width:100%;max-width:560px;max-height:92vh;display:flex;flex-direction:column;
+  background:var(--s1);border:1px solid var(--line2);border-radius:16px 16px 0 0;
+  box-shadow:0 -20px 60px -20px rgba(0,0,0,.9);animation:sheetUp .26s cubic-bezier(.22,.68,.32,1);
+}
+@media(min-width:640px){ .sheet{border-radius:14px;animation:pop .2s ease} }
+@keyframes sheetUp{from{transform:translateY(28px);opacity:.6}to{transform:none;opacity:1}}
+
+.sheet-head{
+  display:flex;align-items:center;gap:10px;padding:14px 16px;
+  border-bottom:1px solid var(--line);flex:0 0 auto;
+}
+.sheet-head b{font-size:14px;font-weight:600}
+.sheet-head .x{
+  margin-inline-start:auto;width:30px;height:30px;flex:0 0 30px;border-radius:8px;
+  display:grid;place-items:center;cursor:pointer;border:1px solid var(--line2);
+  background:var(--s2);color:var(--tx3);
+}
+.sheet-head .x:hover{border-color:var(--bad);color:var(--bad)}
+
+/* تب‌های داخل شیت — مثل «Basics / Protocol / Stream / Security» */
+.stabs{
+  display:flex;gap:4px;padding:10px 14px 0;border-bottom:1px solid var(--line);
+  overflow-x:auto;flex:0 0 auto;
+}
+.stabs::-webkit-scrollbar{height:0}
+.stabs button{
+  font:inherit;font-size:12px;font-weight:600;padding:8px 12px 10px;
+  border:0;background:none;color:var(--tx3);cursor:pointer;white-space:nowrap;
+  border-bottom:2px solid transparent;transition:.15s;
+}
+.stabs button:hover{color:var(--tx2)}
+.stabs button.on{color:var(--acid);border-bottom-color:var(--acid)}
+
+.sheet-body{padding:15px 16px;overflow-y:auto;flex:1 1 auto;min-height:0}
+.pane{display:none}
+.pane.on{display:block;animation:fadeIn .18s ease}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+.sheet-foot{
+  display:flex;align-items:center;gap:9px;padding:12px 16px;
+  border-top:1px solid var(--line);flex:0 0 auto;flex-wrap:wrap;
+  background:var(--s1);border-radius:0 0 14px 14px;
+}
+.sheet-foot .btn{flex:1;justify-content:center;min-width:120px}
+.sheet-foot .err{width:100%;font-size:11.5px;color:var(--bad);margin:0;min-height:0}
+
+/* ── اصلاح هم‌پوشانی متن ── */
+.notice, .hint, .alert{
+  min-width:0;overflow-wrap:anywhere;
+}
+.notice svg, .alert svg{flex:0 0 15px;width:15px;height:15px;margin-top:2px;
+  stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round}
+.notice>span, .alert>span{flex:1;min-width:0}
+.notice b{min-width:0}
+@media(max-width:560px){ .strip .k{white-space:normal;line-height:1.5}
+  .strip .d{font-size:10px} }
+.card .notice{margin:0 0 12px}
+.card .hint{margin:10px 0 0}
+.fld>span, .fld>label{min-width:0;overflow-wrap:anywhere}
+.soft{
+  background:var(--s2);border:1px solid var(--line);border-radius:10px;
+}
+.kv b{white-space:nowrap}
+
+/* ورودی‌های شماره‌ای در RTL */
+html[dir="rtl"] input[type="number"]{direction:ltr;text-align:right}
+
+/* ── v4.1 افزوده‌ها ── */
+body.locked{overflow:hidden}
+.empty{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:9px;padding:34px 16px;color:var(--tx3);font-size:12px;text-align:center;
+}
+.empty svg{width:26px;height:26px;stroke:currentColor;fill:none;stroke-width:1.7;
+  stroke-linecap:round;opacity:.65}
+.chip.dot{position:relative;padding-inline-start:16px}
+.chip.dot::before{
+  content:'';position:absolute;inset-inline-start:7px;top:50%;margin-top:-2.5px;
+  width:5px;height:5px;border-radius:50%;background:var(--brand);
+  box-shadow:0 0 0 2px rgba(34,239,157,.18)
+}
+.icon-btn{
+  width:29px;height:29px;flex:0 0 29px;border-radius:8px;display:grid;place-items:center;
+  border:1px solid var(--line2);background:var(--s2);color:var(--tx3);cursor:pointer;
+  transition:.14s;
+}
+.icon-btn:hover{border-color:var(--acid);color:var(--acid);background:var(--s3)}
+.icon-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.9;
+  stroke-linecap:round;stroke-linejoin:round}
+.btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2.2;
+  stroke-linecap:round;stroke-linejoin:round;flex:0 0 14px}
+
+/* مودال عمومی (#modal) هم به شکل شیت دیده شود */
+#modal .mwrap, #modal.mwrap{position:fixed;inset:0}
+#modal{
+  position:fixed;inset:0;z-index:80;align-items:center;justify-content:center;
+  background:rgba(4,5,7,.74);backdrop-filter:blur(3px);padding:14px;
+}
+#modal>div{
+  width:100%;max-width:520px;max-height:90vh;overflow-y:auto;
+  background:var(--s1);border:1px solid var(--line2);border-radius:14px;
+  box-shadow:0 30px 70px -24px rgba(0,0,0,.9);padding:16px;
+  display:flex;flex-direction:column;gap:10px;
+}
+#modal .fld{margin:0}
+@media(max-width:560px){
+  .ph{align-items:flex-start;margin-bottom:13px}
+  .ph h1{font-size:19px}
+  .ph .sub{font-size:11px}
+  .strip .cell{padding:11px 12px}
+  .strip .v{font-size:18px}
+  .sheet{max-height:94vh}
+}
+
+/* ── ردیف‌های سهم ترنسپورت ── */
+#protoBox .prow{display:grid;grid-template-columns:1fr auto;gap:5px 8px;
+  align-items:center;padding:2px 0}
+#protoBox .lbl{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;
+  color:var(--tx2);white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
+#protoBox .lbl i{width:7px;height:7px;border-radius:50%;flex:0 0 7px;display:block}
+#protoBox b{font-family:'JetBrains Mono',monospace;font-size:12.5px;font-weight:700;
+  color:var(--tx);direction:ltr;font-variant-numeric:tabular-nums}
+#protoBox .bar{grid-column:1/-1;height:4px;border-radius:2px;background:var(--s3);
+  overflow:hidden;direction:ltr}
+#protoBox .bar i{display:block;height:100%;border-radius:2px;min-width:2px}
+.card-head .sub-unit{white-space:nowrap;flex:0 0 auto}
+
+/* نوار آمار در دسکتاپ: شش ستون هم‌عرض */
+@media(min-width:900px){
+  .strip{grid-template-columns:repeat(6,1fr)}
+  .strip .cell{border-bottom:0}
+  .strip .cell:nth-child(3n+1){border-inline-start:1px solid var(--line)}
+  .strip .cell:first-child{border-inline-start:0}
+  .strip .v{font-size:19px}
+}
+/* دو کارت داشبورد هم‌ارتفاع نباشند */
+section[data-pg="dash"] > .g{align-items:start}
+#protoBox .bar i{background:var(--acid)}
 """
 
 
 I18N_JS = r"""
 const I18N={
  fa:{dir:'rtl',
+  unitBytes:'بایت',loadingLbl:'در حال بارگذاری…',noLive:'اتصال بازی نیست',
+  phDash:'وضعیت لحظه‌ای سرور، کاربران و ترافیک',  phUsers:'ساخت، ویرایش و پیگیری حساب‌ها',  phClean:'آی‌پی‌هایی که در لینک ساب قرار می‌گیرند',  phFilter:'دامنه‌های مسدود و مجاز',  phProxy:'استخر پروکسی و انتخاب خودکار',  phLive:'اتصال‌های باز در همین لحظه',  phTgweb:'وب‌پروکسی تلگرام',  phSettings:'ظاهر، رمز عبور، پشتیبان‌گیری و سرور',  phLogs:'آخرین رخدادهای پنل',  refreshLbl:'به‌روزرسانی',  tabBasic:'پایه',  tabLimits:'محدودیت‌ها',  tabSecurity:'امنیت',  viewAll:'همه',  r24:'۲۴ ساعت',  cancel:'انصراف',  statHintUsers:'حساب ساخته‌شده',  statHintOnline:'الان متصل',  statHintDev:'دستگاه فعال',  statHintBytes:'از زمان راه‌اندازی',  statHintCip:'در لینک ساب',  statHintLive:'نشست زنده',  zeroInfShort:'صفر یعنی بی‌نهایت.',  moreLbl:'جزئیات',  noResult:'چیزی پیدا نشد',
   setupTitle:'تعیین رمز عبور',setupSub:'اولین ورود: یک رمز انتخاب کن.',
   loginTitle:'ورود به پنل',loginSub:'رمز عبور',
   password:'رمز عبور',confirm:'تکرار رمز عبور',enter:'ورود',save:'ذخیره و ورود',
@@ -7416,7 +7649,7 @@ const I18N={
   navSettings:'تنظیمات پنل',navLogs:'رخدادها',menu:'منو',
   totalUsers:'کل کاربران',online:'کاربران آنلاین',devices:'دستگاه‌های متصل',
   traffic:'مصرف کل',cleanIps:'آی‌پی تمیز',xSessions:'نشست‌های XHTTP',liveTitle:'اتصالات زنده',liveEmpty:'هیچ اتصالی فعال نیست',
-  chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'سهم هر روش اتصال',
+  chart24:'مصرف ۲۴ ساعت اخیر',protoSplit:'تعداد اتصالات هر ترنسپورت',
   newUser:'ساخت کاربر جدید',users:'کاربران',
   name:'نام (انگلیسی)',quota:'حجم (GB)',days:'مدت (روز)',devLimit:'تعداد دستگاه',ipLimit:'تعداد آی‌پی',
   transport:'روش اتصال',trWs:'WS + TLS',trXhttp:'XHTTP + TLS',trBoth:'هر دو',
@@ -7568,7 +7801,7 @@ const I18N={
   tgwDelWarnPl:'این پروکسی حذف شود؟ سرویس روی {p} هم از همان پلتفرم حذف می‌شود.',
   tgwPauseWarn:'پروکسی متوقف شود؟ سرویس به خواب می‌رود ولی نام میزبانش حفظ می‌شود و بعداً با روشن کردن، همهٔ لینک‌ها سر جایشان برمی‌گردند.',
   tgwServer:'سرور (دامنه)',tgwLabel:'برچسب (اختیاری)',tgwSecret:'سکرت (۳۲ کاراکتر hex)',
-  tgwGen:'🎲 سکرت جدید',
+  tgwGen:'سکرت جدید',
   tgwZeroInf:'۰ = بی‌نهایت. حجم و مدت هر پروکسی همین‌جا ثبت می‌شود و وضعیتش (فعال / منقضی / اتمام حجم) در لیست پایین نمایش داده می‌شود.',
   tgwList:'وب‌پروکسی‌ها',tgwNone:'هنوز وب‌پروکسی‌ای ساخته نشده',
   tgwLink:'لینک عضویت تلگرام',tgwCopyLink:'کپی لینک',tgwOpen:'باز کردن در تلگرام',
@@ -7577,6 +7810,8 @@ const I18N={
   tgwEdit:'ویرایش وب‌پروکسی',tgwDelWarn:'این وب‌پروکسی حذف شود؟',
  },
  en:{dir:'ltr',
+  unitBytes:'bytes',loadingLbl:'Loading…',noLive:'No live connections',
+  phDash:'Live server, user and traffic overview',  phUsers:'Create, edit and monitor accounts',  phClean:'IPs that go into the subscription link',  phFilter:'Blocked and allowed domains',  phProxy:'Proxy pool and auto selection',  phLive:'Connections open right now',  phTgweb:'Telegram web proxy',  phSettings:'Appearance, password, backup and server',  phLogs:'Latest panel events',  refreshLbl:'Refresh',  tabBasic:'Basics',  tabLimits:'Limits',  tabSecurity:'Security',  viewAll:'All',  r24:'24h',  cancel:'Cancel',  statHintUsers:'accounts',  statHintOnline:'online now',  statHintDev:'active devices',  statHintBytes:'since start',  statHintCip:'in subscription',  statHintLive:'live sessions',  zeroInfShort:'0 means unlimited.',  moreLbl:'Details',  noResult:'Nothing found',
   setupTitle:'Set a password',setupSub:'First run — choose your panel password',
   loginTitle:'Sign in',loginSub:'Enter your password',
   password:'Password',confirm:'Confirm password',enter:'Sign in',save:'Save & enter',
@@ -7586,10 +7821,10 @@ const I18N={
   navSettings:'Panel settings',navLogs:'Events',menu:'Menu',
   totalUsers:'Total users',online:'Online users',devices:'Connected devices',
   traffic:'Total traffic',cleanIps:'Clean IPs',xSessions:'XHTTP sessions',liveTitle:'Live connections',liveEmpty:'No active connections',
-  chart24:'Last 24 hours',protoSplit:'Split by transport',
+  chart24:'Last 24 hours',protoSplit:'Connections per transport',
   newUser:'Create user',users:'Users',
   name:'Name',quota:'Quota (GB)',days:'Days',devLimit:'Devices',ipLimit:'IPs',
-  transport:'Transport',trWs:'🔌 WS + TLS',trXhttp:'🚀 XHTTP + TLS',trBoth:'🔀 Both',
+  transport:'Transport',trWs:'WS + TLS',trXhttp:'XHTTP + TLS',trBoth:'Both',
   add:'Add',zeroInf:'0 = unlimited. A device is identified by its IP and client signature; the IP cap is separate and ignores duplicates.',
   search:'Search…',noUsers:'No users yet',
   config:'Config',ipsBtn:'Devices & IPs',edit:'Edit',
@@ -7656,7 +7891,7 @@ const I18N={
   bkInclProxyCreds:'include proxy usernames and passwords',
   bkInclTraffic:'include traffic history (larger file)',
   bkSecretWarn:'⚠️ This file contains the panel password and your proxy credentials — treat it like a password.',
-  btnBackupLbl:'⬇️ Download backup',
+  btnBackupLbl:'Download backup',
   restoreTitle:'Restore',
   restoreHint:'Pick a .ixpbak file. Its contents are shown first; nothing is written until you confirm.',
   restoreMode:'Restore mode',
@@ -7739,7 +7974,7 @@ const I18N={
   tgwDelWarnPl:'Delete this proxy? Its service on {p} will be deleted from the platform as well.',
   tgwPauseWarn:'Pause this proxy? The service goes to sleep but keeps its hostname — turning it back on restores every link.',
   tgwServer:'Server (domain)',tgwLabel:'Label (optional)',tgwSecret:'Secret (32 hex chars)',
-  tgwGen:'🎲 New secret',
+  tgwGen:'New secret',
   tgwZeroInf:'0 = unlimited. Each proxy quota and lifetime is recorded here; the list below shows the live status (active / expired / quota used).',
   tgwList:'Web proxies',tgwNone:'No web proxies yet',
   tgwLink:'Telegram join link',tgwCopyLink:'Copy link',tgwOpen:'Open in Telegram',
@@ -7749,9 +7984,9 @@ const I18N={
  }
 };
 let LANG=localStorage.getItem('lang')||'fa';
-const THEMES=['dark','light','gray'];
-let THEME=localStorage.getItem('theme')||'dark';
-if(!THEMES.includes(THEME)){THEME='light'===THEME?'light':'dark';localStorage.setItem('theme',THEME)}
+const THEMES=['gray','light'];
+let THEME=localStorage.getItem('theme')||'gray';
+if(!THEMES.includes(THEME)){THEME=(THEME==='light')?'light':'gray';localStorage.setItem('theme',THEME)}
 const T=k=>I18N[LANG][k]||k;
 function applyChrome(){
  document.documentElement.lang=LANG;
@@ -7793,7 +8028,7 @@ body{min-height:100vh;display:grid;place-items:center;padding:18px;position:rela
 <div class="auth">
  <div class="top">
   <select id="langSel" class="hidden"><option value="fa">فارسی</option><option value="en">English</option></select>
-  <select id="thSel" class="hidden"><option value="dark"></option><option value="light"></option><option value="gray"></option></select>
+  <select id="thSel" class="hidden"><option value="light"></option><option value="gray"></option></select>
   <button class="icon-btn" type="button" title="theme" id="btnTh"
     onclick="setTheme(THEMES[(THEMES.indexOf(THEME)+1)%THEMES.length])">
    <svg class="ic" viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 1110 3.7a7 7 0 0010.5 10.8z"/></svg></button>
@@ -7912,7 +8147,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
  <div class="side-foot">
   <label class="fld"><span class="text-xs dim" data-t="appearance"></span>
    <select id="thSel" onchange="setTheme(this.value)" class="inp">
-    <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
+    <option value="light" data-t="thLight"></option>
     <option value="gray" data-t="thGray"></option></select></label>
   <label class="fld"><span class="text-xs dim" data-t="language"></span>
    <select id="langSel" onchange="setLang(this.value)" class="inp">
@@ -7944,105 +8179,232 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
 </header>
 
  <main class="content">
+  <div class="ph">
+   <div class="ph-t">
+    <h1 id="phTitle"></h1>
+    <p class="sub" id="phSub"></p>
+   </div>
+   <div class="acts" id="phActs"></div>
+  </div>
 
   <!-- ══ DASHBOARD ══ -->
+  <!-- ══ DASHBOARD ══ -->
   <section data-pg="dash">
-   <div class="g4">
-    <div class="stat">
-     <div class="ico" style="background:color-mix(in srgb,var(--info) 16%,transparent);color:var(--info)">
-      <svg class="ic ic-lg" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19.5c0-3 2.5-4.8 5.5-4.8s5.5 1.8 5.5 4.8"/><path d="M16.5 5.6a3 3 0 010 5.6M18 14.9c2 .6 3.4 2.2 3.4 4.6"/></svg></div>
-     <div><b id="sUsers">—</b><span data-t="totalUsers"></span></div></div>
-    <div class="stat">
-     <div class="ico" style="background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)">
-      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg></div>
-     <div><b id="sOnline" style="color:var(--ok)">—</b><span data-t="online"></span></div></div>
-    <div class="stat">
-     <div class="ico" style="background:color-mix(in srgb,var(--a2) 16%,transparent);color:var(--a2)">
-      <svg class="ic ic-lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg></div>
-     <div><b id="sLive" style="color:var(--ok)">—</b><span data-t="liveDevices"></span></div></div>
-    <div class="stat">
-     <div class="ico" style="background:color-mix(in srgb,var(--info) 16%,transparent);color:var(--info)">
-      <svg class="ic ic-lg" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2"/><path d="M11 18h2"/></svg></div>
-     <div><b id="sDev" style="color:var(--info)">—</b><span data-t="devices"></span></div></div>
-    <div class="stat">
-     <div class="ico" style="background:color-mix(in srgb,var(--a1) 20%,transparent);color:var(--a2)">
-      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M4 16l5-6 4 4 7-8"/><path d="M4 20h16"/></svg></div>
-     <div><b id="sBytes" style="color:var(--a2)">—</b><span data-t="traffic"></span></div></div>
-    <div class="stat">
-     <div class="ico" style="background:color-mix(in srgb,var(--a1) 20%,transparent);color:var(--a2)">
-      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M12 3.2c3.6 3.2 5.6 6 5.6 9a5.6 5.6 0 11-11.2 0c0-3 2-5.8 5.6-9z"/></svg></div>
-     <div><b id="sCip" style="color:var(--a1)">—</b><span data-t="cleanIps"></span></div></div>
-    <div class="stat">
-     <div class="ico" style="background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)">
-      <svg class="ic ic-lg" viewBox="0 0 24 24"><path d="M13 3L5 14h5l-1 7 8-11h-5z"/></svg></div>
-     <div><b id="sXs">—</b><span data-t="xSessions"></span></div></div>
+   <div class="strip">
+    <div class="cell">
+     <div class="k"><i></i><span data-t="totalUsers"></span></div>
+     <div class="v" id="sUsers">—</div>
+     <div class="d"><span data-t="statHintUsers"></span></div>
+    </div>
+    <div class="cell">
+     <div class="k"><i></i><span data-t="online"></span></div>
+     <div class="v" id="sOnline" style="color:var(--acid)">—</div>
+     <div class="d"><span data-t="statHintOnline"></span></div>
+    </div>
+    <div class="cell">
+     <div class="k"><i></i><span data-t="devices"></span></div>
+     <div class="v" id="sDev">—</div>
+     <div class="d"><span data-t="statHintDev"></span></div>
+    </div>
+    <div class="cell">
+     <div class="k"><i></i><span data-t="traffic"></span></div>
+     <div class="v" id="sBytes">—</div>
+     <div class="d"><span data-t="statHintBytes"></span></div>
+    </div>
+    <div class="cell">
+     <div class="k"><i></i><span data-t="cleanIps"></span></div>
+     <div class="v" id="sCip">—</div>
+     <div class="d"><span data-t="statHintCip"></span></div>
+    </div>
+    <div class="cell">
+     <div class="k"><i></i><span data-t="liveDevices"></span></div>
+     <div class="v" id="sLive" style="color:var(--brand)">—</div>
+     <div class="d"><span data-t="statHintLive"></span></div>
+    </div>
    </div>
 
-   <div class="card p-4 mt-4">
-    <b class="text-base" data-t="chart24"></b>
-    <div class="mt-3"><canvas id="chart" height="88"></canvas></div>
+   <div class="g a" style="display:grid;grid-template-columns:1.6fr 1fr;gap:14px;margin-bottom:14px">
+    <div class="card">
+     <div class="card-head">
+      <svg class="ic" viewBox="0 0 24 24" style="width:15px;height:15px;stroke:var(--acid);fill:none;stroke-width:1.8"
+           width="15" height="15"><path d="M4 16l5-6 4 4 7-8"/></svg>
+      <b data-t="chart24"></b>
+      
+      <div class="ms-auto" style="display:flex;gap:2px;padding:3px;border-radius:8px;
+           background:var(--s2);border:1px solid var(--line2)">
+       <span class="chip" style="border:0;background:transparent;color:var(--acid)">
+         <span data-t="r24">۲۴ ساعت</span></span>
+      </div>
+     </div>
+     <div style="padding:12px">
+      <canvas id="chart" height="150"></canvas>
+     </div>
+    </div>
+
+    <div class="card">
+     <div class="card-head">
+      <svg viewBox="0 0 24 24" style="width:15px;height:15px;stroke:var(--acid);fill:none;stroke-width:1.8">
+        <path d="M4 6h16M4 12h10M4 18h6"/></svg>
+      <b data-t="protoSplit"></b>
+     </div>
+     <div id="protoBox" style="padding:14px 15px;display:flex;flex-direction:column;gap:9px"></div>
+    </div>
    </div>
 
-   <div class="card p-4 mt-4">
-    <b class="text-base" data-t="protoSplit"></b>
-    <div id="protoBox" class="flex flex-wrap gap-2 mt-3 text-sm"></div>
+   <div class="card">
+    <div class="card-head">
+     <svg viewBox="0 0 24 24" style="width:15px;height:15px;stroke:var(--acid);fill:none;stroke-width:1.8">
+       <rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M7.4 10l2.4 2-2.4 2M12.6 14h4"/></svg>
+     <b data-t="liveTitle"></b>
+     <a class="chip ms-auto" onclick="go('live')" style="cursor:pointer">
+       <span data-t="viewAll">همه</span>
+       <svg viewBox="0 0 24 24" style="width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:2.2">
+         <path d="M15 6l-6 6 6 6"/></svg></a>
+    </div>
+    <div id="dashLive"><div class="lrow"><span class="dim" data-t="loadingLbl"></span></div></div>
    </div>
   </section>
 
+
+  <!-- ══ USERS ══ -->
   <!-- ══ USERS ══ -->
   <section data-pg="users" class="hidden">
-   <div class="card p-4">
-    <b class="text-base" data-t="newUser"></b>
-    <div class="g3 mt-3">
-     <label class="fld"><span class="text-xs dim" data-t="name"></span><input id="nName" class="inp"></label>
-     <label class="fld"><span class="text-xs dim" data-t="quota"></span><input id="nQuota" type="number" step="0.5" value="30" class="inp"></label>
-     <label class="fld"><span class="text-xs dim" data-t="days"></span><input id="nDays" type="number" value="30" class="inp"></label>
-     <label class="fld"><span class="text-xs dim" data-t="resetCycle"></span>
-      <select id="nReset" class="inp"><option value="0"></option><option value="1"></option><option value="3"></option><option value="7"></option><option value="14"></option><option value="30"></option><option value="60"></option><option value="90"></option><option value="-1"></option></select></label>
-     <label class="fld hidden" id="nResetWrap"><span class="text-xs dim" data-t="customDays"></span>
-      <input id="nResetCustom" type="number" min="1" max="365" class="inp"></label>
-     <label class="fld"><span class="text-xs dim" data-t="devLimit"></span><input id="nDev" type="number" value="1" class="inp"></label>
-     <label class="fld"><span class="text-xs dim" data-t="ipLimit"></span><input id="nIp" type="number" value="0" class="inp"></label>
-     <label class="fld"><span class="text-xs dim" data-t="transport"></span>
-      <select id="nTr" class="inp"><option value="both"></option><option value="ws"></option><option value="xhttp"></option></select></label>
-    </div>
-    <div class="flex flex-wrap items-center gap-3 mt-3 text-sm">
-     <label class="flex items-center gap-2"><input id="nObf" type="checkbox"><span data-t="obfLbl"></span></label>
-     <label class="flex items-center gap-2"><input id="nEch" type="checkbox"><span data-t="echLbl"></span></label>
-     <label class="flex items-center gap-2"><span class="dim" data-t="fpLbl"></span>
-      <select id="nFp" class="inp" style="width:auto;padding:6px 9px;font-size:12px"></select></label>
-     <label class="flex items-center gap-2"><span class="dim" data-t="alpnLbl"></span>
-      <select id="nAlpn" class="inp" style="width:auto;padding:6px 9px;font-size:12px"></select></label>
-    </div>
-    <details class="mt-3">
-     <summary class="text-xs dim" style="cursor:pointer" data-t="custLbl"></summary>
-     <div class="mt-3">
-      <label class="fld"><span class="text-xs dim" data-t="echValueLbl"></span>
-       <input id="nEchVal" class="inp mono" style="font-size:11px" placeholder="cloudflare-ech.com+udp://1.1.1.1"></label>
-      <div class="g2 mt-2">
-       <label class="fld"><span class="text-xs dim" data-t="obfCsLbl"></span>
-        <input id="nObfCs" class="inp mono" style="font-size:11px"></label>
-       <label class="fld"><span class="text-xs dim" data-t="obfFmLbl"></span>
-        <textarea id="nObfFm" rows="3" spellcheck="false" class="inp mono" style="font-size:11px"></textarea></label>
-      </div>
-      <p class="text-xs mt-2" style="color:var(--warn,#e0a80d);margin:0" data-t="custHint"></p>
-     </div>
-    </details>
-    <div class="flex flex-wrap items-center gap-3 mt-3">
-     <button onclick="createUser()" id="btnAdd" class="btn"></button>
-     <span class="text-xs dim" data-t="zeroInf"></span>
-    </div>
-    <p id="cErr" class="text-sm mt-2" style="color:var(--bad);margin-bottom:0"></p>
-   </div>
-
-   <div class="card mt-4" style="overflow:hidden">
+   <div class="card">
     <div class="card-head">
-     <b class="text-base" data-t="users"></b>
-     <input id="q" oninput="renderUsers()" class="inp ms-auto" style="width:190px;padding:7px 11px">
+     <label class="fld" style="flex:1;max-width:280px">
+      <input id="q" oninput="renderUsers()" class="inp" autocomplete="off">
+     </label>
+     <span id="uCount" class="chip ms-auto"></span>
     </div>
     <div id="rows"></div>
    </div>
   </section>
+
+  <!-- ══ مودال ساخت کاربر (به‌جای فرم همیشه‌باز) ══ -->
+  <div id="userModal" class="mwrap hidden" role="dialog" aria-modal="true" aria-labelledby="umTitle">
+   <div class="sheet">
+    <div class="sheet-head">
+     <b id="umTitle" data-t="newUser"></b>
+     <button class="x" onclick="closeUserForm()" aria-label="بستن">
+      <svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round">
+        <path d="M6 6l12 12M18 6L6 18"/></svg>
+     </button>
+    </div>
+
+    <div class="stabs" id="umTabs">
+     <button class="on" data-pane="basic" data-t="tabBasic"></button>
+     <button data-pane="limits" data-t="tabLimits"></button>
+     <button data-pane="security" data-t="tabSecurity"></button>
+    </div>
+
+    <div class="sheet-body">
+
+     <!-- ── پایه ── -->
+     <div class="pane on" data-pane="basic">
+      <div class="fld" style="margin-bottom:11px">
+       <label data-t="name"></label>
+       <input id="nName" class="inp" placeholder="ali_01" dir="ltr" autocomplete="off">
+      </div>
+      <div class="g2">
+       <div class="fld">
+        <label data-t="quota"></label>
+        <input id="nQuota" type="number" step="0.5" value="30" class="inp">
+       </div>
+       <div class="fld">
+        <label data-t="days"></label>
+        <input id="nDays" type="number" value="30" class="inp">
+       </div>
+      </div>
+      <div class="fld" style="margin-top:11px">
+       <label data-t="transport"></label>
+       <select id="nTr" class="inp">
+        <option value="both"></option><option value="ws"></option><option value="xhttp"></option>
+       </select>
+      </div>
+      <div class="notice" style="margin-top:13px">
+       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+       <span data-t="zeroInf"></span>
+      </div>
+     </div>
+
+     <!-- ── محدودیت‌ها ── -->
+     <div class="pane" data-pane="limits">
+      <div class="g2">
+       <div class="fld">
+        <label data-t="devLimit"></label>
+        <input id="nDev" type="number" value="1" class="inp">
+       </div>
+       <div class="fld">
+        <label data-t="ipLimit"></label>
+        <input id="nIp" type="number" value="0" class="inp">
+       </div>
+      </div>
+      <div class="fld" style="margin-top:11px">
+       <label data-t="resetCycle"></label>
+       <select id="nReset" class="inp">
+        <option value="0"></option><option value="1"></option><option value="3"></option>
+        <option value="7"></option><option value="14"></option><option value="30"></option>
+        <option value="60"></option><option value="90"></option><option value="-1"></option>
+       </select>
+      </div>
+      <div class="fld hidden" id="nResetWrap" style="margin-top:11px">
+       <label data-t="customDays"></label>
+       <input id="nResetCustom" type="number" min="1" max="365" class="inp">
+      </div>
+      <p class="hint" data-t="zeroInfShort"></p>
+     </div>
+
+     <!-- ── امنیت ── -->
+     <div class="pane" data-pane="security">
+      <div class="fld" style="margin-bottom:11px">
+       <label data-t="fpLbl"></label>
+       <select id="nFp" class="inp"></select>
+      </div>
+      <div class="fld" style="margin-bottom:13px">
+       <label data-t="alpnLbl"></label>
+       <select id="nAlpn" class="inp"></select>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:11px;padding:12px;
+                  border-radius:10px;background:var(--s2);border:1px solid var(--line)">
+       <label class="flex items-center gap-2" style="cursor:pointer">
+        <input id="nObf" type="checkbox"><span data-t="obfLbl"></span></label>
+       <label class="flex items-center gap-2" style="cursor:pointer">
+        <input id="nEch" type="checkbox"><span data-t="echLbl"></span></label>
+      </div>
+
+      <details style="margin-top:13px">
+       <summary class="text-xs dim" style="cursor:pointer;padding:6px 0" data-t="custLbl"></summary>
+       <div style="margin-top:10px">
+        <div class="fld">
+         <label data-t="echValueLbl"></label>
+         <input id="nEchVal" class="inp mono" style="font-size:11px"
+                placeholder="cloudflare-ech.com+udp://1.1.1.1">
+        </div>
+        <div class="g2" style="margin-top:9px">
+         <div class="fld">
+          <label data-t="obfCsLbl"></label>
+          <input id="nObfCs" class="inp mono" style="font-size:11px">
+         </div>
+         <div class="fld">
+          <label data-t="obfFmLbl"></label>
+          <textarea id="nObfFm" rows="3" spellcheck="false" class="inp mono" style="font-size:11px"></textarea>
+         </div>
+        </div>
+        <p class="hint" style="color:var(--amber)" data-t="custHint"></p>
+       </div>
+      </details>
+     </div>
+
+    </div>
+
+    <div class="sheet-foot">
+     <button onclick="createUser()" id="btnAdd" class="btn"></button>
+     <button class="btn btn-soft" onclick="closeUserForm()" data-t="cancel"></button>
+     <p id="cErr" class="err"></p>
+    </div>
+   </div>
+  </div>
+
 
   <!-- ══ CLEAN IP ══ -->
   <section data-pg="clean" class="hidden">
@@ -8223,11 +8585,11 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
     <div class="g3 mt-3">
      <label class="fld"><span class="text-xs dim" data-t="theme"></span>
       <select id="thSel2" onchange="setTheme(this.value);syncSelects()" class="inp">
-       <option value="dark" data-t="thDark"></option><option value="light" data-t="thLight"></option>
+       <option value="light" data-t="thLight"></option>
        <option value="gray" data-t="thGray"></option></select></label>
      <label class="fld"><span class="text-xs dim" data-t="language"></span>
       <select id="langSel2" onchange="setLang(this.value);syncSelects()" class="inp">
-       <option value="fa">🇮🇷 فارسی</option><option value="en">🇬🇧 English</option></select></label>
+       <option value="fa">فارسی</option><option value="en">English</option></select></label>
      <label class="fld"><span class="text-xs dim" data-t="mainCountry"></span>
       <div class="flex gap-2">
        <select id="mcSel" class="inp flex-1"></select>
@@ -8335,7 +8697,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl" data-theme="dark"><hea
 const esc=(s)=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 const ICO={
- cfg:'<svg class="ic" viewBox="0 0 24 24"><path d="M9.4 7.2L5 12l4.4 4.8M14.6 7.2L19 12l-4.4 4.8"/><path d="M13.2 4.6l-2.4 14.8"/></svg>',
+ cfg:'<svg class="ic" viewBox="0 0 24 24"><path d="M10 13.5a4 4 0 005.66 0l2.83-2.83a4 4 0 10-5.66-5.66L11.4 6.4"/><path d="M14 10.5a4 4 0 00-5.66 0L5.5 13.33a4 4 0 105.66 5.66l1.42-1.42"/></svg>',
  ips:'<svg class="ic" viewBox="0 0 24 24"><rect x="2.8" y="5" width="12.5" height="8.5" rx="1.8"/><path d="M6.4 17.4h5.3M9 13.5v3.9"/><rect x="16.4" y="9.5" width="4.8" height="9.5" rx="1.6"/></svg>',
  edit:'<svg class="ic" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M14 6l4 4"/></svg>',
  del:'<svg class="ic" viewBox="0 0 24 24"><path d="M5 7h14M9.5 7V5h5v2M7 7l1 13h8l1-13"/></svg>',
@@ -8409,6 +8771,7 @@ function go(p){
  crumb.textContent=T({dash:'navDash',users:'navUsers',clean:'navClean',filter:'navFilter',
    proxy:'navProxy',tgweb:'navTgweb',live:'navLive',settings:'navSettings',logs:'navLogs'}[p]);
  closeDrawer();
+ try{paintPageHead(p)}catch(_){}
  if(p==='logs')loadLogs();
  if(p==='clean')loadCips();
  if(p==='filter')loadFilter();
@@ -8456,7 +8819,7 @@ function paintStatic(){
  document.querySelectorAll('[data-t]').forEach(e=>e.textContent=T(e.dataset.t));
  btnOut.textContent=T('logout'); btnAdd.textContent=T('add');
  btnTgAdd.textContent=T('add'); btnTgGen.textContent=T('tgwGen');
- btnTgSet.textContent='⚙️ '+T('tgwSetBtn');
+ btnTgSet.textContent=T('tgwSetBtn');
  tgPlRender.textContent=T('tgwPlRender');
  tgPlRailway.textContent=T('tgwPlRailway');
  fillTgRegions(tgPlatform);
@@ -8485,6 +8848,7 @@ function paintStatic(){
  const _mb=document.getElementById('btnMc'); if(_mb)_mb.textContent=T('save');
  pwCur.placeholder=T('curPw'); pwNew.placeholder=T('newPw');
  applyNav();
+ try{paintPageHead(PAGE)}catch(_){}
 }
 window.rerender=()=>{paintStatic();go(PAGE);renderUsers();renderCips();
  renderProto();renderServer();renderLogs();renderFilter()};
@@ -8514,11 +8878,16 @@ function paintChart(){
 }
 function renderProto(){
  const bp=stats.by_proto||{};
- const pairs=[['ws',T('trWs'),'var(--a1)'],['xhttp',T('trXhttp'),'var(--a2)']];
- protoBox.innerHTML=pairs.map(([k,lbl,col])=>`
-  <div class="chip" style="font-size:12px;padding:7px 12px">
-   <span style="width:8px;height:8px;border-radius:50%;background:${col}"></span>
-   <span class="dim">${lbl}</span><b>${bp[k]||0}</b></div>`).join('');
+ const rows=[['ws',T('trWs'),'var(--a1)'],['xhttp',T('trXhttp'),'var(--a2)']];
+ const max=Math.max(1,...rows.map(r=>bp[r[0]]||0));
+ protoBox.innerHTML=rows.map(([k,lbl,col])=>{
+  const v=bp[k]||0;
+  return '<div class="prow">'
+   +'<span class="lbl"><i style="background:'+col+'"></i>'+lbl+'</span>'
+   +'<b>'+v+'</b>'
+   +'<span class="bar"><i style="width:'+Math.round(v/max*100)+'%;background:'+col+'"></i></span>'
+  +'</div>';
+ }).join('');
 }
 function renderServer(){
  srvBox.innerHTML=[
@@ -8542,9 +8911,10 @@ async function loadStats(){
  sUsers.textContent=stats.users; sOnline.textContent=stats.online_users;
  sDev.textContent=stats.online_devices; sLive.textContent=stats.live_devices;
  sBytes.textContent=fmt(stats.total_bytes);
- sCip.textContent=stats.clean_ips; sXs.textContent=stats.xhttp_sessions;
+ sCip.textContent=stats.clean_ips;
  pill.textContent='/'+stats.ws_path+' · /'+stats.xhttp_path;
  paintChart(); renderProto();
+ if(PAGE==='dash')loadDashLive();
  if(PAGE==='settings'){renderServer();loadBackupInfo();loadTelegram()}
 }
 async function loadUsers(){users=await api('/api/users');renderUsers()}
@@ -8589,43 +8959,89 @@ async function loadLive(){
 function stopLive(){clearTimeout(liveTimer);liveTimer=null}
 
 /* ─── renderers ─── */
-function renderUsers(){
- const term=(q.value||'').toLowerCase();
- rows.innerHTML=users.filter(u=>u.name.toLowerCase().includes(term)).map(u=>{
-  const pct=u.quota_bytes?Math.min(100,u.used_bytes/u.quota_bytes*100):0;
-  const badge=u.active
-   ?`<span class="chip green">${T('active')}</span>`
-   :`<span class="chip red">${statusTxt(u.status)}</span>`;
-  const dev=u.device_limit?`<bdi dir="ltr">${u.devices_now}/${u.device_limit}</bdi>`:'∞';
-  const liveTag=u.devices_live?`<span class="chip green">● ${u.devices_live}</span>`:'';
-  const devWarn=u.device_limit&&u.devices_now>=u.device_limit;
-  const ipN=u.ip_limit?`<bdi dir="ltr">${u.ips_now}/${u.ip_limit}</bdi>`:'∞';
-  const ipWarn=u.ip_limit&&u.ips_now>=u.ip_limit;
-  const ipTag=u.ips_live?`<span class="chip green">● ${u.ips_live}</span>`:'';
-  return `<div class="urow">
-   <div class="u-av">${esc((u.name||'?').slice(0,1).toUpperCase())}</div>
-   <div class="u-main">
-    <div class="flex items-center gap-2 flex-wrap">
-     <b class="text-base">${esc(u.name)}</b>${badge}
-     <span class="chip teal">${trTxt(u.transport)}</span>${liveTag}${ipTag}
-    </div>
-    <div class="progress mt-2${pct>=85?' hot':''}"><i style="width:${pct}%"></i></div>
-    <div class="flex flex-wrap gap-3 text-xs dim mt-1">
-     <span>${T('used')}: <bdi dir="ltr">${fmt(u.used_bytes)} / ${u.quota_bytes?fmt(u.quota_bytes):'♾️'}</bdi></span>
-     <span>${T('expiry')}: ${dt(u.expire_at)}</span>
-    </div>
-   </div>
-   <div class="u-dev">
-    <div style="color:${devWarn?'var(--bad)':'var(--info)'}">📱 ${dev}</div>
-    <div style="color:${ipWarn?'var(--bad)':'var(--info)'}">🌐 ${ipN}</div>
-   </div>
-   <div class="u-actions">
-    <button class="icon-btn" title="${T('config')}" onclick="showConfig(${u.id})">${ICO.cfg}</button>
-    <button class="icon-btn" title="${T('ipsBtn')}" onclick="showIps(${u.id})">${ICO.ips}</button>
-    <button class="icon-btn" title="${T('edit')}" onclick="showEdit(${u.id})">${ICO.edit}</button>
-   </div></div>`}).join('')
-  ||`<div class="p-4 text-sm dim" style="text-align:center">${T('noUsers')}</div>`;
+
+function durTxt(sec){
+ sec=Math.max(0,Math.floor(sec||0));
+ if(sec<60)return sec+'s';
+ const m=Math.floor(sec/60);
+ if(m<60)return m+'m '+(sec%60)+'s';
+ return Math.floor(m/60)+'h '+(m%60)+'m';
 }
+async function loadDashLive(){
+ const host=document.getElementById('dashLive');
+ if(!host)return;
+ try{
+  const d=await api('/api/live');
+  const rows=(d.connections||[]).slice(0,5);
+  if(!rows.length){
+   host.innerHTML='<div class="lrow"><span class="dim">'+T('noLive')+'</span></div>';
+   return;
+  }
+  host.innerHTML=rows.map(c=>
+   '<div class="lrow">'
+    +'<span class="chip '+(c.transport==='xhttp'?'teal':'blue')+'">'
+      +esc(String(c.transport||'').toUpperCase())+'</span>'
+    +'<b>'+esc(c.user||'—')+'</b>'
+    +'<span class="dim mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+      +esc(c.ip||'')+(c.route?' · '+esc(c.route):'')+'</span>'
+    +'<span class="mono ms-auto" style="color:var(--tx3)">'+durTxt(c.connected_for)+'</span>'
+   +'</div>').join('');
+ }catch(_){}
+}
+
+function renderUsers(){
+ const qi=document.getElementById('q');
+ const t=((qi&&qi.value)||'').trim().toLowerCase();
+ const list=t?users.filter(u=>u.name.toLowerCase().includes(t)):users;
+ const cnt=document.getElementById('uCount');
+ if(cnt)cnt.textContent=list.length+' / '+users.length;
+ const host=document.getElementById('rows'); if(!host)return;
+ const IC={
+  phone:'<svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.6"/><path d="M10.8 18.6h2.4"/></svg>',
+  globe:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.2 9.2h17.6M3.2 14.8h17.6M12 3a15.5 15.5 0 000 18M12 3a15.5 15.5 0 010 18"/></svg>',
+  clock:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3.1 1.9"/></svg>'
+ };
+ if(!list.length){
+  host.innerHTML='<div class="empty"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M16.5 16.5L21 21"/></svg><span>'
+   +(t?T('noResult'):T('noUsers'))+'</span></div>';
+  return;
+ }
+ host.innerHTML=list.map(u=>{
+  const pct=u.quota_bytes?Math.min(100,(u.used_bytes/u.quota_bytes)*100):0;
+  const devL=u.device_limit||0, ipL=u.ip_limit||0;
+  const devWarn=!!(devL&&u.devices_now>=devL);
+  const ipWarn=!!(ipL&&u.ips_now>=ipL);
+  const badge=u.active
+   ?'<span class="chip green">'+T('active')+'</span>'
+   :'<span class="chip red">'+statusTxt(u.status)+'</span>';
+  const live=u.devices_live?'<span class="chip green dot">'+u.devices_live+'</span>':'';
+  return '<div class="ucard">'
+   +'<div class="uc-top">'
+     +'<span class="av">'+esc((u.name||'?').charAt(0).toUpperCase())+'</span>'
+     +'<span class="nm">'+esc(u.name)+'</span>'
+     +badge+'<span class="chip teal">'+trTxt(u.transport)+'</span>'+live
+     +'<div class="uc-act">'
+       +'<button class="icon-btn" title="'+T('config')+'" onclick="showConfig('+u.id+')">'+ICO.cfg+'</button>'
+       +'<button class="icon-btn" title="'+T('ipsBtn')+'" onclick="showIps('+u.id+')">'+ICO.ips+'</button>'
+       +'<button class="icon-btn" title="'+T('edit')+'" onclick="showEdit('+u.id+')">'+ICO.edit+'</button>'
+     +'</div>'
+   +'</div>'
+   +'<div class="uc-bar'+(pct>=85?' hot':'')+'"><i style="width:'+pct.toFixed(1)+'%"></i></div>'
+   +'<div class="uc-foot">'
+     +'<span class="mono">'+fmt(u.used_bytes)+' / '+(u.quota_bytes?fmt(u.quota_bytes):'∞')+'</span>'
+     +'<span class="pct">'+pct.toFixed(0)+'%</span>'
+   +'</div>'
+   +'<div class="uc-foot">'
+     +'<span>'+IC.clock+T('expiry')+' <b>'+dt(u.expire_at)+'</b></span>'
+     +'<span'+(devWarn?' class="warn"':'')+'>'+IC.phone+'<b>'+(devL?u.devices_now+'/'+devL:'∞')
+       +'</b> '+T('devSec')+'</span>'
+     +'<span'+(ipWarn?' class="warn"':'')+'>'+IC.globe+'<b>'+(ipL?u.ips_now+'/'+ipL:'∞')
+       +'</b> '+T('ipSec')+'</span>'
+   +'</div>'
+  +'</div>';
+ }).join('');
+}
+
 
 function renderCips(){
  cipRows.innerHTML=cips.map(x=>`
@@ -8670,6 +9086,7 @@ async function createUser(){
    ech:nEch.checked,fp:nFp.value||'unsafe',alpn:nAlpn.value,
    ech_value:nEchVal.value.trim(),obf_cs:nObfCs.value.trim(),obf_fm:nObfFm.value.trim()})});
   nName.value='';loadUsers();loadStats();
+  try{closeUserForm()}catch(_){}
  }catch(e){cErr.textContent=e.message}
 }
 async function addCip(){
@@ -8767,7 +9184,7 @@ function renderTgweb(){
   const linkBtn=u.link?`<button class="icon-btn" title="${T('tgwLink')}" onclick="tgLink(${u.id})">${ICO.copy}</button>`
    :`<span class="icon-btn" style="opacity:.35;cursor:default">${ICO.copy}</span>`;
   return `<div class="urow">
-   <div class="u-av">✈️</div>
+   <div class="u-av"><svg viewBox="0 0 24 24" style="width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round"><path d="M21 3L3 10.5l6 2.4 2.4 6L21 3z"/><path d="M9 12.9L21 3"/></svg></div>
    <div class="u-main">
     <div class="flex items-center gap-2 flex-wrap">
      <b class="text-base">${esc(u.label||(u.server||tgPlName(plat)))}</b>${stBadge}${dwChip(u)}${tgPlatChip(u)}
@@ -9400,8 +9817,15 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
  const MAPCE=new WeakMap();
  const escH=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+ let MUT=0;   /* گارد: نوشتن‌های خودمان نباید MutationObserver را بیدار کند */
+
  function build(sel){
-  if(MAPCE.has(sel))return MAPCE.get(sel);
+  if(MAPCE.has(sel)){
+   const a=MAPCE.get(sel);
+   if(a.root.isConnected&&a.root.parentNode===sel.parentNode)return a;
+   try{a.root.remove()}catch(_){}
+   MAPCE.delete(sel);
+  }
   const root=document.createElement('div'); root.className='sel';
   const btn=document.createElement('button');
   btn.type='button'; btn.className='sel-btn'; btn.setAttribute('aria-haspopup','listbox');
@@ -9410,7 +9834,8 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
   const menu=document.createElement('div');
   menu.className='sel-menu'; menu.setAttribute('role','listbox');
   root.appendChild(btn); root.appendChild(menu);
-  sel.parentNode.insertBefore(root, sel.nextSibling);
+  root.dataset.forSel='1';
+  MUT++; sel.parentNode.insertBefore(root, sel.nextSibling); MUT--;
   const api={sel,root,btn,menu,sig:null};
   MAPCE.set(sel,api);
   btn.addEventListener('click',e=>{e.stopPropagation();toggle(api)});
@@ -9429,7 +9854,8 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
   api.sig=sig;
   const cur=opts.find(o=>o.value===sel.value)||opts[0];
   api.btn.querySelector('.cur').textContent=cur?txt(cur):'—';
-  if(!opts.length){api.menu.innerHTML='<div class="sempty">—</div>';return}
+  MUT++;
+  if(!opts.length){api.menu.innerHTML='<div class="sempty">—</div>';MUT--;return}
   api.menu.innerHTML=opts.map(o=>{
    const on=String(o.value)===String(sel.value);
    return '<button type="button" class="sopt" role="option" data-v="'+escH(o.value)+'" '+
@@ -9437,6 +9863,7 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
     '<span class="tx">'+escH(txt(o))+'</span>'+
     '<svg class="tick" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7"/></svg></button>';
   }).join('');
+  MUT--;
   api.menu.querySelectorAll('.sopt').forEach(b=>{
    b.addEventListener('click',()=>{
     if(sel.value!==b.dataset.v){
@@ -9485,7 +9912,17 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
   if(e.key==='Tab')close(api);
  }
 
+ function prune(){
+  /* آینه‌هایی که select‌شان از صفحه حذف شده باید بروند، وگرنه روی هم تلنبار می‌شوند */
+  document.querySelectorAll('.sel[data-for-sel]').forEach(root=>{
+   const prev=root.previousElementSibling;
+   if(!prev||prev.tagName!=='SELECT'){try{root.remove()}catch(_){}}
+  });
+ }
+
  function scan(){
+  if(MUT)return;
+  prune();
   document.querySelectorAll('select').forEach(sel=>{
    if(sel.dataset.native==='1')return;      /* اگر خواستی بعضی‌ها نیتیو بمانند */
    if(!MAPCE.has(sel))build(sel); else sync(sel);
@@ -9493,11 +9930,15 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
  }
 
  document.addEventListener('click',()=>closeAll());
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeAll()});
+ window.addEventListener('scroll',()=>closeAll(),true);
+ window.addEventListener('resize',()=>closeAll());
  /* هر بار پنل آپشن‌ها/متن‌ها را بازنویسی کرد، آینه به‌روز می‌شود */
  let mt=null;
  const mo=new MutationObserver(()=>{
+  if(MUT)return;
   clearTimeout(mt);
-  mt=setTimeout(()=>{try{scan()}catch(e){}},60);
+  mt=setTimeout(()=>{try{scan()}catch(e){}},80);
  });
  function startObserver(){
   mo.observe(document.body,{childList:true,subtree:true,characterData:true});
@@ -9513,6 +9954,76 @@ function toast(msg){const el=document.getElementById('toast');el.innerHTML=msg;e
  }
  new MutationObserver(syncLangTag).observe(document.documentElement,{attributes:true,attributeFilter:['lang']});
  syncLangTag();
+})();
+
+/* ══════════════════ v4 · سرصفحه، مودال کاربر، تب‌ها ══════════════════ */
+const PH_MAP={
+ dash:['navDash','phDash'],users:['navUsers','phUsers'],clean:['navClean','phClean'],
+ filter:['navFilter','phFilter'],proxy:['navProxy','phProxy'],live:['navLive','phLive'],
+ tgweb:['navTgweb','phTgweb'],settings:['navSettings','phSettings'],logs:['navLogs','phLogs']};
+const PH_ICO={
+ plus:'<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+ refres:'<svg viewBox="0 0 24 24"><path d="M20 11.5a8 8 0 10-2.3 5.6M20 5v6.5h-6.5"/></svg>'};
+function paintPageHead(p){
+ const t=document.getElementById('phTitle'),s=document.getElementById('phSub'),
+       a=document.getElementById('phActs');
+ if(!t)return;
+ const m=PH_MAP[p]||PH_MAP.dash;
+ t.textContent=T(m[0]); s.textContent=T(m[1]||'');
+ /* عنوان تکراری داخل کارت‌ها پنهان می‌شود تا صفحه دو بار تیتر نخورد */
+ const sec=document.querySelector('[data-pg="'+p+'"]');
+ if(sec)sec.querySelectorAll('.card-head b').forEach(b=>{
+  const same=(b.dataset.t&&b.dataset.t===m[0])||b.textContent.trim()===t.textContent.trim();
+  b.style.display=same?'none':'';
+ });
+ if(!a)return;
+ if(p==='users'){
+  a.innerHTML=`<button class="btn" onclick="openUserForm()">${PH_ICO.plus}<span>${T('newUser')}</span></button>`;
+ }else if(p==='clean'||p==='filter'||p==='live'||p==='logs'){
+  a.innerHTML=`<button class="btn btn-soft" onclick="refreshPage()">${PH_ICO.refres}<span>${T('refreshLbl')}</span></button>`;
+ }else a.innerHTML='';
+}
+function refreshPage(){
+ if(PAGE==='clean')loadCips(); else if(PAGE==='filter')loadFilter();
+ else if(PAGE==='live')loadLive(); else if(PAGE==='logs')loadLogs(); else loadStats();
+}
+
+/* ── مودال ساخت کاربر ── */
+function openUserForm(){
+ const m=document.getElementById('userModal'); if(!m)return;
+ const e=document.getElementById('cErr'); if(e)e.textContent='';
+ m.classList.remove('hidden');
+ document.body.classList.add('locked');
+ switchTab('basic');
+ try{enhanceSelects()}catch(_){}
+ setTimeout(()=>{const n=document.getElementById('nName'); if(n&&!n.value)n.focus()},80);
+}
+function closeUserForm(){
+ const m=document.getElementById('userModal'); if(!m)return;
+ m.classList.add('hidden');
+ document.body.classList.remove('locked');
+}
+function switchTab(p){
+ document.querySelectorAll('#umTabs button').forEach(b=>b.classList.toggle('on',b.dataset.pane===p));
+ document.querySelectorAll('#userModal .pane').forEach(x=>x.classList.toggle('on',x.dataset.pane===p));
+ const body=document.querySelector('#userModal .sheet-body');
+ if(body)body.scrollTop=0;
+}
+(function wireUserForm(){
+ const m=document.getElementById('userModal'); if(!m)return;
+ const tabs=document.getElementById('umTabs');
+ if(tabs)tabs.addEventListener('click',ev=>{
+  const b=ev.target.closest('button[data-pane]'); if(b)switchTab(b.dataset.pane);
+ });
+ m.addEventListener('click',ev=>{ if(ev.target===m)closeUserForm(); });
+ document.addEventListener('keydown',ev=>{
+  if(ev.key==='Escape'&&!m.classList.contains('hidden'))closeUserForm();
+ });
+ const nr=document.getElementById('nReset');
+ if(nr)nr.addEventListener('change',()=>{
+  const w=document.getElementById('nResetWrap');
+  if(w)w.classList.toggle('hidden',nr.value!=='-1');
+ });
 })();
 
 /* ─── boot ─── */
