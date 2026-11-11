@@ -3019,34 +3019,98 @@ async def railway_read_instance(token: str, service_id: str,
     return d.get("serviceInstance") or {}
 
 
+def _http_headers_get(url: str, headers: dict | None = None,
+                      timeout: int = 12) -> dict:
+    """One stdlib GET returning the RESPONSE HEADERS lower-cased. Railway's edge
+    stamps its routing headers even on non-2xx answers (a paused service returns
+    4xx/5xx but the edge headers still tell where it lives), so only transport
+    failures raise."""
+    req = urllib.request.Request(url, method="GET")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    req.add_header("user-agent", PLATFORM_UA)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as e:
+        return {k.lower(): v for k, v in (e.headers or {}).items()}
+    except Exception as e:
+        raise PlatformError("edge probe failed: %s" % e)
+
+
+async def railway_real_region(token: str, service_id: str, environment_id: str,
+                              host: str = "") -> str:
+    """The region the deployment ACTUALLY runs in. The instance's `region` field is
+    only the stored setting and can disagree with placement (the reported "the
+    panel shows Amsterdam but the IP test says US"). Railway's edge stamps every
+    answer with x-railway-upstream-zone — the origin zone the request was routed
+    to — which is the ground truth (format "railway/<region code>"). The probe
+    must hit the ORIGIN host (*.up.railway.app); relay/custom domains never carry
+    the header. Falls back to the instance read when the probe fails."""
+    if (host or "").strip():
+        try:
+            h = await _call(_http_headers_get, "https://" + host.strip().rstrip("/")
+                            + "/", {"x-railway-debug": "true"}, 10)
+            zone = (h.get("x-railway-upstream-zone") or "").strip()
+            if zone:
+                return zone.split("/", 1)[-1].strip()
+        except PlatformError:
+            pass
+    return ((await railway_read_instance(token, service_id, environment_id))
+            .get("region") or "").strip()
+
+
 async def railway_set_region(token: str, service_id: str, environment_id: str,
                              region: str):
     """Move an existing instance to another region — Railway redeploys in place and
-    keeps the domain, so every issued link stays valid. The write is verified by
-    reading the instance back: Railway has accepted region payloads while still
-    landing the service in its default region, which is exactly the silent failure
-    this guard turns into a real error."""
+    keeps the domain, so every issued link stays valid.
+
+    Railway keeps TWO region slots that must agree: the instance's `region` field is
+    only the stored setting, while actual placement follows `multiRegionConfig`.
+    Writing `region` alone is accepted and echoed back by every read, yet the
+    service keeps running in the account's default region — the exact silent
+    failure behind "the panel shows Amsterdam but the IP test says US" (proven by
+    the edge's x-railway-upstream-zone header still reporting the old zone). The
+    primary write therefore sets BOTH; the plain write is kept as a fallback for
+    older schemas that reject multiRegionConfig. Every write is verified by
+    reading the instance back: a confirmed wrong region raises, so the UI never
+    claims a region the service is not in."""
     q = """mutation serviceInstanceUpdate($serviceId: String!, $environmentId: String!,
              $input: ServiceInstanceUpdateInput!) {
              serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId,
                input: $input) }"""
-    await railway_gql(token, q,
-                      {"serviceId": service_id, "environmentId": environment_id,
-                       "input": {"region": region}})
-    for attempt in (1, 2):
-        real = ((await railway_read_instance(token, service_id, environment_id))
-                .get("region") or "").strip()
-        if not real or real == region:
-            return                      # applied — or nothing readable yet (pre-deploy)
+
+    async def write(payload: dict):
         await railway_gql(token, q,
                           {"serviceId": service_id, "environmentId": environment_id,
-                           "input": {"region": region}})
-    real = ((await railway_read_instance(token, service_id, environment_id))
-            .get("region") or "").strip()
-    if real and real != region:
-        raise PlatformError("Railway kept the service in region %s (requested %s) — "
-                            "this plan/account may not allow that region"
-                            % (real, region))
+                           "input": payload})
+
+    payloads = [{"region": region,
+                 "multiRegionConfig": {region: {"numReplicas": 1}}},
+                {"region": region}]
+    last_err = None
+    for payload in payloads:
+        try:
+            await write(payload)
+        except PlatformError as e:
+            last_err = e                # try the next-known payload shape
+            continue
+        for attempt in (1, 2):
+            real = ((await railway_read_instance(token, service_id, environment_id))
+                    .get("region") or "").strip()
+            if not real or real == region:
+                return                  # applied — or nothing readable yet (pre-deploy)
+            await write(payload)
+        real = ((await railway_read_instance(token, service_id, environment_id))
+                .get("region") or "").strip()
+        if real and real != region:
+            raise PlatformError("Railway kept the service in region %s (requested %s) — "
+                                "this plan/account may not allow that region"
+                                % (real, region))
+        return                          # set, not yet readable — tgw_refresh_platform
+                                        # re-checks the real zone after the deploy lands
+    raise PlatformError("region update rejected: %s" % (last_err or "all known "
+                                                        "payload shapes refused"))
 
 
 async def railway_configure_instance(token: str, service_id: str, environment_id: str,
@@ -3054,12 +3118,15 @@ async def railway_configure_instance(token: str, service_id: str, environment_id
     """Attach the repo source (rootDirectory = the tproxy folder) + healthcheck + the
     region to build in. `repo` must already be the \"owner/repo\" slug Railway expects.
 
-    The region is sent as its own serviceInstanceUpdate — bundling it with the source
-    attach made Railway silently drop it and build in the default region (the reported
-    "chose Amsterdam, got US West"). After both writes the instance is read back: a
-    confirmed wrong region fails the create before a single build is wasted; an
-    unreadable (null) region stays unknown here and is re-checked after the deploy
-    goes live (tgw_refresh_platform self-heal)."""
+    The region is sent as its own serviceInstanceUpdate (region + multiRegionConfig
+    together — see railway_set_region for why both are required): bundling it with
+    the source attach made Railway silently drop it, and writing `region` alone
+    stored the setting without ever moving the service out of the default region
+    (the reported "chose Amsterdam, got US West"). After the write the instance is
+    read back: a confirmed wrong region fails the create before a single build is
+    wasted; an unreadable (null) region stays unknown here and is re-checked after
+    the deploy goes live (tgw_refresh_platform self-heal via the edge's
+    upstream-zone header)."""
     try:
         await railway_gql(
             token,
@@ -3221,10 +3288,12 @@ async def render_usage_bytes(token: str, service_id: str, since_ts: int) -> int:
 
 async def tgw_refresh_platform(row, force: bool = False):
     """Pull live platform facts into a deployed row: the traffic counter and — for
-    Railway — the instance's REAL region, which self-heals rows whose stored region
-    never actually applied on the platform (reported as "chose Amsterdam, got US
-    West"). Best effort: any failure leaves the row as it was. The list view calls
-    this throttled; the row's sync button forces it."""
+    Railway — the deployment's REAL running region, which self-heals rows whose
+    stored region never actually applied on the platform (reported as "chose
+    Amsterdam, got US West"). The real region comes from the edge's
+    x-railway-upstream-zone header when the origin host is known, falling back to
+    the instance read. Best effort: any failure leaves the row as it was. The list
+    view calls this throttled; the row's sync button forces it."""
     if row["platform"] not in ("render", "railway") or not row["service_id"]:
         return row
     if row["deploy_state"] not in (TGW_STATE_LIVE, "suspended"):
@@ -3246,12 +3315,15 @@ async def tgw_refresh_platform(row, force: bool = False):
             used = await railway_usage_bytes(token, coords.get("projectId", ""),
                                              row["service_id"], since)
             try:
-                real = ((await railway_read_instance(token, row["service_id"],
-                                                     coords.get("environmentId", "")))
-                        .get("region") or "").strip()
+                # The REAL running region — the edge's upstream-zone header first
+                # (the stored `region` field alone has already lied once), then the
+                # instance read. Self-heals rows placed in the wrong region.
+                real = await railway_real_region(token, row["service_id"],
+                                                 coords.get("environmentId", ""),
+                                                 row["server"] or "")
             except PlatformError:
                 real = None          # read failed — keep the stored region
-            if real is not None and real != (coords.get("region") or ""):
+            if real and real != (coords.get("region") or ""):
                 coords["region"] = real
                 coords_dirty = True
     except Exception:
@@ -4714,6 +4786,20 @@ async def patch_tgweb(pid: int, body: TgWebPatch, _=Depends(require_admin)):
                 coords["region"] = reg
                 coords_dirty = True
                 move_region = reg
+            elif plat0 == "railway" and row0["service_id"]:
+                # coords may already SAY this region while the service actually runs
+                # elsewhere — the stored `region` field used to lie (the reported
+                # "panel shows Amsterdam, IP test says US"). Re-selecting the same
+                # region must still move the service when the real zone disagrees.
+                try:
+                    real = await railway_real_region(
+                        get_setting("tgweb_railway_token") or "",
+                        row0["service_id"], coords.get("environmentId", ""),
+                        row0["server"] or "")
+                except PlatformError:
+                    real = ""
+                if real and real != reg:
+                    move_region = reg
         if coords_dirty:
             sets.append("coords=?"); vals.append(json.dumps(coords))
         if body.enabled is not None:
