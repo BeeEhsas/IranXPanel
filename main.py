@@ -7509,14 +7509,17 @@ html[lang="fa"] .ph h1{letter-spacing:-.1px;font-size:21px}
   font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;
 }
 .uc-top .nm{
-  font-size:13px;font-weight:600;line-height:1.4;min-width:0;flex:0 1 auto;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:44vw;
+  font-size:13px;font-weight:600;line-height:1.4;min-width:0;flex:1 1 auto;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 
 /* ردیف ابزار: چیپ ترنسپورت کنار سه دکمه */
 .uc-tools{display:flex;align-items:center;gap:8px;min-width:0}
-/* چیپ ترنسپورت در ردیف نام، ته ردیف */
-.uc-top .uc-tsp{flex:0 0 auto;margin-inline-start:auto;align-self:center}
+/* وضعیت · ترنسپورت · دستگاه متصل: پشت سر هم، ته ردیف نام */
+.uc-meta{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;
+  margin-inline-start:auto;min-width:0}
+.uc-meta .chip{white-space:nowrap}
+.uc-top .uc-tsp{flex:0 0 auto;align-self:center}
 .uc-tools{min-height:0}
 .uc-tools .chip{flex:0 0 auto}
 .uc-act{display:flex;gap:6px;align-items:center;flex:0 0 auto}
@@ -7557,7 +7560,7 @@ html[lang="fa"] .ph h1{letter-spacing:-.1px;font-size:21px}
 html[lang="fa"] .uc-foot .dt{font-family:'Vazirmatn','Vazir',Tahoma,sans-serif}
 
 @media(max-width:560px){
-  .uc-top .nm{max-width:40vw}
+  .uc-meta{gap:5px}
   .uc-foot{gap:3px 10px;font-size:10.5px}
   .uc-foot .dt{font-size:10.5px}
 }
@@ -9044,8 +9047,11 @@ function renderUsers(){
    +'<div class="uc-top">'
      +'<span class="av">'+esc((u.name||'?').charAt(0).toUpperCase())+'</span>'
      +'<span class="nm">'+esc(u.name)+'</span>'
-     +badge+live
-     +'<span class="chip teal uc-tsp">'+trTxt(u.transport)+'</span>'
+     +'<span class="uc-meta">'
+       +badge
+       +'<span class="chip teal uc-tsp">'+trTxt(u.transport)+'</span>'
+       +live
+     +'</span>'
    +'</div>'
 
    +'<div class="uc-tools">'
