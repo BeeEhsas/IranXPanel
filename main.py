@@ -67,7 +67,11 @@ DOMAIN         = os.getenv("DOMAIN", "")
 # Cloudflare Worker) can sit in front. The panel still runs on DOMAIN, but every config
 # and subscription link it hands out points at RELAY_DOMAIN instead.
 RELAY_DOMAIN   = os.getenv("RELAY_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
-DB_PATH        = os.getenv("DB_PATH", "/tmp/panel.db")
+# On Railway the deployer mounts a persistent volume at /data; prefer it automatically
+# so the database survives redeploys even without an explicit DB_PATH (Railway wipes
+# everything outside a volume on every deploy). /tmp stays the default on hosts that
+# have no volume.
+DB_PATH        = os.getenv("DB_PATH", "/data/panel.db" if os.path.isdir("/data") else "/tmp/panel.db")
 WS_PATH        = os.getenv("WS_PATH", "ws").strip("/")
 XHTTP_PATH     = os.getenv("XHTTP_PATH", "xh").strip("/")
 PANEL_TITLE    = os.getenv("PANEL_TITLE", "IranX Panel")

@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # IranXPanel WEB-proxy entrypoint: generate the tproxy-server config from env vars,
-# detect NAT for the MTProxy middle-end, start MTProxy on loopback, then hand PID 1 to
-# the official relay. See Dockerfile for the env contract.
+# detect NAT for the MTProxy middle-end, start MTProxy on loopback, put a tiny TCP edge
+# (socat) on $PORT, then hand PID 1 to the official relay. See Dockerfile for the env
+# contract.
+#
+# Why the socat edge: upstream tproxy-server VALIDATES that its "listen" address is a
+# numeric LOOPBACK address (internal/config/config.go — "must use a numeric loopback
+# address"). The reference layout is "edge -> 127.0.0.1:8080 tproxy-server", where Caddy
+# is the only thing on an external interface. Render/Railway terminate TLS at their
+# platform edge and forward plain HTTP/WebSocket to $PORT, so socat plays Caddy's L4
+# role inside the container: 0.0.0.0:$PORT -> 127.0.0.1:$RELAY_PORT. Pointing the
+# config's "listen" at 0.0.0.0 instead makes the relay exit on startup and the deploy
+# die at the healthcheck stage ("Service offline").
 set -euo pipefail
 
 die() { echo "entrypoint: $*" >&2; exit 1; }
@@ -10,7 +20,11 @@ SECRET="${TGP_SECRET:-}"
 HOST_PUB="${TGP_PUBLIC_HOSTNAME:-}"
 CARRIER="${TGP_CARRIER:-websocket}"
 PORT="${PORT:-8080}"
+# The relay's own loopback listener. 8081 is taken by admin_listen, 2398 by MTProxy.
+RELAY_PORT="${TGP_RELAY_PORT:-8082}"
 PAUSED="${TGP_PAUSED:-}"
+
+[[ "$PORT" != "$RELAY_PORT" ]] || die "PORT and TGP_RELAY_PORT must differ"
 
 [[ "$SECRET" =~ ^[0-9a-f]{32}$ ]] || die "TGP_SECRET must be 32 lowercase hex chars"
 # The client derives the bridge capability from the hostname it stores, so this value
@@ -78,7 +92,7 @@ elif [[ -z "$PUB_IP" ]]; then
 fi
 
 # ── start the MTProxy backend on loopback 2398 ──
-echo "entrypoint: starting MTProxy on 127.0.0.1:2398 (carrier: $CARRIER, listen: 0.0.0.0:$PORT)"
+echo "entrypoint: starting MTProxy on 127.0.0.1:2398 (carrier: $CARRIER, relay: 127.0.0.1:$RELAY_PORT, edge: 0.0.0.0:$PORT)"
 /opt/mtproxy/mtproto-proxy \
   -u mtproxy -p 8888 -H 2398 \
   -S "$SECRET" \
@@ -102,7 +116,7 @@ cat > "$RUN/config.json" <<EOF
 {
   "public_hostname": "$HOST_PUB",
   "base_path": "",
-  "listen": "0.0.0.0:$PORT",
+  "listen": "127.0.0.1:$RELAY_PORT",
   "admin_listen": "127.0.0.1:8081",
   "public_dir": "/srv/tproxy-site",
   "static_routes": "exact",
@@ -123,6 +137,15 @@ cat > "$RUN/profiles.json" <<EOF
 }
 EOF
 chmod 0600 "$RUN/config.json" "$RUN/profiles.json"
+
+# ── the public edge: socat owns 0.0.0.0:$PORT and pipes raw TCP to the relay's
+#    loopback listener. L4 only — the platform already terminated TLS, and WebSocket
+#    upgrades are plain bytes as far as socat is concerned. ──
+socat "TCP-LISTEN:${PORT},fork,reuseaddr" "TCP:127.0.0.1:${RELAY_PORT}" &
+SOCAT_PID=$!
+sleep 0.3
+kill -0 "$SOCAT_PID" 2>/dev/null || die "socat edge could not bind 0.0.0.0:$PORT"
+echo "entrypoint: edge forwarder 0.0.0.0:$PORT -> 127.0.0.1:$RELAY_PORT (socat pid $SOCAT_PID)"
 
 echo "entrypoint: handing over to tproxy-server (public_hostname=$HOST_PUB)"
 exec /usr/local/bin/tproxy-server -config "$RUN/config.json"

@@ -8,9 +8,15 @@
 #   * a small neutral static site at /srv/tproxy-site that unauthenticated visitors see
 #     (the active-probing cover required by the WEB-proxy design).
 #
-# The platform (Render / Railway) terminates TLS and forwards plain HTTP/WebSocket to
-# $PORT, so the relay binds 0.0.0.0:$PORT — no Caddy inside, matching the official
-# reference layout "edge -> relay -> 127.0.0.1:2398 mtproxy".
+# Listening layout: upstream tproxy-server REQUIRES a loopback "listen" (it validates
+# the config and refuses 0.0.0.0 with "must use a numeric loopback address"). The
+# official reference layout puts Caddy on the external interface; here the platform
+# (Render / Railway) already terminates TLS and forwards plain HTTP/WebSocket to $PORT,
+# so a socat edge takes Caddy's L4 role inside the container:
+#
+#     platform edge :443 -> container 0.0.0.0:$PORT (socat)
+#                         -> 127.0.0.1:$RELAY_PORT tproxy-server
+#                         -> 127.0.0.1:2398 mtproto-proxy
 #
 # Environment the entrypoint reads:
 #   TGP_SECRET          required, 32 lowercase hex chars — the client-facing MTProxy secret
@@ -21,11 +27,13 @@
 #                       (default: websocket — one multiplexed WSS carrier)
 #   TGP_PAUSED          optional, "1" puts the container to idle sleep without a listener
 #                       (the panel's pause button; the hostname stays the same)
-#   PORT                relay listen port. Render injects it; Railway healthchecks it
+#   PORT                public edge port. Render injects it; Railway healthchecks it
 #                       (healthcheck probes $PORT), so the image pins a default of 8080 —
 #                       matching EXPOSE below — and the panel also sets it as a service
 #                       variable. Without it Railway's healthcheck has no port to probe
 #                       and the deploy dies as "failed during the network process".
+#   TGP_RELAY_PORT      optional, internal loopback port of tproxy-server (default 8082).
+#                       Must differ from PORT; clients never see it.
 
 ARG GO_IMAGE=golang:1.23-bookworm
 ARG BUILD_IMAGE=debian:bookworm
@@ -65,7 +73,7 @@ RUN apt-get update \
 # ── stage 3: runtime ────────────────────────────────────────────────────────────
 FROM ${RUN_IMAGE}
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl iproute2 libssl3 zlib1g \
+ && apt-get install -y --no-install-recommends ca-certificates curl iproute2 libssl3 zlib1g socat \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --home /nonexistent --shell /usr/sbin/nologin mtproxy
 COPY --from=relay   /out/tproxy-server            /usr/local/bin/tproxy-server
