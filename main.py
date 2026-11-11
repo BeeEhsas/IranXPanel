@@ -2811,7 +2811,9 @@ def _http_json(method: str, url: str, token: str = "", body=None, timeout: int =
             or (payload.get("errors", [{}])[0].get("message")
                 if isinstance(payload, dict) and payload.get("errors") else None) \
             or {401: "token rejected", 402: "plan does not allow this operation",
-                403: "token not allowed for this action",
+                403: "platform refused the call (HTTP 403, no error body) — usually a "
+                     "plan/domain limit (Railway Trial: only 2 service domains per "
+                     "workspace) or an account block, not a bad token",
                 404: "service not found", 429: "rate limited"}.get(e.code, "HTTP %s" % e.code)
         # A non-JSON body on a mapped code means an edge/WAF block answered, not the
         # API ("error code: 1010" = Cloudflare signature ban) — surface what it said,
@@ -3058,16 +3060,34 @@ async def railway_upsert_vars(token: str, project_id: str, environment_id: str,
                    "variables": {k: str(v) for k, v in env.items()}}})
 
 
-async def railway_create_domain(token: str, environment_id: str, service_id: str) -> str:
-    """Generate the service's *.up.railway.app domain."""
-    d = await railway_gql(
-        token,
-        """mutation serviceDomainCreate($input: ServiceDomainCreateInput!) {
-             serviceDomainCreate(input: $input) { domain } }""",
-        {"input": {"environmentId": environment_id, "serviceId": service_id}})
-    dom = ((d.get("serviceDomainCreate") or {}).get("domain")) or ""
+async def railway_create_domain(token: str, environment_id: str, service_id: str,
+                                target_port: int = 0) -> str:
+    """Generate the service's *.up.railway.app domain.
+
+    target_port pins the domain's route. Railway's healthcheck probes the service's
+    PORT variable (or the domain's target port); a domain created BEFORE the first
+    deploy exists has nothing to auto-detect from, so without an explicit port the
+    deployment can sit in the healthcheck phase until the 5-minute timeout kills it
+    ("Deployment failed during the network process") even though the container is
+    perfectly healthy. 8080 is what the tproxy image EXPOSEs and listens on."""
+    q = """mutation serviceDomainCreate($input: ServiceDomainCreateInput!) {
+             serviceDomainCreate(input: $input) { domain } }"""
+    base = {"environmentId": environment_id, "serviceId": service_id}
+    shapes = ([dict(base, targetPort=int(target_port)), base] if target_port else [base])
+    d, err = None, ""
+    for inp in shapes:
+        try:
+            d = await railway_gql(token, q, {"input": inp})
+            break
+        except PlatformError as e:
+            err = str(e)
+    dom = ((d or {}).get("serviceDomainCreate") or {}).get("domain") or ""
     if not dom:
-        raise PlatformError("Railway did not return a public domain")
+        raise PlatformError(
+            "Railway did not return a public domain (%s). Note: the Trial plan allows "
+            "only 2 service domains per workspace — the panel project plus proxy "
+            "projects use them up. Delete a proxy row in the panel (this removes its "
+            "Railway project) and try again, or upgrade to Hobby." % (err or "empty response"))
     return dom.lower()
 
 
@@ -3141,6 +3161,14 @@ async def railway_delete_service(token: str, service_id: str):
                                  "{ serviceDelete(id: $id) }", {"id": service_id})
     except PlatformError:
         pass  # best effort — the row is deleted regardless
+
+
+async def railway_delete_project(token: str, project_id: str):
+    try:
+        await railway_gql(token, "mutation projectDelete($id: String!) "
+                                 "{ projectDelete(id: $id) }", {"id": project_id})
+    except PlatformError:
+        pass  # best effort
 
 
 # ── orchestration: create / rotate / pause / delete / sync ────────────────────
@@ -3246,6 +3274,7 @@ async def tgweb_deploy(pid: int):
     carrier = coords.get("carrier", "websocket")
     region = coords.get("region") or tgw_default_region(platform)
     repo, branch = tgw_repo_url(), tgw_branch()
+    proj, token = None, ""   # filled per-platform below; the cleanup path needs them
     try:
         if TGW_PREFLIGHT and (await tgw_repo_state(repo, branch)) == "missing":
             raise PlatformError(
@@ -3295,10 +3324,16 @@ async def tgweb_deploy(pid: int):
             sid = await railway_create_service(token, proj["projectId"], name)
             await railway_configure_instance(token, sid, proj["environmentId"], slug,
                                              region)
-            host = await railway_create_domain(token, proj["environmentId"], sid)
+            host = await railway_create_domain(token, proj["environmentId"], sid,
+                                               target_port=8080)
+            # PORT is load-bearing: Railway healthchecks the PORT variable, and unlike
+            # Render it does not inject one for us. Without it the deploy sits in the
+            # healthcheck phase for 5 minutes and dies as "failed during the network
+            # process" even though the relay is listening and answering "/".
             await railway_upsert_vars(token, proj["projectId"], proj["environmentId"], sid,
                                       {"TGP_SECRET": row["secret"], "TGP_CARRIER": carrier,
-                                       "TGP_PUBLIC_HOSTNAME": host, "TGP_PAUSED": "0"})
+                                       "TGP_PUBLIC_HOSTNAME": host, "TGP_PAUSED": "0",
+                                       "PORT": "8080"})
             coords.update({"projectId": proj["projectId"],
                            "environmentId": proj["environmentId"]})
             with db() as c:
@@ -3316,12 +3351,14 @@ async def tgweb_deploy(pid: int):
         else:
             raise PlatformError("unknown platform")
     except PlatformError as e:
+        await tgw_cleanup_orphan(platform, token, proj, pid)
         with db() as c:
             c.execute("UPDATE tg_web_proxies SET deploy_state=?, error=? WHERE id=?",
                       (TGW_STATE_FAILED, str(e)[:300], pid))
         TGW_DEPLOY_TASKS.pop(pid, None)
         return
     except Exception as e:  # never leave a row stuck in building
+        await tgw_cleanup_orphan(platform, token, proj, pid)
         with db() as c:
             c.execute("UPDATE tg_web_proxies SET deploy_state=?, error=? WHERE id=?",
                       (TGW_STATE_FAILED, ("internal: %s" % e)[:300], pid))
@@ -3336,6 +3373,22 @@ def tgw_spawn(pid: int):
     if old and not old.done():
         return
     TGW_DEPLOY_TASKS[pid] = asyncio.create_task(tgweb_deploy(pid))
+
+
+async def tgw_cleanup_orphan(platform: str, token: str, proj: dict | None, pid: int):
+    """A Railway create that died before its service was persisted still leaves a full
+    project behind — Trial accounts only get 5 projects and 2 service domains, so an
+    orphaned attempt per failure adds up fast. Remove it, best effort."""
+    if platform != "railway" or not proj or not token:
+        return
+    try:
+        with db() as c:
+            row = c.execute("SELECT service_id FROM tg_web_proxies WHERE id=?",
+                            (pid,)).fetchone()
+        if row and not (row["service_id"] or "").strip():
+            await railway_delete_project(token, proj.get("projectId", ""))
+    except Exception:
+        pass
 
 
 def tgw_spawn_watch(pid: int):
@@ -3480,9 +3533,11 @@ async def tgweb_platform_rotate(row) -> str:
         await render_trigger_deploy(token, row["service_id"])
     elif platform == "railway":
         token = get_setting("tgweb_railway_token") or ""
+        # PORT rides along on every redeploy so proxies created before the PORT fix
+        # are healed here too (a rotate is the user's one-click repair for them).
         await railway_upsert_vars(token, coords.get("projectId", ""),
                                   coords.get("environmentId", ""), row["service_id"],
-                                  {"TGP_SECRET": new})
+                                  {"TGP_SECRET": new, "PORT": "8080"})
         await railway_trigger_deploy(token, row["service_id"],
                                      coords.get("environmentId", ""))
     else:
@@ -3535,7 +3590,8 @@ async def tgweb_platform_pause(row, paused: bool):
         token = get_setting("tgweb_railway_token") or ""
         await railway_upsert_vars(token, coords.get("projectId", ""),
                                   coords.get("environmentId", ""), row["service_id"],
-                                  {"TGP_PAUSED": "1" if paused else "0"})
+                                  {"TGP_PAUSED": "1" if paused else "0",
+                                   "PORT": "8080"})
         await railway_trigger_deploy(token, row["service_id"],
                                      coords.get("environmentId", ""))
         with db() as c:

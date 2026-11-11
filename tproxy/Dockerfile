@@ -21,7 +21,11 @@
 #                       (default: websocket — one multiplexed WSS carrier)
 #   TGP_PAUSED          optional, "1" puts the container to idle sleep without a listener
 #                       (the panel's pause button; the hostname stays the same)
-#   PORT                optional, relay listen port (Render injects it; default 8080)
+#   PORT                relay listen port. Render injects it; Railway healthchecks it
+#                       (healthcheck probes $PORT), so the image pins a default of 8080 —
+#                       matching EXPOSE below — and the panel also sets it as a service
+#                       variable. Without it Railway's healthcheck has no port to probe
+#                       and the deploy dies as "failed during the network process".
 
 ARG GO_IMAGE=golang:1.23-bookworm
 ARG BUILD_IMAGE=debian:bookworm
@@ -75,5 +79,6 @@ RUN chmod 0755 /entrypoint.sh /usr/local/bin/tproxy-server /opt/mtproxy/mtproto-
  && curl -fsSL https://core.telegram.org/getProxySecret  -o /opt/mtproxy/proxy-secret \
  && curl -fsSL https://core.telegram.org/getProxyConfig -o /opt/mtproxy/proxy-multi.conf \
  && chmod 0644 /opt/mtproxy/proxy-secret /opt/mtproxy/proxy-multi.conf
+ENV PORT=8080
 EXPOSE 8080
 ENTRYPOINT ["/entrypoint.sh"]
