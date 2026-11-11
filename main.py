@@ -195,7 +195,9 @@ CREATE TABLE IF NOT EXISTS tg_web_proxies (
     service_id   TEXT    DEFAULT '',
     coords       TEXT    DEFAULT '',
     deploy_state TEXT    DEFAULT '',
-    error        TEXT    DEFAULT ''
+    error        TEXT    DEFAULT '',
+    usage_since  INTEGER DEFAULT 0,
+    usage_checked INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS user_ips (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,7 +287,9 @@ def migrate():
                                  ("service_id", "TEXT DEFAULT ''"),
                                  ("coords", "TEXT DEFAULT ''"),
                                  ("deploy_state", "TEXT DEFAULT ''"),
-                                 ("error", "TEXT DEFAULT ''")],
+                                 ("error", "TEXT DEFAULT ''"),
+                                 ("usage_since", "INTEGER DEFAULT 0"),
+                                 ("usage_checked", "INTEGER DEFAULT 0")],
               "proxies": [("country", "TEXT DEFAULT ''"),
                           ("country_name", "TEXT DEFAULT ''"),
                           ("city", "TEXT DEFAULT ''"),
@@ -3003,26 +3007,59 @@ async def railway_create_service(token: str, project_id: str, name: str) -> str:
     return sid
 
 
+async def railway_read_instance(token: str, service_id: str,
+                                environment_id: str) -> dict:
+    """Read the service instance's settings back — region is what we verify."""
+    d = await railway_gql(
+        token,
+        """query serviceInstance($serviceId: String!, $environmentId: String!) {
+             serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
+               region rootDirectory } }""",
+        {"serviceId": service_id, "environmentId": environment_id})
+    return d.get("serviceInstance") or {}
+
+
+async def railway_set_region(token: str, service_id: str, environment_id: str,
+                             region: str):
+    """Move an existing instance to another region — Railway redeploys in place and
+    keeps the domain, so every issued link stays valid. The write is verified by
+    reading the instance back: Railway has accepted region payloads while still
+    landing the service in its default region, which is exactly the silent failure
+    this guard turns into a real error."""
+    q = """mutation serviceInstanceUpdate($serviceId: String!, $environmentId: String!,
+             $input: ServiceInstanceUpdateInput!) {
+             serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId,
+               input: $input) }"""
+    await railway_gql(token, q,
+                      {"serviceId": service_id, "environmentId": environment_id,
+                       "input": {"region": region}})
+    for attempt in (1, 2):
+        real = ((await railway_read_instance(token, service_id, environment_id))
+                .get("region") or "").strip()
+        if not real or real == region:
+            return                      # applied — or nothing readable yet (pre-deploy)
+        await railway_gql(token, q,
+                          {"serviceId": service_id, "environmentId": environment_id,
+                           "input": {"region": region}})
+    real = ((await railway_read_instance(token, service_id, environment_id))
+            .get("region") or "").strip()
+    if real and real != region:
+        raise PlatformError("Railway kept the service in region %s (requested %s) — "
+                            "this plan/account may not allow that region"
+                            % (real, region))
+
+
 async def railway_configure_instance(token: str, service_id: str, environment_id: str,
                                      repo: str, region: str = ""):
-    """Attach the repo source (rootDirectory = the tproxy folder) + healthcheck +
-    the region to build in (Railway redeploys on region changes, keeping the domain).
-    `repo` must already be the \"owner/repo\" slug Railway expects."""
-    inp = {"source": {"repo": repo}, "rootDirectory": TGWEB_ROOT, "healthcheckPath": "/"}
-    if region:
-        inp["region"] = region
-    try:
-        await railway_gql(
-            token,
-            """mutation serviceInstanceUpdate($serviceId: String!, $environmentId: String!,
-                 $input: ServiceInstanceUpdateInput!) {
-                 serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId,
-                   input: $input) }""",
-            {"serviceId": service_id, "environmentId": environment_id, "input": inp})
-        return
-    except PlatformError:
-        pass
-    # Older schema: the root directory is part of the source payload or set separately.
+    """Attach the repo source (rootDirectory = the tproxy folder) + healthcheck + the
+    region to build in. `repo` must already be the \"owner/repo\" slug Railway expects.
+
+    The region is sent as its own serviceInstanceUpdate — bundling it with the source
+    attach made Railway silently drop it and build in the default region (the reported
+    "chose Amsterdam, got US West"). After both writes the instance is read back: a
+    confirmed wrong region fails the create before a single build is wasted; an
+    unreadable (null) region stays unknown here and is re-checked after the deploy
+    goes live (tgw_refresh_platform self-heal)."""
     try:
         await railway_gql(
             token,
@@ -3031,26 +3068,28 @@ async def railway_configure_instance(token: str, service_id: str, environment_id
                  serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId,
                    input: $input) }""",
             {"serviceId": service_id, "environmentId": environment_id,
-             "input": dict({"source": {"repo": repo, "rootDirectory": TGWEB_ROOT},
-                            "healthcheckPath": "/"},
-                           **({"region": region} if region else {}))})
-    except PlatformError as e:
-        raise PlatformError("repo attach failed: %s (Railway needs GitHub access to the "
-                            "repo — Account Settings → Integrations)" % e)
-
-
-async def railway_set_region(token: str, service_id: str, environment_id: str,
-                             region: str):
-    """Move an existing instance to another region — Railway redeploys in place and
-    keeps the domain, so every issued link stays valid."""
-    await railway_gql(
-        token,
-        """mutation serviceInstanceUpdate($serviceId: String!, $environmentId: String!,
-             $input: ServiceInstanceUpdateInput!) {
-             serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId,
-               input: $input) }""",
-        {"serviceId": service_id, "environmentId": environment_id,
-         "input": {"region": region}})
+             "input": {"source": {"repo": repo}, "rootDirectory": TGWEB_ROOT,
+                       "healthcheckPath": "/"}})
+    except PlatformError:
+        # Older schema: the root directory is part of the source payload.
+        try:
+            await railway_gql(
+                token,
+                """mutation serviceInstanceUpdate($serviceId: String!, $environmentId: String!,
+                     $input: ServiceInstanceUpdateInput!) {
+                     serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId,
+                       input: $input) }""",
+                {"serviceId": service_id, "environmentId": environment_id,
+                 "input": {"source": {"repo": repo, "rootDirectory": TGWEB_ROOT},
+                           "healthcheckPath": "/"}})
+        except PlatformError as e2:
+            raise PlatformError("repo attach failed: %s (Railway needs GitHub access to "
+                                "the repo — Account Settings → Integrations)" % e2)
+    if region:
+        try:
+            await railway_set_region(token, service_id, environment_id, region)
+        except PlatformError as e:
+            raise PlatformError("region not applied: %s" % e)
 
 
 async def railway_upsert_vars(token: str, project_id: str, environment_id: str,
@@ -3122,6 +3161,114 @@ async def railway_trigger_deploy(token: str, service_id: str, environment_id: st
             last = str(e)
     raise PlatformError("deploy trigger failed: %s" % (last or "all known trigger "
                                                        "mutations rejected"))
+
+
+# ── platform traffic metrics (used_bytes for hosted proxies) ──────────────────
+# The panel itself sees none of a proxy's traffic, so usage is read from the host:
+# Railway aggregates per-service network GB in its `usage` query, Render exposes an
+# hourly bandwidth-sources endpoint. Both are summed over the row's accounting
+# window (creation, or the last manual reset) —Railway reports GB, Render bytes.
+
+TGW_USAGE_MIN = 60              # s between metric refreshes per row (list view)
+RAILWAY_GB = 10 ** 9            # Railway's *_GB measurements are decimal GB
+RENDER_BW_EPOCH = 1741478400    # Render serves bandwidth-sources from 2025-03-09
+
+
+def _iso(ts: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts)))
+
+
+async def railway_usage_bytes(token: str, project_id: str, service_id: str,
+                              since_ts: int) -> int:
+    """NETWORK_RX + NETWORK_TX for one service since `since_ts`, in bytes."""
+    if not project_id:
+        return 0
+    start = max(0, int(since_ts or 0))
+    if start >= now():
+        return 0
+    d = await railway_gql(
+        token,
+        """query usage($projectId: String!, $startDate: DateTime!, $endDate: DateTime!) {
+             usage(projectId: $projectId, startDate: $startDate, endDate: $endDate,
+                   measurements: [NETWORK_RX_GB, NETWORK_TX_GB],
+                   groupBy: [SERVICE_ID]) {
+               measurement tags { serviceId } value } }""",
+        {"projectId": project_id, "startDate": _iso(start), "endDate": _iso(now())})
+    total = 0.0
+    for u in d.get("usage") or []:
+        if ((u.get("tags") or {}).get("serviceId") or "") == service_id:
+            total += float(u.get("value") or 0)
+    return int(round(total * RAILWAY_GB))
+
+
+async def render_usage_bytes(token: str, service_id: str, since_ts: int) -> int:
+    """Sum Render's hourly bandwidth-sources (trafficSource=total) since `since_ts`."""
+    end = now()
+    start = max(int(since_ts or 0), RENDER_BW_EPOCH)
+    if start >= end:
+        return 0
+    d = await _call(_http_json, "GET",
+                    RENDER_API + "/metrics/bandwidth-sources?resource=%s&startTime=%d"
+                    "&endTime=%d" % (service_id, start, end), token)
+    total = 0.0
+    for row in (d or {}).get("data") or []:
+        if ((row.get("labels") or {}).get("trafficSource") or "") != "total":
+            continue
+        for pt in row.get("values") or []:
+            total += float(pt.get("value") or 0)
+    return int(round(total))
+
+
+async def tgw_refresh_platform(row, force: bool = False):
+    """Pull live platform facts into a deployed row: the traffic counter and — for
+    Railway — the instance's REAL region, which self-heals rows whose stored region
+    never actually applied on the platform (reported as "chose Amsterdam, got US
+    West"). Best effort: any failure leaves the row as it was. The list view calls
+    this throttled; the row's sync button forces it."""
+    if row["platform"] not in ("render", "railway") or not row["service_id"]:
+        return row
+    if row["deploy_state"] not in (TGW_STATE_LIVE, "suspended"):
+        return row
+    if not force and now() - (row["usage_checked"] or 0) < TGW_USAGE_MIN:
+        return row
+    used, coords_dirty = None, False
+    try:
+        coords = json.loads(row["coords"] or "{}")
+    except Exception:
+        coords = {}
+    try:
+        since = row["usage_since"] or row["created_at"]
+        if row["platform"] == "render":
+            used = await render_usage_bytes(get_setting("tgweb_render_token") or "",
+                                            row["service_id"], since)
+        else:
+            token = get_setting("tgweb_railway_token") or ""
+            used = await railway_usage_bytes(token, coords.get("projectId", ""),
+                                             row["service_id"], since)
+            try:
+                real = ((await railway_read_instance(token, row["service_id"],
+                                                     coords.get("environmentId", "")))
+                        .get("region") or "").strip()
+            except PlatformError:
+                real = None          # read failed — keep the stored region
+            if real is not None and real != (coords.get("region") or ""):
+                coords["region"] = real
+                coords_dirty = True
+    except Exception:
+        used = None                  # metrics are best-effort; never break the list
+    with db() as c:
+        sets, vals = ["usage_checked=?"], [now()]
+        if used is not None:
+            sets.append("used_bytes=?")
+            vals.append(int(used))
+        if coords_dirty:
+            sets.append("coords=?")
+            vals.append(json.dumps(coords))
+        c.execute("UPDATE tg_web_proxies SET %s WHERE id=?" % ",".join(sets),
+                  vals + [row["id"]])
+    with db() as c:
+        return c.execute("SELECT * FROM tg_web_proxies WHERE id=?",
+                         (row["id"],)).fetchone()
 
 
 TGW_RL_LIVE = ("SUCCESS", "COMPLETE")
@@ -3514,6 +3661,10 @@ async def tgweb_platform_sync(row) -> dict:
             error = prev_err            # never blur an already-recorded failure reason
         c.execute("UPDATE tg_web_proxies SET deploy_state=?, error=?, server=? WHERE id=?",
                   (state, error, server, pid))
+    with db() as c:
+        row = c.execute("SELECT * FROM tg_web_proxies WHERE id=?",
+                        (pid,)).fetchone()
+    row = await tgw_refresh_platform(row, force=True)   # real region + traffic usage
     with db() as c:
         return tgweb_out(c.execute("SELECT * FROM tg_web_proxies WHERE id=?",
                                    (pid,)).fetchone())
@@ -4395,7 +4546,13 @@ async def delete_proxy(pid: int, _=Depends(require_admin)):
 async def list_tgweb(_=Depends(require_admin)):
     with db() as c:
         rows = c.execute("SELECT * FROM tg_web_proxies ORDER BY id DESC").fetchall()
-    return [tgweb_out(r) for r in rows]
+    out = []
+    for r in rows:
+        if r["platform"] in ("render", "railway") and r["service_id"]:
+            # throttled best-effort refresh of the traffic counter + real region
+            r = await tgw_refresh_platform(r)
+        out.append(tgweb_out(r))
+    return out
 
 
 @app.get("/api/tgweb/regions")
@@ -4569,16 +4726,21 @@ async def patch_tgweb(pid: int, body: TgWebPatch, _=Depends(require_admin)):
                 raise HTTPException(409, "this secret is already in use")
         row = c.execute("SELECT * FROM tg_web_proxies WHERE id=?", (pid,)).fetchone()
     if move_region and row["platform"] == "railway":
-        # Railway redeploys the instance in the new region — same domain, same links
+        # Railway redeploys the instance in the new region — same domain, same links.
+        # The move is verified server-side; if Railway refuses it, the stored coords
+        # are rolled back so the UI never claims a region the service is not in.
         try:
-            coords = json.loads(row["coords"] or "{}")
+            coords_before = json.loads(row0["coords"] or "{}")
         except Exception:
-            coords = {}
+            coords_before = {}
         token = get_setting("tgweb_railway_token") or ""
         try:
             await railway_set_region(token, row["service_id"],
                                      coords.get("environmentId", ""), move_region)
         except PlatformError as e:
+            with db() as c:
+                c.execute("UPDATE tg_web_proxies SET coords=? WHERE id=?",
+                          (json.dumps(coords_before), pid))
             raise HTTPException(502, "region change failed: %s" % e)
         with db() as c:
             c.execute("UPDATE tg_web_proxies SET deploy_state=? WHERE id=?",
@@ -4627,7 +4789,8 @@ async def rotate_tgweb(pid: int, _=Depends(require_admin)):
 @app.post("/api/tgweb/{pid}/reset-traffic")
 async def reset_tgweb_traffic(pid: int, _=Depends(require_admin)):
     with db() as c:
-        cur = c.execute("UPDATE tg_web_proxies SET used_bytes=0 WHERE id=?", (pid,))
+        cur = c.execute("UPDATE tg_web_proxies SET used_bytes=0, usage_since=? "
+                        "WHERE id=?", (now(), pid))
         if cur.rowcount == 0:
             raise HTTPException(404, "not found")
     return {"ok": True}
@@ -7033,7 +7196,8 @@ const I18N={
   tgwPlRender:'رندر',tgwPlRailway:'ریلوی',tgwPlExternal:'خارجی',
   tgwCarrier:'حامل ارتباط',
   tgwRegion:'ریجن میزبانی',
-  tgwRegionHint:'تغییر ریجن، سرویس را در ریجن جدید روی همان دامنه ری‌دپلوی می‌کند (چند دقیقه) و همهٔ لینک‌ها معتبر می‌مانند.',
+  tgwRegionHostDefault:'پیش‌فرض میزبان (بدون ریجن مشخص)',
+  tgwRegionHint:'تغییر ریجن، سرویس را در ریجن جدید روی همان دامنه ری‌دپلوی می‌کند (چند دقیقه) و همهٔ لینک‌ها معتبر می‌مانند. ریجن واقعی سرویس بعد از هر همگام‌سازی از خود میزبان خوانده می‌شود.',
   tgwRegionLock:'ریجن سرویس‌های رندر بعد از ساخت قابل تغییر نیست',
   tgwTokenMissing:'توکن API این پلتفرم ذخیره نشده — اول از «تنظیمات پلتفرم» اضافه‌اش کن',
   tgwSetBtn:'تنظیمات پلتفرم',
@@ -7213,7 +7377,8 @@ const I18N={
   tgwPlRender:'Render',tgwPlRailway:'Railway',tgwPlExternal:'External',
   tgwCarrier:'Carrier',
   tgwRegion:'Hosting region',
-  tgwRegionHint:'Changing the region redeploys the service in the new region on the same domain (a few minutes) — every issued link stays valid.',
+  tgwRegionHostDefault:'Host default (no region set)',
+  tgwRegionHint:'Changing the region redeploys the service in the new region on the same domain (a few minutes) — every issued link stays valid. The real region is read back from the host on every sync.',
   tgwRegionLock:"Render services can't move to another region after creation",
   tgwTokenMissing:'No API token stored for this platform — add it in Platform settings first',
   tgwSetBtn:'Platform settings',
@@ -8347,7 +8512,11 @@ async function tgEdit(id){
      <div class="soft mono text-xs" style="border-radius:10px;padding:9px 11px" dir="ltr">${esc(u.server||'…')}</div></label>`}
   ${plat==='railway'&&rgn.length
    ?`<label class="fld mt-2"><span class="text-xs dim">${T('tgwRegion')}</span>
-     <select id="teRgn" class="inp" dir="ltr">${rgn.map(r=>`<option value="${esc(r.id)}"${u.region&&u.region.id===r.id?' selected':''}>${esc(rgName(r))}</option>`).join('')}</select>
+     <select id="teRgn" class="inp" dir="ltr">${(()=>{const curR=(u.region||{}).id||'';
+      const ops=rgn.map(r=>`<option value="${esc(r.id)}"${curR===r.id?' selected':''}>${esc(rgName(r))}</option>`);
+      if(curR&&!rgn.some(r=>r.id===curR))ops.unshift(`<option value="${esc(curR)}" selected>${esc(rgName(u.region))}</option>`);
+      if(!curR)ops.unshift(`<option value="" selected>${T('tgwRegionHostDefault')}</option>`);
+      return ops.join('');})()}</select>
      <span class="text-xs dim">${T('tgwRegionHint')}</span></label>`
    :(plat==='render'&&u.region
     ?`<label class="fld mt-2"><span class="text-xs dim">${T('tgwRegion')}</span>
@@ -8370,7 +8539,7 @@ async function saveTgweb(id){
   quota_gb:parseFloat(teQ.value||0),expire_days:parseInt(teD.value||0)};
  if((u.platform||'external')==='external')body.server=teSrv.value.trim();
  const teRgn=document.getElementById('teRgn');
- if(teRgn&&(u.region||{}).id!==teRgn.value)body.region=teRgn.value;
+ if(teRgn&&teRgn.value&&((u.region||{}).id||'')!==teRgn.value)body.region=teRgn.value;
  try{
   await api('/api/tgweb/'+id,{method:'PATCH',body:JSON.stringify(body)});
   closeModal();loadTgweb();
