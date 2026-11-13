@@ -9794,6 +9794,12 @@ html[lang="fa"] .uc-foot .dt{font-family:'Vazirmatn','Vazir',Tahoma,sans-serif}
   .uc-meta{gap:5px}
   .uc-foot{gap:3px 10px;font-size:10.5px}
   .uc-foot .dt{font-size:10.5px}
+  /* چیپ‌های وضعیت وقتی کنار نام جا نشوند، از ابتدای خط بعد شروع شوند
+     (margin:auto باعث می‌شد به لبهٔ مخالف بچسبند و ظاهر به‌هم بریزد) */
+  .uc-meta{margin-inline-start:0}
+  .uc-top .chip{font-size:10px;padding:3px 8px}
+  /* ردیف‌های پایین کارت: لیبل بلند فارسی بتواند بشکند، سرریز نکند */
+  .uc-foot .gf{white-space:normal;overflow-wrap:anywhere;line-height:1.6}
 }
 
 /* ── مودال / شیت تنظیمات کاربر ── */
@@ -10085,6 +10091,20 @@ label.chip{display:inline-flex;align-items:center;gap:7px;line-height:1.5}
 .uc-foot-1{margin-top:9px}
 .uc-foot-2{margin-top:5px;gap:14px}
 .uc-foot-2 .gf{flex:0 0 auto}
+
+/* ── v4.8: موبایل — نوار آمار ۲ ستونه ──
+   بعد از قاعدهٔ پایه و بلوک min-width:900px قرار می‌گیرد تا کسکید آن را خنثی نکند.
+   ۳ ستون در ~۳۶۰px هر سلول را ~۱۰۰px می‌کند: لیبل فارسی دوکلمه‌ای و اعداد له می‌شوند. */
+@media(max-width:640px){
+  .strip{grid-template-columns:1fr 1fr}
+  .strip .cell{border-inline-start:1px solid var(--line);
+    border-bottom:1px solid var(--line)}
+  .strip .cell:nth-child(2n+1){border-inline-start:0}
+  .strip .cell:nth-last-child(-n+2){border-bottom:0}
+  .strip .k{white-space:normal;line-height:1.45;font-size:10px}
+  .strip .v{font-size:17px}
+  .strip .d{font-size:10px}
+}
 """
 
 
