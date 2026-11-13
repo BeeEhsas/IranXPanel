@@ -630,6 +630,68 @@ def parse_ua(ua: str) -> tuple[str, str]:
     return client, platform
 
 
+# ── clients that actually identify themselves ──
+# A device limit is only meaningful when the panel can tell two devices apart. That needs
+# the app to send a User-Agent that names it (and, in most of these, the phone model too).
+# The six apps below are the ones that do; everything else either sends one fixed UA for
+# every install (v2rayNG, NekoBox …) or nothing at all (Clash, sing-box, browsers, curl),
+# which makes a per-device cap unenforceable. So when a user has a device limit, the
+# subscription link is only handed to these apps (see device_sub_gate()).
+DEVICE_AWARE_CLIENTS = (
+    (r"v2box", "V2Box"),
+    (r"v2raytun", "v2rayTun"),
+    (r"happ(?![a-z])", "Happ"),
+    (r"incy", "Incy"),
+    (r"shadowrocket", "Shadowrocket"),
+    (r"streisand", "Streisand"),
+)
+DEVICE_AWARE_RE = [(re.compile(rx, re.I), name) for rx, name in DEVICE_AWARE_CLIENTS]
+
+
+def device_aware_client(ua: str) -> str:
+    """Name of the client when its User-Agent identifies the device, else ''."""
+    u = ua or ""
+    if not u:
+        return ""
+    for rx, name in DEVICE_AWARE_RE:
+        if rx.search(u):
+            return name
+    return ""
+
+
+def hwid_of(headers) -> str:
+    """The device identifier the standards-compliant clients send on subscription
+    requests (XTLS subscription standard: x-hwid, x-device-os, x-ver-os,
+    x-device-model — v2rayTun since 2.3.5, Happ, v2rayA, Securify …)."""
+    for h in ("x-hwid", "x-device-id", "x-device-model"):
+        v = ""
+        try:
+            v = (headers.get(h) or "").strip()
+        except AttributeError:
+            v = ""
+        if v:
+            return v[:120]
+    return ""
+
+
+def device_gate_on() -> bool:
+    """Subscriptions of limited users are restricted to device-aware apps (default on)."""
+    return (get_setting("device_gate") or "1") == "1"
+
+
+def device_gate_traffic() -> bool:
+    """Also refuse proxied traffic from apps that cannot be identified (default off)."""
+    return (get_setting("device_gate_traffic") or "0") == "1"
+
+
+def needs_device_gate(row) -> bool:
+    """A user needs the gate only when a device limit is actually set on the account."""
+    try:
+        return int(row["device_limit"] or 0) > 0
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
 def device_key(ip: str, ua: str) -> str:
     """Opaque per-device identity: stable for one client+IP, distinct for others."""
     seed = f"{(ip or '').strip()}|{(ua or '').strip().lower()}"
@@ -1292,6 +1354,9 @@ def authorize(uid_str: str, ip: str, proto: str, ua: str = ""):
     dkey = device_key(ip, ua)
     if not device_allowed(row["id"], dkey, row["device_limit"]):
         return None, "device limit"
+    if (needs_device_gate(row) and device_gate_on() and device_gate_traffic()
+            and not device_aware_client(ua or "")):
+        return None, "device not identifiable by this app"
     touch_device(row["id"], dkey, ip, ua, proto)
     if not ip_allowed(row["id"], ip, row["ip_limit"]):
         return None, "ip limit"
@@ -2629,6 +2694,46 @@ def _singbox_config(configs, title: str) -> dict:
         "outbounds": outbounds,
         "route": {"rules": [], "final": final},
     }
+
+
+DEVICE_GATE_HEADER = "x-iranx-device-gate"
+DEVICE_GATE_APPS = tuple(name for _rx, name in DEVICE_AWARE_CLIENTS)
+
+
+def device_gate_response(row) -> PlainTextResponse:
+    """403 for a client that cannot identify its device on a limited account.
+
+    Deliberately a plain-text body: subscription clients show it verbatim, so the user
+    sees which apps they may use instead of a generic "download failed".
+    """
+    try:
+        n = int(row["device_limit"] or 0)
+    except (KeyError, IndexError, TypeError):
+        n = 0
+    lines = [
+        "IRANX · THIS LINK NEEDS A DEVICE-AWARE APP",
+        "",
+        ("This account allows %d device%s, so the panel only gives the "
+         "subscription to apps that report which device is asking."
+         % (n, "" if n == 1 else "s")),
+        "",
+        "Open this link inside one of these apps:",
+    ]
+    lines += ["  \u2022 " + a for a in DEVICE_GATE_APPS]
+    lines += [
+        "",
+        "Other apps (v2rayNG, Hiddify, Clash, sing-box, browsers \u2026) cannot be",
+        "identified, so they are refused \u2014 otherwise the device limit could be bypassed.",
+        "",
+        "Apps that send the device headers (x-hwid / x-device-model) are also accepted.",
+        "",
+        "Ask the panel admin to set the device limit to 0 if you need a different app.",
+    ]
+    return PlainTextResponse("\n".join(lines), status_code=403, headers={
+        DEVICE_GATE_HEADER: "1",
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+    })
 
 
 def _sub_headers(row, request: Request) -> dict:
@@ -4112,6 +4217,12 @@ class TgKeyIn(BaseModel):
     name: str = ""
 
 
+class DeviceGateIn(BaseModel):
+    """Subscription device gate: restrict limited accounts to device-aware apps."""
+    gate: Optional[bool] = None
+    traffic: Optional[bool] = None
+
+
 class CountryIn(BaseModel):
     country: str = ""
 
@@ -4724,6 +4835,23 @@ async def activate_proxy(pid: int, _=Depends(require_admin)):
           (px["kind"], px["host"], px["port"], res.get("country") or "?"))
     return {"ok": True, "active_id": pid, "country": res.get("country"),
             "flag": res.get("flag"), "exit_ip": res.get("exit_ip")}
+
+
+@app.get("/api/device-gate")
+async def get_device_gate(_=Depends(require_admin)):
+    return {"ok": True, "gate": device_gate_on(), "traffic": device_gate_traffic(),
+            "apps": list(DEVICE_GATE_APPS)}
+
+
+@app.post("/api/device-gate")
+async def set_device_gate(body: DeviceGateIn, _=Depends(require_admin)):
+    if body.gate is not None:
+        set_setting("device_gate", "1" if body.gate else "0")
+    if body.traffic is not None:
+        set_setting("device_gate_traffic", "1" if body.traffic else "0")
+    audit("device-gate", "", "gate=%s traffic=%s" % (device_gate_on(), device_gate_traffic()))
+    return {"ok": True, "gate": device_gate_on(), "traffic": device_gate_traffic(),
+            "apps": list(DEVICE_GATE_APPS)}
 
 
 @app.post("/api/proxies/mode")
@@ -6699,6 +6827,9 @@ html[lang="en"] .dcenter b{font-family:'JetBrains Mono',monospace;letter-spacing
   display:grid;place-items:center}
 #qrMain svg,#qrMain img{width:100%;height:100%;display:block}
 .hint{font-size:11px;color:var(--tx3);line-height:1.9;margin:0;text-align:center}
+/* راهنمای محدودیت دستگاه: وقتی صفر نیست، رنگ هشدار (یعنی گیت فعال است) */
+.dev-device-hint{text-align:start;line-height:1.85}
+.dev-device-hint.on{color:var(--amber)}
 
 /* ── تیتر بخش‌ها ── */
 h2{font-size:11px;color:var(--tx3);font-weight:700;margin:16px 0 8px;
@@ -9145,6 +9276,23 @@ async def subscription(token: str, request: Request):
 
     row = maybe_auto_reset(row)
 
+    # ── device gate ──
+    # Only for accounts that actually carry a device limit: those subscriptions are
+    # restricted to the apps that identify the device, so the cap stays accurate.
+    # Browsers (and ?page=1) still get the human-readable page below.
+    _ua = (request.headers.get("user-agent") or "")
+    _qp = request.query_params
+    _html_wanted = ("text/html" in (request.headers.get("accept") or "")
+                    and "mozilla" in _ua.lower())
+    _hwid = hwid_of(request.headers)
+    if (needs_device_gate(row) and device_gate_on()
+            and not _html_wanted
+            and _qp.get("page") not in ("1", "true")
+            and not device_aware_client(_ua)
+            and not _hwid):
+        audit("sub-gate", row["name"], "refused %s" % (_ua[:80] or "no user-agent"))
+        return device_gate_response(row)
+
     d = base_domain(request)
     lines = build_info_lines(row, d)
     if user_status(row)[0]:
@@ -10113,6 +10261,13 @@ const I18N={
  en:{dir:'ltr',
   unitBytes:'bytes',loadingLbl:'Loading…',noLive:'No live connections',
   phDash:'Live server, user and traffic overview',  phUsers:'Create, edit and monitor accounts',  phClean:'IPs that go into the subscription link',  phFilter:'Blocked and allowed domains',  phProxy:'Proxy pool and auto selection',  phLive:'Connections open right now',  phTgweb:'Build and manage Telegram web proxies',  phSettings:'Appearance, password, backup and server',  phLogs:'Latest panel events',  refreshLbl:'Refresh',  tabBasic:'Basics',  tabLimits:'Limits',  tabSecurity:'Security',  viewAll:'All',  r24:'24h',  cancel:'Cancel',  statHintUsers:'accounts',  statHintOnline:'online now',  statHintDev:'active devices',  statHintBytes:'since start',  statHintCip:'in subscription',  statHintLive:'live sessions',  zeroInfShort:'0 means unlimited.',  moreLbl:'Details',  noResult:'Nothing found',
+  devGateTitle:'Device limit',
+  devGateSub:'A device limit only works when the panel can tell devices apart, which needs an app that reports its identity. With a limit above 0, the subscription link is handed out only to the apps below; everything else is refused. Accounts with 0 (unlimited) are never restricted.',
+  devGateOn:'Only device-aware apps may add limited subscriptions',
+  devGateTraffic:'Also refuse proxy traffic from those apps',
+  devGateTrafficHint:'Off by default. Turning it on blocks apps that copy configs by hand instead of using the subscription link.',
+  devGateApps:'Accepted apps',
+  devLimitHint:'0 = any app. 1 or more = only V2Box, v2rayTun, Happ, Incy, Shadowrocket and Streisand can add this link, because only they report the device.',
   setupTitle:'Set a password',setupSub:'First run — choose your panel password',
   loginTitle:'Sign in',loginSub:'Enter your password',
   password:'Password',confirm:'Confirm password',enter:'Sign in',save:'Save & enter',
@@ -10642,6 +10797,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark"><hea
        <input id="nResetCustom" type="number" min="1" max="365" class="inp">
       </div>
       <p class="hint" data-t="zeroInfShort"></p>
+      <p class="hint dev-device-hint" id="nDevHint" data-t="devLimitHint" style="margin-top:8px"></p>
      </div>
 
      <!-- ── امنیت ── -->
@@ -10901,6 +11057,23 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark"><hea
     <p class="text-xs dim" style="margin:0" data-t="envNote"></p>
    </div>
 
+   <!-- ══ DEVICE LIMIT GATE ══ -->
+   <div class="card p-4 mt-4 space-y-3" id="devGateCard">
+    <b class="text-base" data-t="devGateTitle"></b>
+    <p class="text-xs dim" style="margin:0" data-t="devGateSub"></p>
+    <label class="flex items-start gap-2 text-sm" style="cursor:pointer">
+     <input type="checkbox" id="dgOn" style="margin-top:3px">
+     <span data-t="devGateOn"></span></label>
+    <label class="flex items-start gap-2 text-sm" style="cursor:pointer">
+     <input type="checkbox" id="dgTraffic" style="margin-top:3px">
+     <span data-t="devGateTraffic"></span></label>
+    <p class="text-xs dim" style="margin:0" data-t="devGateTrafficHint"></p>
+    <div>
+     <p class="text-xs dim" style="margin:0 0 6px" data-t="devGateApps"></p>
+     <div id="dgApps" class="flex flex-wrap gap-2 text-sm"></div>
+    </div>
+   </div>
+
    <!-- ══ BACKUP & RESTORE ══ -->
    <div class="card p-4 mt-4 space-y-3">
     <b class="text-base" data-t="backupTitle"></b>
@@ -11084,7 +11257,7 @@ function go(p){
  if(p==='clean')loadCips();
  if(p==='filter')loadFilter();
  if(p==='tgweb'){loadTgSettings();loadTgweb();loadTgRegions();tgPickPlatform(tgPlatform)}
- if(p==='settings'){renderServer();loadBackupInfo();loadTelegram()}
+ if(p==='settings'){renderServer();loadBackupInfo();loadTelegram();loadDeviceGate()}
  if(p==='live')loadLive(); else stopLive();
 }
 
@@ -11118,6 +11291,27 @@ async function api(p,o={}){
 }
 async function logout(){await fetch('/api/logout',{method:'POST'});location.href='/login'}
 
+/* ── device gate (settings card) ── */
+async function loadDeviceGate(){
+ const on=document.getElementById('dgOn'), tr=document.getElementById('dgTraffic'),
+       box=document.getElementById('dgApps');
+ if(!on)return;
+ try{
+  const r=await api('/api/device-gate');
+  on.checked=!!r.gate; tr.checked=!!r.traffic;
+  if(box) box.innerHTML=(r.apps||[]).map(a=>`<span class="chip teal">${esc(a)}</span>`).join('');
+ }catch(e){}
+}
+async function saveDeviceGate(){
+ const on=document.getElementById('dgOn'), tr=document.getElementById('dgTraffic');
+ try{ await api('/api/device-gate',{method:'POST',
+   body:JSON.stringify({gate:on.checked,traffic:tr.checked})}); }
+ catch(e){}
+}
+document.addEventListener('change',e=>{
+ if(e.target&&(e.target.id==='dgOn'||e.target.id==='dgTraffic')) saveDeviceGate();
+});
+
 function syncSelects(){
  [thSel,thSel2].forEach(e=>{if(e)e.value=THEME});
  ['langSel','langSel2'].forEach(i=>{const e=document.getElementById(i);if(e)e.value='en'});
@@ -11146,6 +11340,14 @@ function paintStatic(){
  ['resetOff','reset1','reset3','reset7','reset14','reset30','reset60','reset90','resetCustom']
   .forEach((k,i)=>{ if(nReset.options[i]) nReset.options[i].textContent=T(k); });
  nReset.addEventListener('change',()=>{ nResetWrap.classList.toggle('hidden',nReset.value!=='-1'); });
+ const paintDevHint=(inp,hint)=>{
+  if(!inp||!hint)return;
+  const on=parseInt(inp.value||'0',10)>0;
+  hint.classList.toggle('on',on);
+ };
+ const _nh=document.getElementById('nDevHint');
+ if(_nh) _nh.classList.toggle('on',parseInt(nDev.value||'0',10)>0);
+ nDev.addEventListener('input',()=>paintDevHint(nDev,document.getElementById('nDevHint')));
  nTr.options[0].textContent=T('trBoth');
  nTr.options[1].textContent=T('trWs');
  nTr.options[2].textContent=T('trXhttp');
@@ -11988,7 +12190,9 @@ function showEdit(id){
   <label class="fld hidden" id="eRCustomWrap"><span class="text-xs dim">${T('customDays')}</span>
    <input id="eRCustom" type="number" min="1" max="365" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('allowedDev')}</span>
-   <input id="eV" type="number" value="${u.device_limit}" class="inp"></label>
+   <input id="eV" type="number" value="${u.device_limit}" class="inp"
+     oninput="document.getElementById('eDevHint').classList.toggle('on',parseInt(this.value||'0',10)>0)"></label>
+  <p class="hint dev-device-hint${u.device_limit>0?' on':''}" id="eDevHint" style="margin:0 0 4px">${esc(T('devLimitHint'))}</p>
   <label class="fld"><span class="text-xs dim">${T('allowedIp')}</span>
    <input id="eIp" type="number" value="${u.ip_limit}" class="inp"></label>
   <label class="fld"><span class="text-xs dim">${T('transport')}</span>
