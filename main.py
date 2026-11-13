@@ -262,6 +262,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_ips_user  ON user_ips(user_id, last_seen);
 CREATE INDEX IF NOT EXISTS idx_dev_user  ON devices(user_id, last_seen);
 CREATE INDEX IF NOT EXISTS idx_traf_user ON traffic_log(user_id, ts);
+CREATE TABLE IF NOT EXISTS tg_platform_keys (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform   TEXT    NOT NULL,            -- 'render' | 'railway'
+    name       TEXT    DEFAULT '',          -- account/workspace label resolved from the token
+    owner_id   TEXT    DEFAULT '',
+    token      TEXT    NOT NULL,
+    active     INTEGER DEFAULT 0,           -- one per platform is the deploy default
+    created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tgpk_one_active
+    ON tg_platform_keys(platform) WHERE active = 1;
 """
 
 
@@ -2206,13 +2217,16 @@ ISO2_RE = re.compile(r"(?:^|[\s\-_\[\(#|])([A-Za-z]{2})(?:$|[\s\-_\]\)#|])")
 
 
 def flag_of(code: str) -> str:
-    """ISO alpha-2 -> country code shown as text.
+    """ISO alpha-2 -> flag emoji.
 
-    Emoji flags render as empty boxes on many Android builds and on Windows,
-    so the panel never emits them; callers get "DE" instead of a glyph.
+    Maps each A-Z letter to its Regional Indicator Symbol (U+1F1E6..U+1F1FF),
+    so "DE" becomes the German flag glyph. Falls back to the bare two-letter
+    code when the input is not a clean alpha-2 (e.g. unknown or empty).
     """
     c = re.sub(r"[^A-Za-z]", "", code or "")[:2].upper()
-    return c if len(c) == 2 else ""
+    if len(c) != 2:
+        return ""
+    return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in c)
 
 
 def guess_country(text: str) -> str:
@@ -3364,10 +3378,10 @@ async def tgw_refresh_platform(row, force: bool = False):
     try:
         since = row["usage_since"] or row["created_at"]
         if row["platform"] == "render":
-            used = await render_usage_bytes(get_setting("tgweb_render_token") or "",
+            used = await render_usage_bytes(tg_key_active("render"),
                                             row["service_id"], since)
         else:
-            token = get_setting("tgweb_railway_token") or ""
+            token = tg_key_active("railway")
             used = await railway_usage_bytes(token, coords.get("projectId", ""),
                                              row["service_id"], since)
             try:
@@ -3456,8 +3470,86 @@ TGW_DEPLOY_TASKS: dict[int, asyncio.Task] = {}
 
 
 def tgw_settings_tokens() -> tuple[str, str]:
-    return (get_setting("tgweb_render_token") or "",
-            get_setting("tgweb_railway_token") or "")
+    return (tg_key_active("render"), tg_key_active("railway"))
+
+
+# ── multi-account platform keys (tg_platform_keys) ────────────────────────────
+# One row per saved platform API key. Exactly one row per platform is "active";
+# the deploy code reads that active token. The legacy single-key settings
+# (tgweb_<platform>_token) are kept as a fallback for databases created before
+# this table existed, and are mirrored on every change so nothing that still
+# reads them breaks.
+
+def tg_key_rows(platform: str) -> list[dict]:
+    with db() as c:
+        rows = c.execute(
+            "SELECT id, platform, name, owner_id, token, active, created_at "
+            "FROM tg_platform_keys WHERE platform=? ORDER BY id", (platform,)).fetchall()
+    out = []
+    for r in rows:
+        tok = r["token"] or ""
+        out.append({"id": r["id"], "platform": r["platform"],
+                    "name": r["name"] or "",
+                    "owner_id": r["owner_id"] or "",
+                    "active": bool(r["active"]),
+                    "token_hint": ("••••" + tok[-4:]) if tok else "",
+                    "created_at": r["created_at"]})
+    return out
+
+
+async def tg_key_resolve(platform: str, token: str) -> tuple[str, str]:
+    """Return (account_name, owner_id) for a platform token, or raise PlatformError."""
+    token = (token or "").strip()
+    if platform == "render":
+        owners = await render_owners(token)
+        o = render_pick_owner(owners)
+        return (o.get("name") or o.get("id") or "Render account", o.get("id") or "")
+    owners = await railway_owners(token)
+    ws = next((o for o in owners if not o.get("is_team")), owners[0] if owners else {})
+    return (ws.get("name") or ws.get("id") or "Railway workspace", ws.get("id") or "")
+
+
+def tg_key_add(platform: str, name: str, owner_id: str, token: str) -> int:
+    with db() as c:
+        cur = c.execute("INSERT INTO tg_platform_keys(platform,name,owner_id,token,active,created_at) "
+                        "VALUES(?,?,?,?,?,?)", (platform, name, owner_id, token.strip(), 0, now()))
+        kid = cur.lastrowid
+        if c.execute("SELECT COUNT(*) n FROM tg_platform_keys WHERE platform=?",
+                     (platform,)).fetchone()["n"] == 1:
+            c.execute("UPDATE tg_platform_keys SET active=1 WHERE id=?", (kid,))
+    return kid
+
+
+def tg_key_set_active(platform: str, kid: int):
+    with db() as c:
+        c.execute("UPDATE tg_platform_keys SET active=0 WHERE platform=?", (platform,))
+        c.execute("UPDATE tg_platform_keys SET active=1 WHERE id=?", (kid,))
+
+
+def tg_key_delete(kid: int):
+    with db() as c:
+        row = c.execute("SELECT platform, active FROM tg_platform_keys WHERE id=?",
+                        (kid,)).fetchone()
+        if not row:
+            return
+        platform = row["platform"]
+        c.execute("DELETE FROM tg_platform_keys WHERE id=?", (kid,))
+        if row["active"]:
+            nxt = c.execute("SELECT id FROM tg_platform_keys WHERE platform=? "
+                            "ORDER BY id DESC LIMIT 1", (platform,)).fetchone()
+            if nxt:
+                c.execute("UPDATE tg_platform_keys SET active=1 WHERE id=?", (nxt["id"],))
+
+
+def tg_key_active(platform: str) -> str:
+    """Token the deploy code uses for this platform: the active stored key, else the
+    legacy single-key setting (so pre-existing databases keep working)."""
+    with db() as c:
+        r = c.execute("SELECT token FROM tg_platform_keys WHERE platform=? AND active=1",
+                      (platform,)).fetchone()
+    if r:
+        return r["token"] or ""
+    return get_setting("tgweb_%s_token" % platform) or ""
 
 
 def tgw_repo_url() -> str:
@@ -3560,7 +3652,7 @@ async def tgweb_deploy(pid: int):
                 "tproxy/Dockerfile not found in %s (branch %s) — push the tproxy "
                 "folder to GitHub first, then sync this proxy" % (repo, branch))
         if platform == "render":
-            token = get_setting("tgweb_render_token") or ""
+            token = tg_key_active("render")
             owners = await render_owners(token)
             owner = render_pick_owner(owners)
             name = tgw_slug(row["label"], str(pid))
@@ -3591,7 +3683,7 @@ async def tgweb_deploy(pid: int):
             hint = ("Render build failed — open the service's Events/Logs page in the "
                     "Render dashboard (repo %s, branch %s)" % (repo, branch))
         elif platform == "railway":
-            token = get_setting("tgweb_railway_token") or ""
+            token = tg_key_active("railway")
             slug = tgw_github_slug(repo)
             if not slug:
                 raise PlatformError("Railway builds from GitHub — the repo must look "
@@ -3680,7 +3772,7 @@ def tgw_spawn_watch(pid: int):
     hint = "build failed — check the platform's dashboard logs"
     repo, branch = tgw_repo_url(), tgw_branch()
     if row["platform"] == "render":
-        token = get_setting("tgweb_render_token") or ""
+        token = tg_key_active("render")
         check = lambda: render_deploy_status(token, row["service_id"])
         hint = ("Render build failed — open the service's Events/Logs page in the "
                 "Render dashboard (repo %s, branch %s)" % (repo, branch))
@@ -3689,7 +3781,7 @@ def tgw_spawn_watch(pid: int):
             coords = json.loads(row["coords"] or "{}")
         except Exception:
             coords = {}
-        token = get_setting("tgweb_railway_token") or ""
+        token = tg_key_active("railway")
         check = lambda: railway_deploy_status(token, coords.get("projectId", ""),
                                               row["service_id"],
                                               coords.get("environmentId", ""))
@@ -3751,7 +3843,7 @@ async def tgweb_platform_sync(row) -> dict:
         return tgweb_out(row)     # create still in flight — there is no platform truth yet
     try:
         if platform == "render":
-            token = get_setting("tgweb_render_token") or ""
+            token = tg_key_active("render")
             svc = await render_service(token, row["service_id"])
             host = re.sub(r"^https?://", "", (svc.get("serviceDetails") or {}).get("url") or "",
                           ).strip("/").lower()
@@ -3767,7 +3859,7 @@ async def tgweb_platform_sync(row) -> dict:
             else:
                 error = ""
         elif platform == "railway":
-            token = get_setting("tgweb_railway_token") or ""
+            token = tg_key_active("railway")
             st = await railway_deploy_status(token, coords.get("projectId", ""),
                                              row["service_id"],
                                              coords.get("environmentId", ""))
@@ -3807,7 +3899,7 @@ async def tgweb_platform_rotate(row) -> str:
     except Exception:
         pass
     if platform == "render":
-        token = get_setting("tgweb_render_token") or ""
+        token = tg_key_active("render")
         env = await render_get_env(token, row["service_id"])
         if "TGP_SECRET" not in env:
             raise PlatformError("service has no TGP_SECRET — not created by this panel?")
@@ -3815,7 +3907,7 @@ async def tgweb_platform_rotate(row) -> str:
         await render_put_env(token, row["service_id"], env)
         await render_trigger_deploy(token, row["service_id"])
     elif platform == "railway":
-        token = get_setting("tgweb_railway_token") or ""
+        token = tg_key_active("railway")
         # PORT rides along on every redeploy so proxies created before the PORT fix
         # are healed here too (a rotate is the user's one-click repair for them).
         await railway_upsert_vars(token, coords.get("projectId", ""),
@@ -3841,7 +3933,7 @@ async def tgweb_platform_pause(row, paused: bool):
     except Exception:
         pass
     if platform == "render":
-        token = get_setting("tgweb_render_token") or ""
+        token = tg_key_active("render")
         if paused:
             try:
                 await _call(_http_json, "POST",
@@ -3870,7 +3962,7 @@ async def tgweb_platform_pause(row, paused: bool):
             c.execute("UPDATE tg_web_proxies SET deploy_state=? WHERE id=?",
                       (state, row["id"]))
     elif platform == "railway":
-        token = get_setting("tgweb_railway_token") or ""
+        token = tg_key_active("railway")
         await railway_upsert_vars(token, coords.get("projectId", ""),
                                   coords.get("environmentId", ""), row["service_id"],
                                   {"TGP_PAUSED": "1" if paused else "0",
@@ -3893,10 +3985,10 @@ async def tgweb_platform_delete(row):
     platform = row["platform"]
     try:
         if platform == "render":
-            token = get_setting("tgweb_render_token") or ""
+            token = tg_key_active("render")
             await render_delete_service(token, row["service_id"])
         elif platform == "railway":
-            token = get_setting("tgweb_railway_token") or ""
+            token = tg_key_active("railway")
             try:
                 coords = json.loads(row["coords"] or "{}")
             except Exception:
@@ -4011,6 +4103,13 @@ class TgWebSettingsIn(BaseModel):
     railway_token: str = ""
     repo: Optional[str] = None
     branch: Optional[str] = None
+
+
+class TgKeyIn(BaseModel):
+    """A single platform API key to store. Optional name is the account label the
+    admin wants (defaults to the account/workspace name resolved from the API)."""
+    token: str = ""
+    name: str = ""
 
 
 class CountryIn(BaseModel):
@@ -4695,13 +4794,16 @@ async def get_tgweb_regions(_=Depends(require_admin)):
 
 @app.get("/api/tgweb/settings")
 async def get_tgweb_settings(_=Depends(require_admin)):
-    """Platform credentials — tokens are never returned, only a hint that one is set."""
+    """Platform credentials. Tokens are never returned — each saved key appears as a
+    row with an account name, a masked hint stub, and whether it is the active one."""
     rt, rw = tgw_settings_tokens()
     return {
         "render_token_set": bool(rt),
         "render_token_hint": ("••••" + rt[-4:]) if rt else "",
         "railway_token_set": bool(rw),
         "railway_token_hint": ("••••" + rw[-4:]) if rw else "",
+        "render_keys": tg_key_rows("render"),
+        "railway_keys": tg_key_rows("railway"),
         "repo": tgw_repo_url(),
         "branch": tgw_branch(),
     }
@@ -4709,17 +4811,60 @@ async def get_tgweb_settings(_=Depends(require_admin)):
 
 @app.post("/api/tgweb/settings")
 async def set_tgweb_settings(body: TgWebSettingsIn, _=Depends(require_admin)):
-    if body.render_token:
-        set_setting("tgweb_render_token", body.render_token.strip())
-    if body.railway_token:
-        set_setting("tgweb_railway_token", body.railway_token.strip())
     if body.repo is not None:
         set_setting("tgweb_repo", (body.repo or "").strip().rstrip("/")
                     or TGWEB_REPO)   # keep scheme + case: it is a repo URL, not a host
     if body.branch is not None:
         set_setting("tgweb_branch", body.branch.strip() or "main")
-    audit("tgweb-settings", "", "platform tokens/repo updated")
+    audit("tgweb-settings", "", "platform repo/branch updated")
     return await get_tgweb_settings()
+
+
+@app.get("/api/tgweb/keys/{platform}")
+async def list_tgweb_keys(platform: str, _=Depends(require_admin)):
+    if platform not in ("render", "railway"):
+        raise HTTPException(400, "platform must be render or railway")
+    return tg_key_rows(platform)
+
+
+@app.post("/api/tgweb/keys/{platform}")
+async def add_tgweb_key(platform: str, body: TgKeyIn, _=Depends(require_admin)):
+    """Store a new platform API key. The account is resolved live from the platform
+    so the panel can show WHICH account it belongs to, and the first key saved for a
+    platform becomes the active deploy key automatically."""
+    if platform not in ("render", "railway"):
+        raise HTTPException(400, "platform must be render or railway")
+    token = (body.token or "").strip()
+    if not token:
+        raise HTTPException(400, "API key is required")
+    try:
+        name, owner_id = await tg_key_resolve(platform, token)
+    except PlatformError as e:
+        raise HTTPException(400, "could not validate this key: %s" % e)
+    label = (body.name or "").strip() or name
+    kid = tg_key_add(platform, label, owner_id, token)
+    return {"ok": True, "id": kid, "account": label, "owner_id": owner_id}
+
+
+@app.post("/api/tgweb/keys/{platform}/{kid}/active")
+async def activate_tgweb_key(platform: str, kid: int, _=Depends(require_admin)):
+    if platform not in ("render", "railway"):
+        raise HTTPException(400, "platform must be render or railway")
+    row = tg_key_rows(platform)
+    if not any(k["id"] == kid for k in row):
+        raise HTTPException(404, "key not found")
+    tg_key_set_active(platform, kid)
+    audit("tgweb-key", str(kid), "platform key set active")
+    return {"ok": True, "id": kid}
+
+
+@app.delete("/api/tgweb/keys/{platform}/{kid}")
+async def delete_tgweb_key(platform: str, kid: int, _=Depends(require_admin)):
+    if platform not in ("render", "railway"):
+        raise HTTPException(400, "platform must be render or railway")
+    tg_key_delete(kid)
+    audit("tgweb-key", str(kid), "platform key deleted")
+    return {"ok": True}
 
 
 @app.post("/api/tgweb")
@@ -4731,8 +4876,7 @@ async def add_tgweb(body: TgWebIn, _=Depends(require_admin)):
         if not server:
             raise HTTPException(400, "server is required (bare host, no https:// or port)")
     else:
-        tok = get_setting("tgweb_render_token" if platform == "render"
-                          else "tgweb_railway_token") or ""
+        tok = tg_key_active(platform)
         if not tok:
             raise HTTPException(
                 400, "no %s token stored — save it in the platform settings first"
@@ -4849,7 +4993,7 @@ async def patch_tgweb(pid: int, body: TgWebPatch, _=Depends(require_admin)):
                 # region must still move the service when the real zone disagrees.
                 try:
                     real = await railway_real_region(
-                        get_setting("tgweb_railway_token") or "",
+                        tg_key_active("railway"),
                         row0["service_id"], coords.get("environmentId", ""),
                         row0["server"] or "")
                 except PlatformError:
@@ -4875,7 +5019,7 @@ async def patch_tgweb(pid: int, body: TgWebPatch, _=Depends(require_admin)):
             coords_before = json.loads(row0["coords"] or "{}")
         except Exception:
             coords_before = {}
-        token = get_setting("tgweb_railway_token") or ""
+        token = tg_key_active("railway")
         try:
             await railway_set_region(token, row["service_id"],
                                      coords.get("environmentId", ""), move_region)
@@ -10105,6 +10249,7 @@ const I18N={
   tgwSetSub:'For the panel to build proxies itself, store an API token of the hosting platform here (Render: Account Settings → API Keys; Railway: Account Settings → Tokens). Tokens are stored only in this panel. Repo and branch use their defaults (the project repo, branch main) and each proxy is built from that repo\'s tproxy folder — so push the tproxy folder to GitHub first.',
   tgwSetSubSelf:'This panel is hosted on {p}; building a Telegram web proxy therefore needs the {p} API token — get it from your own account and paste it into the field below.',
   tgwRenderToken:'Render API token (rnd_…)',tgwRailwayToken:'Railway API token',
+  tgwNoKeys:'No keys saved yet.',tgwActive:'Active',tgwUse:'Use',tgwAddKey:'Add',tgwNewKey:'Paste a new API key…',tgwKeyRequired:'Paste an API key first',tgwKeyAdded:'Key added ✓',tgwKeyDeleted:'Key deleted',tgwDelKeyQ:'Delete this API key? It can no longer deploy proxies.',
   tgwSetSaved:'Saved ✓',
   tgwBuildHint:'Builds usually take 2–4 minutes; if it takes longer, hit the ⟳ button to re-read the state from the platform',
   tgwBuilding:'Building',tgwLive:'Ready',tgwFailed:'Failed',tgwSuspended:'Suspended',
@@ -11388,30 +11533,72 @@ function tgTokenField(id,hint,lbl){
   <input id="${id}" class="inp mono" style="font-size:11.5px" dir="ltr"
          placeholder="${esc(hint||'')}" autocomplete="off"></label>`;
 }
+function tgKeyList(plat){
+ const s=tgSettings||{};
+ const keys=(plat==='render'?s.render_keys:s.railway_keys)||[];
+ if(!keys.length)return `<div class="text-xs dim mt-2">${T('tgwNoKeys')}</div>`;
+ return `<div class="mt-2 flex flex-col gap-1.5">`+keys.map(k=>
+  `<div class="flex items-center gap-2 text-sm border rounded p-2 ${k.active?'border-teal':''}">
+    <span class="flex-1 min-w-0">
+      <span class="flex items-center gap-2">
+        <b class="truncate">${esc(k.name||('#'+k.id))}</b>
+        ${k.active?`<span class="chip teal">${T('tgwActive')}</span>`:''}
+      </span>
+      <span class="text-xs dim mono">${esc(k.token_hint||'')}</span>
+    </span>
+    ${k.active?'':`<button class="btn btn-sm" onclick="tgSetKeyActive('${plat}',${k.id})">${T('tgwUse')}</button>`}
+    <button class="icon-btn danger" title="${T('del')}" onclick="tgDelKey('${plat}',${k.id})">${ICO.x}</button>
+   </div>`).join('')+`</div>`;
+}
+async function tgAddKey(plat){
+ const inp=document.getElementById('tgsNewKey');if(!inp)return;
+ const token=inp.value.trim();if(!token){toast(T('tgwKeyRequired'));return}
+ try{
+  await api('/api/tgweb/keys/'+plat,{method:'POST',body:JSON.stringify({token})});
+  inp.value='';await loadTgSettings();
+  const lk=document.getElementById('tgKeyListWrap');if(lk)lk.innerHTML=tgKeyList(plat);
+  tgPickPlatform(tgPlatform);toast(T('tgwKeyAdded'));
+ }catch(e){toast(e.message)}
+}
+async function tgSetKeyActive(plat,kid){
+ try{
+  await api('/api/tgweb/keys/'+plat+'/'+kid+'/active',{method:'POST'});
+  await loadTgSettings();
+  const lk=document.getElementById('tgKeyListWrap');if(lk)lk.innerHTML=tgKeyList(plat);
+  toast(T('tgwSetSaved'));
+ }catch(e){toast(e.message)}
+}
+async function tgDelKey(plat,kid){
+ if(!confirm(T('tgwDelKeyQ')))return;
+ try{
+  await api('/api/tgweb/keys/'+plat+'/'+kid,{method:'DELETE'});
+  await loadTgSettings();
+  const lk=document.getElementById('tgKeyListWrap');if(lk)lk.innerHTML=tgKeyList(plat);
+  tgPickPlatform(tgPlatform);toast(T('tgwKeyDeleted'));
+ }catch(e){toast(e.message)}
+}
 async function openTgSettings(){
  await loadTgSettings();
  const s=tgSettings||{};
  const sub=TGWSELF?T('tgwSetSubSelf').replace('{p}',tgPlName(TGWSELF)):T('tgwSetSub');
- let fields='';
- if(TGWSELF==='railway')fields=tgTokenField('tgsRailway',s.railway_token_hint,T('tgwRailwayToken'));
- else if(TGWSELF==='render')fields=tgTokenField('tgsRender',s.render_token_hint,T('tgwRenderToken'));
- else fields=tgTokenField('tgsRender',s.render_token_hint,T('tgwRenderToken'))
-     +tgTokenField('tgsRailway',s.railway_token_hint,T('tgwRailwayToken'));
+ const plats=TGWSELF?[TGWSELF]:['render','railway'];
+ function platSection(p){
+  return `<div class="mt-3"><div class="flex items-center gap-2">
+    <b>${esc(tgPlName(p))}</b>
+    ${(p==='render'?s.render_token_set:s.railway_token_set)?`<span class="chip teal">${T('tgwActive')}</span>`:''}
+   </div>
+   <div id="tgKeyListWrap">${tgKeyList(p)}</div>
+   <div class="fld mt-2 flex gap-2">
+    <input id="tgsNewKey" class="inp mono" style="flex:1;font-size:11.5px" dir="ltr"
+           placeholder="${T('tgwNewKey')}" autocomplete="off">
+    <button class="btn" onclick="tgAddKey('${p}')">${T('tgwAddKey')}</button>
+   </div>
+  </div>`;
+ }
  openModal(T('tgwSet'),`
   <p class="text-xs dim" style="margin:0">${sub}</p>
-  ${fields}
-  <button onclick="saveTgSettings()" class="btn w-full mt-3">${T('saveBtn')}</button>`);
-}
-async function saveTgSettings(){
- const body={};
- const rEl=document.getElementById('tgsRender'),wEl=document.getElementById('tgsRailway');
- if(rEl)body.render_token=rEl.value.trim();
- if(wEl)body.railway_token=wEl.value.trim();
- try{
-  await api('/api/tgweb/settings',{method:'POST',body:JSON.stringify(body)});
-  await loadTgSettings();tgPickPlatform(tgPlatform);
-  closeModal();toast(T('tgwSetSaved'));
- }catch(e){toast(e.message)}
+  ${plats.map(platSection).join('')}
+  <button onclick="closeModal()" class="btn w-full mt-3">${T('close')}</button>`);
 }
 async function tgSync(id){
  try{await api('/api/tgweb/'+id+'/sync',{method:'GET'})}catch(e){}
