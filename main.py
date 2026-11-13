@@ -294,6 +294,8 @@ def migrate():
                         ("reset_days", "INTEGER DEFAULT 0"),
                         ("last_reset", "INTEGER DEFAULT 0")],
               "user_ips": [("proto", "TEXT DEFAULT 'ws'")],
+              "devices": [("device_name", "TEXT DEFAULT ''"),
+                          ("client_version", "TEXT DEFAULT ''")],
               "clean_ips": [("country", "TEXT DEFAULT ''")],
               "tg_web_proxies": [("platform", "TEXT DEFAULT 'external'"),
                                  ("service_id", "TEXT DEFAULT ''"),
@@ -593,7 +595,8 @@ async def resetter():
 # client IP and the request User-Agent. The pair becomes one opaque key per device, and we
 # remember the parsed app + platform so the panel can show "who" is connected.
 UA_CLIENTS = (
-    ("v2rayng", "v2rayNG"), ("v2raytun", "v2rayTun"), ("v2rayn", "v2rayN"),
+    ("v2rayng", "v2rayNG"), ("v2raytun", "v2rayTun"), ("happ", "Happ"),
+    ("incy", "Incy"), ("v2rayn", "v2rayN"),
     ("nekobox", "NekoBox"), ("nekoray", "NekoRay"), ("streisand", "Streisand"),
     ("hiddify", "Hiddify"), ("shadowrocket", "Shadowrocket"), ("quantumult", "Quantumult"),
     ("stash", "Stash"), ("clash", "Clash"), ("sing-box", "sing-box"), ("singbox", "sing-box"),
@@ -663,7 +666,9 @@ def hwid_of(headers) -> str:
     """The device identifier the standards-compliant clients send on subscription
     requests (XTLS subscription standard: x-hwid, x-device-os, x-ver-os,
     x-device-model — v2rayTun since 2.3.5, Happ, v2rayA, Securify …)."""
-    for h in ("x-hwid", "x-device-id", "x-device-model"):
+    # Only stable per-install identifiers count. Device model is shared by many
+    # phones and is not an identity; accepting it here lets users evade the cap.
+    for h in ("x-hwid", "x-device-id", "x-hardware-id"):
         v = ""
         try:
             v = (headers.get(h) or "").strip()
@@ -696,6 +701,68 @@ def device_key(ip: str, ua: str) -> str:
     """Opaque per-device identity: stable for one client+IP, distinct for others."""
     seed = f"{(ip or '').strip()}|{(ua or '').strip().lower()}"
     return hashlib.sha1(seed.encode()).hexdigest()[:16]
+
+
+def hwid_fingerprint(hwid: str) -> str:
+    """One-way stable identifier; raw client HWIDs are never stored."""
+    return "hwid:" + hashlib.sha256((hwid or "").strip().lower().encode()).hexdigest()[:40]
+
+
+def register_hwid_device(uid: int, hwid: str, limit: int, ip: str, ua: str,
+                         headers=None, proto: str = "sub") -> tuple[bool, int]:
+    """Persist a client-reported HWID and enforce a persistent per-account cap.
+
+    Unlike the legacy IP+UA heuristic, these slots do not expire on a rolling
+    window. A device is freed only when an admin removes it from the device list.
+    """
+    if limit <= 0:
+        return True, 0
+    hwid = (hwid or "").strip()
+    if not hwid:
+        return False, 0
+    dkey = hwid_fingerprint(hwid)
+    client, platform = parse_ua(ua)
+    headers = headers or {}
+    def _header(*names):
+        for name in names:
+            try:
+                value = (headers.get(name) or "").strip()
+            except AttributeError:
+                value = ""
+            if value:
+                return value[:120]
+        return ""
+    device_name = _header("x-device-model", "x-device-name", "x-hardware-model")
+    client_version = _header("x-app-version", "x-client-version", "x-ver-app")
+    if not client_version:
+        match = re.search(r"(?i)(?:v2box|v2raytun|happ|incy|shadowrocket|streisand)[/\s-]v?([0-9]+(?:\.[0-9A-Za-z_-]+)+)", ua or "")
+        client_version = match.group(1) if match else ""
+    ts = now()
+    with db() as c:
+        # Serialize simultaneous first fetches so two new HWIDs cannot both take
+        # the final slot. SQLite's write transaction is short and local.
+        c.execute("BEGIN IMMEDIATE")
+        known = c.execute("SELECT id FROM devices WHERE user_id=? AND dkey=?",
+                          (uid, dkey)).fetchone()
+        if not known:
+            n = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=? AND dkey LIKE 'hwid:%'",
+                          (uid,)).fetchone()["n"]
+            if n >= limit:
+                return False, int(n)
+            c.execute("""INSERT INTO devices(user_id,dkey,ip,ua,client,platform,proto,
+                                             first_seen,last_seen,hits,device_name,client_version)
+                         VALUES(?,?,?,?,?,?,?,?,?,1,?,?)""",
+                      (uid, dkey, (ip or "")[:80], (ua or "")[:300], client,
+                       platform, proto, ts, ts, device_name, client_version))
+            return True, int(n) + 1
+        c.execute("""UPDATE devices SET last_seen=?,ip=?,ua=?,client=?,platform=?,
+                     proto=?,hits=hits+1,device_name=?,client_version=?
+                     WHERE user_id=? AND dkey=?""",
+                  (ts, (ip or "")[:80], (ua or "")[:300], client, platform,
+                   proto, device_name, client_version, uid, dkey))
+        n = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=? AND dkey LIKE 'hwid:%'",
+                      (uid,)).fetchone()["n"]
+        return True, int(n)
 
 
 def device_label(client: str, platform: str, ip: str) -> str:
@@ -1351,13 +1418,18 @@ def authorize(uid_str: str, ip: str, proto: str, ua: str = ""):
         return None, reason
     if not transport_allowed(row, proto):
         return None, f"{proto} not allowed"
-    dkey = device_key(ip, ua)
-    if not device_allowed(row["id"], dkey, row["device_limit"]):
-        return None, "device limit"
-    if (needs_device_gate(row) and device_gate_on() and device_gate_traffic()
-            and not device_aware_client(ua or "")):
-        return None, "device not identifiable by this app"
-    touch_device(row["id"], dkey, ip, ua, proto)
+    # With HWID registration enabled, never fall back to IP+UA for the device
+    # quota: doing so would create fake identities and make the limit inconsistent.
+    # Proxy transports do not carry subscription HTTP headers, so this layer cannot
+    # cryptographically bind a live tunnel to the registered subscription HWID.
+    if not (needs_device_gate(row) and device_gate_on()):
+        dkey = device_key(ip, ua)
+        if not device_allowed(row["id"], dkey, row["device_limit"]):
+            return None, "device limit"
+        if (needs_device_gate(row) and device_gate_traffic()
+                and not device_aware_client(ua or "")):
+            return None, "device not identifiable by this app"
+        touch_device(row["id"], dkey, ip, ua, proto)
     if not ip_allowed(row["id"], ip, row["ip_limit"]):
         return None, "ip limit"
     touch_ip(row["id"], ip, proto)
@@ -2711,23 +2783,19 @@ def device_gate_response(row) -> PlainTextResponse:
     except (KeyError, IndexError, TypeError):
         n = 0
     lines = [
-        "IRANX · THIS LINK NEEDS A DEVICE-AWARE APP",
+        "IRANX · DEVICE ID REQUIRED",
         "",
-        ("This account allows %d device%s, so the panel only gives the "
-         "subscription to apps that report which device is asking."
+        ("This account allows %d device%s. To receive the subscription, "
+         "your client must send a stable x-hwid or x-device-id header."
          % (n, "" if n == 1 else "s")),
         "",
-        "Open this link inside one of these apps:",
-    ]
-    lines += ["  \u2022 " + a for a in DEVICE_GATE_APPS]
-    lines += [
+        "A client name, User-Agent, IP address, or phone model is not enough.",
+        "Each accepted HWID is registered and consumes one device slot.",
+        "When all slots are used, ask the panel admin to remove an old device.",
         "",
-        "Other apps (v2rayNG, Hiddify, Clash, sing-box, browsers \u2026) cannot be",
-        "identified, so they are refused \u2014 otherwise the device limit could be bypassed.",
-        "",
-        "Apps that send the device headers (x-hwid / x-device-model) are also accepted.",
-        "",
-        "Ask the panel admin to set the device limit to 0 if you need a different app.",
+        "A device ID is client-reported; this cannot prevent deliberate HWID spoofing "
+        "or a client that copies its subscription and identifier.",
+        "Set device limit to 0 to keep the account unrestricted.",
     ]
     return PlainTextResponse("\n".join(lines), status_code=403, headers={
         DEVICE_GATE_HEADER: "1",
@@ -4493,7 +4561,7 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
     live_cut = now() - LIVE_WINDOW
     count_cut = now() - DEVICE_WINDOW
     ip_cut = now() - IP_WINDOW
-    cols = "id,dkey,ip,ua,client,platform,proto,first_seen,last_seen,hits"
+    cols = "id,dkey,ip,ua,client,platform,proto,first_seen,last_seen,hits,device_name,client_version"
     ip_cols = "id,ip,proto,first_seen,last_seen,hits"
     with db() as c:
         if history:
@@ -4534,7 +4602,7 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
         "history": bool(history),
         "rows": [
             {**dict(r),
-             "label": device_label(r["client"], r["platform"], r["ip"]),
+             "label": r["device_name"] or device_label(r["client"], r["platform"], r["ip"]),
              "online": r["last_seen"] > live_cut,
              "counted": r["last_seen"] > count_cut}
             for r in rows
@@ -9276,22 +9344,29 @@ async def subscription(token: str, request: Request):
 
     row = maybe_auto_reset(row)
 
-    # ── device gate ──
-    # Only for accounts that actually carry a device limit: those subscriptions are
-    # restricted to the apps that identify the device, so the cap stays accurate.
-    # Browsers (and ?page=1) still get the human-readable page below.
+    # ── HWID device registration gate ──
+    # The device cap is based on a stable client-reported HWID, never an IP/UA pair
+    # or a client-name allowlist (both are trivially spoofable). Human browser pages
+    # remain viewable, but limited accounts do not receive subscription payloads
+    # unless the client supplies a stable HWID and has an available registered slot.
     _ua = (request.headers.get("user-agent") or "")
     _qp = request.query_params
     _html_wanted = ("text/html" in (request.headers.get("accept") or "")
                     and "mozilla" in _ua.lower())
-    _hwid = hwid_of(request.headers)
-    if (needs_device_gate(row) and device_gate_on()
-            and not _html_wanted
-            and _qp.get("page") not in ("1", "true")
-            and not device_aware_client(_ua)
-            and not _hwid):
-        audit("sub-gate", row["name"], "refused %s" % (_ua[:80] or "no user-agent"))
-        return device_gate_response(row)
+    _force_page = _qp.get("page") in ("1", "true")
+    if needs_device_gate(row) and device_gate_on() and not _html_wanted and not _force_page:
+        _hwid = hwid_of(request.headers)
+        if not _hwid:
+            audit("sub-hwid-missing", row["name"], _ua[:80] or "no user-agent")
+            return device_gate_response(row)
+        _ip = request.client.host if request.client else ""
+        _ok, _count = register_hwid_device(row["id"], _hwid,
+                                           int(row["device_limit"] or 0), _ip, _ua,
+                                           headers=request.headers)
+        if not _ok:
+            audit("sub-hwid-limit", row["name"], "registered=%s limit=%s" %
+                  (_count, row["device_limit"]))
+            return device_gate_response(row)
 
     d = base_domain(request)
     lines = build_info_lines(row, d)
@@ -12111,7 +12186,7 @@ async function paintIps(quiet){
    <span style="width:8px;height:8px;border-radius:50%;background:${x.online?'var(--ok)':(x.counted?'var(--info)':'var(--dim)')}"></span>
    <div style="min-width:0;flex:1">
     <div class="font-bold truncate">${esc(x.label||x.ip)}</div>
-    <div class="text-xs dim mono truncate">${esc(x.ip)} · ${esc(x.proto||'ws')}${x.hits?' · '+x.hits+'x':''}</div>
+    <div class="text-xs dim mono truncate">${esc([x.client,x.client_version&&('v'+x.client_version),x.platform,x.ip,x.proto].filter(Boolean).join(' · '))}${x.hits?' · '+x.hits+'x':''}</div>
    </div>
    <span class="text-xs dim" title="${esc(x.ua||'')}">${dt(x.last_seen)}</span>
    <button class="icon-btn danger" title="${T('delDevice')}" onclick="delDevice(${ipUid},${x.id})">${ICO.del}</button>
