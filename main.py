@@ -210,10 +210,8 @@ CREATE TABLE IF NOT EXISTS user_ips (
     hits       INTEGER DEFAULT 1,
     UNIQUE(user_id, ip)
 );
--- One row per detected client device. Identity is an opaque key derived from the
--- client IP plus its User-Agent, so the same phone always lands on the same row and a
--- second device (different app or different IP) gets its own. `device_limit` counts
--- these rows inside DEVICE_WINDOW.
+-- One row per device identity per user. HWID registrations occupy persistent
+-- slots. Legacy IP/User-Agent observations use the rolling DEVICE_WINDOW.
 --
 -- Device limit and IP limit are two independent gates:
 --   * device_limit identifies and registers every Nth device identity and only lets
@@ -500,23 +498,30 @@ async def keepalive():
             print("keepalive:", result)
 
 
+async def flush_traffic():
+    async with _lock:
+        if not _pending:
+            return
+        stamp = now()
+        with db() as c:
+            for uid, (up, down) in _pending.items():
+                if not (up or down):
+                    continue
+                updated = c.execute("UPDATE users SET used_bytes=used_bytes+? WHERE id=?",
+                                    (up + down, uid))
+                if updated.rowcount:
+                    c.execute("INSERT INTO traffic_log(user_id,ts,up,down) VALUES(?,?,?,?)",
+                              (uid, stamp, up, down))
+            c.execute("DELETE FROM traffic_log WHERE ts<?", (stamp - 86400 * 7,))
+        _pending.clear()
+
+
 async def flusher():
     while True:
         await asyncio.sleep(10)
-        async with _lock:
-            snap = {k: v for k, v in _pending.items() if v[0] or v[1]}
-            _pending.clear()
-        if not snap:
-            continue
         try:
-            with db() as c:
-                for uid, (up, down) in snap.items():
-                    c.execute("UPDATE users SET used_bytes=used_bytes+? WHERE id=?",
-                              (up + down, uid))
-                    c.execute("INSERT INTO traffic_log(user_id,ts,up,down) VALUES(?,?,?,?)",
-                              (uid, now(), up, down))
-                c.execute("DELETE FROM traffic_log WHERE ts<?", (now() - 86400 * 7,))
-        except Exception as e:
+            await flush_traffic()
+        except sqlite3.Error as e:
             print("flush error:", e)
 
 
@@ -708,15 +713,18 @@ def hwid_fingerprint(hwid: str) -> str:
     return "hwid:" + hashlib.sha256((hwid or "").strip().lower().encode()).hexdigest()[:40]
 
 
+def registered_hwid_count(conn: sqlite3.Connection, uid: int) -> int:
+    return conn.execute("SELECT COUNT(*) FROM devices WHERE user_id=? AND dkey GLOB 'hwid:*'",
+                        (uid,)).fetchone()[0]
+
+
 def register_hwid_device(uid: int, hwid: str, limit: int, ip: str, ua: str,
-                         headers=None, proto: str = "sub") -> tuple[bool, int]:
+                         headers=None, proto: str = "sub") -> tuple[bool, int | None]:
     """Persist a client-reported HWID and enforce a persistent per-account cap.
 
     Unlike the legacy IP+UA heuristic, these slots do not expire on a rolling
-    window. A device is freed only when an admin removes it from the device list.
+    window. Return the number of occupied slots only when a new device is refused.
     """
-    if limit <= 0:
-        return True, 0
     hwid = (hwid or "").strip()
     if not hwid:
         return False, 0
@@ -742,27 +750,24 @@ def register_hwid_device(uid: int, hwid: str, limit: int, ip: str, ua: str,
         # Serialize simultaneous first fetches so two new HWIDs cannot both take
         # the final slot. SQLite's write transaction is short and local.
         c.execute("BEGIN IMMEDIATE")
-        known = c.execute("SELECT id FROM devices WHERE user_id=? AND dkey=?",
-                          (uid, dkey)).fetchone()
-        if not known:
-            n = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=? AND dkey LIKE 'hwid:%'",
-                          (uid,)).fetchone()["n"]
+        updated = c.execute("""UPDATE devices SET last_seen=?,ip=?,ua=?,client=?,platform=?,
+                               proto=?,device_name=COALESCE(NULLIF(?,''),device_name),
+                               client_version=COALESCE(NULLIF(?,''),client_version)
+                               WHERE user_id=? AND dkey=?""",
+                            (ts, (ip or "")[:80], (ua or "")[:300], client, platform,
+                             proto, device_name, client_version, uid, dkey))
+        if updated.rowcount:
+            return True, None
+        if limit > 0:
+            n = registered_hwid_count(c, uid)
             if n >= limit:
-                return False, int(n)
-            c.execute("""INSERT INTO devices(user_id,dkey,ip,ua,client,platform,proto,
-                                             first_seen,last_seen,hits,device_name,client_version)
-                         VALUES(?,?,?,?,?,?,?,?,?,1,?,?)""",
-                      (uid, dkey, (ip or "")[:80], (ua or "")[:300], client,
-                       platform, proto, ts, ts, device_name, client_version))
-            return True, int(n) + 1
-        c.execute("""UPDATE devices SET last_seen=?,ip=?,ua=?,client=?,platform=?,
-                     proto=?,hits=hits+1,device_name=?,client_version=?
-                     WHERE user_id=? AND dkey=?""",
-                  (ts, (ip or "")[:80], (ua or "")[:300], client, platform,
-                   proto, device_name, client_version, uid, dkey))
-        n = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=? AND dkey LIKE 'hwid:%'",
-                      (uid,)).fetchone()["n"]
-        return True, int(n)
+                return False, n
+        c.execute("""INSERT INTO devices(user_id,dkey,ip,ua,client,platform,proto,
+                                         first_seen,last_seen,device_name,client_version)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                  (uid, dkey, (ip or "")[:80], (ua or "")[:300], client,
+                   platform, proto, ts, ts, device_name, client_version))
+        return True, None
 
 
 def device_label(client: str, platform: str, ip: str) -> str:
@@ -782,6 +787,15 @@ def active_devices(uid: int, window: Optional[int] = None) -> int:
         r = c.execute("SELECT COUNT(*) n FROM devices WHERE user_id=? AND last_seen>?",
                       (uid, now() - w)).fetchone()
     return r["n"] if r else 0
+
+
+def device_slots_used(uid: int, hwid_mode: bool) -> int:
+    with db() as c:
+        if hwid_mode:
+            return registered_hwid_count(c, uid)
+        return c.execute("""SELECT COUNT(*) FROM devices
+                            WHERE user_id=? AND last_seen>? AND dkey NOT GLOB 'hwid:*'""",
+                         (uid, now() - DEVICE_WINDOW)).fetchone()[0]
 
 
 def live_devices(uid: int) -> int:
@@ -808,7 +822,7 @@ def device_allowed(uid: int, dkey: str, limit: int) -> bool:
     with db() as c:
         known = c.execute("SELECT 1 FROM devices WHERE user_id=? AND dkey=? AND last_seen>?",
                           (uid, dkey, now() - DEVICE_WINDOW)).fetchone()
-    return bool(known) or active_devices(uid) < limit
+    return bool(known) or device_slots_used(uid, hwid_mode=False) < limit
 
 
 def active_ips(uid: int, window: Optional[int] = None) -> int:
@@ -1894,9 +1908,13 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(tg_autobackup()),
         asyncio.create_task(detect_own_country()),
     ]
-    yield
-    for t in tasks:
-        t.cancel()
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await flush_traffic()
 
 
 app = FastAPI(title=PANEL_TITLE, docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -2836,7 +2854,7 @@ def sub_response_singbox(row, d, ips, request: Request) -> JSONResponse:
 def row_out(r) -> dict:
     r = maybe_auto_reset(r)            # refresh a stale cycle right on panel load
     d = dict(r)
-    d["devices_now"] = active_devices(r["id"])
+    d["devices_now"] = device_slots_used(r["id"], device_gate_on())
     d["devices_live"] = live_devices(r["id"])
     d["ips_now"] = active_ips(r["id"])
     d["ips_live"] = live_ips(r["id"])
@@ -4456,9 +4474,9 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
             vals.append(now() + body.expire_days * 86400 if body.expire_days > 0 else 0)
         if body.reset_days is not None:
             rd = min(365, max(0, int(body.reset_days or 0)))
-            sets.append("reset_days=?"); vals.append(rd)
-            # turning the cycle on (or changing it) starts a fresh one from today
-            sets.append("last_reset=?"); vals.append(now())
+            if rd != (row["reset_days"] or 0):
+                sets.extend(("reset_days=?", "last_reset=?"))
+                vals.extend((rd, now()))
         if body.device_limit is not None:
             sets.append("device_limit=?"); vals.append(max(0, body.device_limit))
         if body.ip_limit is not None:
@@ -4506,6 +4524,7 @@ async def patch_user(uid: int, body: UserPatch, _=Depends(require_admin)):
 
 @app.post("/api/users/{uid}/reset-traffic")
 async def reset_traffic(uid: int, _=Depends(require_admin)):
+    await flush_traffic()
     with db() as c:
         c.execute("UPDATE users SET used_bytes=0, last_reset=? WHERE id=?",
                   (now(), uid))
@@ -4561,6 +4580,7 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
     live_cut = now() - LIVE_WINDOW
     count_cut = now() - DEVICE_WINDOW
     ip_cut = now() - IP_WINDOW
+    hwid_mode = device_gate_on()
     cols = "id,dkey,ip,ua,client,platform,proto,first_seen,last_seen,hits,device_name,client_version"
     ip_cols = "id,ip,proto,first_seen,last_seen,hits"
     with db() as c:
@@ -4590,7 +4610,7 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
                          (uid,)).fetchone()
     return {
         "live": live_devices(uid),
-        "counted": active_devices(uid),
+        "counted": device_slots_used(uid, hwid_mode),
         "total_seen": total,
         "limit": (urow["device_limit"] if urow else 0),
         "live_window": LIVE_WINDOW,
@@ -4603,8 +4623,10 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
         "rows": [
             {**dict(r),
              "label": r["device_name"] or device_label(r["client"], r["platform"], r["ip"]),
+             "registered": r["dkey"].startswith("hwid:"),
              "online": r["last_seen"] > live_cut,
-             "counted": r["last_seen"] > count_cut}
+             "counted": (r["dkey"].startswith("hwid:") if hwid_mode else
+                         not r["dkey"].startswith("hwid:") and r["last_seen"] > count_cut)}
             for r in rows
         ],
         "ip_rows": [
@@ -5314,7 +5336,7 @@ ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
             "DEVICE_WINDOW", "IP_WINDOW", "LIVE_WINDOW", "SESSION_IDLE", "PANEL_TITLE",
             "KEEPALIVE", "KEEPALIVE_MINUTES")
 
-USER_FIELDS = ("name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
+USER_FIELDS = ("id", "name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
                "used_bytes", "expire_at", "device_limit", "ip_limit", "transport",
                "obfuscate", "ech", "fp", "alpn", "ech_value", "obf_cs", "obf_fm",
                "reset_days", "last_reset", "created_at")
@@ -5369,7 +5391,7 @@ def build_backup(include_password: bool = True, include_traffic: bool = False,
 
     prox_out = []
     for p in proxies:
-        row = {k: p.get(k) for k in PROXY_FIELDS}
+        row = {"id": p["id"], **{k: p.get(k) for k in PROXY_FIELDS}}
         if not include_proxy_creds:
             row["username"] = ""
             row["password"] = ""
@@ -5420,6 +5442,9 @@ def parse_backup(raw, force: bool = False) -> dict:
     for key in ("users", "clean_ips", "proxies"):
         if not isinstance(payload.get(key, []), list):
             raise HTTPException(400, "backup structure is invalid")
+    for key, kind in (("env", dict), ("settings", dict), ("traffic_log", list)):
+        if payload.get(key) is not None and not isinstance(payload[key], kind):
+            raise HTTPException(400, "backup structure is invalid")
     return payload
 
 
@@ -5444,6 +5469,7 @@ def _clean_user(u: dict) -> Optional[dict]:
     tr = str(u.get("transport", "both")).lower()
     token = str(u.get("sub_token", "") or "").strip()
     return {
+        "id": num("id"),
         "name": name,
         "uuid": uid,
         # A missing or absurd token would break the subscription URL, so mint a new one.
@@ -5547,7 +5573,9 @@ def apply_backup(payload: dict, mode: str = "merge",
     stats = {"users_added": 0, "users_updated": 0, "users_skipped": skipped_users,
              "clean_ips_added": 0, "clean_ips_skipped": skipped_cips,
              "proxies_added": 0, "proxies_updated": 0, "proxies_skipped": skipped_proxies,
-             "password_restored": False, "traffic_rows": 0, "mode": mode}
+             "password_restored": False, "traffic_rows": 0, "traffic_skipped": 0,
+             "mode": mode}
+    user_ids = {}
 
     conn = db()
     try:
@@ -5564,10 +5592,18 @@ def apply_backup(payload: dict, mode: str = "merge",
 
         # name and uuid are both UNIQUE, so a row can collide on either one.
         for u in users:
-            existing = conn.execute(
-                "SELECT id FROM users WHERE name=? OR uuid=?", (u["name"], u["uuid"])
-            ).fetchone()
+            matches = conn.execute("SELECT id FROM users WHERE name=? OR uuid=?",
+                                   (u["name"], u["uuid"])).fetchall()
+            if len(matches) > 1:
+                stats["users_skipped"] += 1
+                continue
+            existing = matches[0] if matches else None
+            token_owner = conn.execute("SELECT id FROM users WHERE sub_token=?",
+                                       (u["sub_token"],)).fetchone()
             if existing:
+                if token_owner and token_owner["id"] != existing["id"]:
+                    stats["users_skipped"] += 1
+                    continue
                 conn.execute(
                     """UPDATE users SET name=?, uuid=?, sub_token=?, note=?, enabled=?,
                            quota_bytes=?, used_bytes=?, expire_at=?, device_limit=?,
@@ -5581,39 +5617,26 @@ def apply_backup(payload: dict, mode: str = "merge",
                      u["ech_value"], u["obf_cs"], u["obf_fm"],
                      u["reset_days"], u["last_reset"], existing["id"]))
                 stats["users_updated"] += 1
+                user_ids[u["id"]] = existing["id"]
                 continue
             try:
-                conn.execute(
+                token = secrets.token_urlsafe(16) if token_owner else u["sub_token"]
+                cur = conn.execute(
                     """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
                                          used_bytes,expire_at,device_limit,ip_limit,transport,
                                          obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
                                          reset_days,last_reset,created_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (u["name"], u["uuid"], u["sub_token"], u["note"], u["enabled"],
+                    (u["name"], u["uuid"], token, u["note"], u["enabled"],
                      u["quota_bytes"], u["used_bytes"], u["expire_at"],
                      u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
                      u["ech"], u["fp"], u["alpn"],
                      u["ech_value"], u["obf_cs"], u["obf_fm"],
                      u["reset_days"], u["last_reset"], u["created_at"]))
                 stats["users_added"] += 1
+                user_ids[u["id"]] = cur.lastrowid
             except sqlite3.IntegrityError:
-                # sub_token is UNIQUE too; retry once with a fresh one.
-                try:
-                    conn.execute(
-                        """INSERT INTO users(name,uuid,sub_token,note,enabled,quota_bytes,
-                                             used_bytes,expire_at,device_limit,ip_limit,transport,
-                                             obfuscate,ech,fp,alpn,ech_value,obf_cs,obf_fm,
-                                             reset_days,last_reset,created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (u["name"], u["uuid"], secrets.token_urlsafe(16), u["note"],
-                         u["enabled"], u["quota_bytes"], u["used_bytes"], u["expire_at"],
-                         u["device_limit"], u["ip_limit"], u["transport"], u["obfuscate"],
-                         u["ech"], u["fp"], u["alpn"],
-                         u["ech_value"], u["obf_cs"], u["obf_fm"],
-                         u["reset_days"], u["last_reset"], u["created_at"]))
-                    stats["users_added"] += 1
-                except sqlite3.IntegrityError:
-                    stats["users_skipped"] += 1
+                stats["users_skipped"] += 1
 
         for addr, remark, country, enabled, added in cips:
             try:
@@ -5676,7 +5699,9 @@ def apply_backup(payload: dict, mode: str = "merge",
                     if isinstance(candidate, dict) and str(candidate.get("id", "")) == old_active:
                         want = candidate
                         break
-                if want is None and 0 <= idx < len(src) and isinstance(src[idx], dict):
+                has_source_ids = any(isinstance(p, dict) and "id" in p for p in src)
+                if (want is None and not has_source_ids and
+                        0 <= idx < len(src) and isinstance(src[idx], dict)):
                     want = src[idx]
                 if want:
                     cp = _clean_proxy(want)
@@ -5692,16 +5717,30 @@ def apply_backup(payload: dict, mode: str = "merge",
                                 (str(row["id"]),))
                             stats["active_proxy_id"] = row["id"]
 
+        # A legacy backup without user IDs cannot map its traffic rows safely.
         for row in payload.get("traffic_log") or []:
             if not isinstance(row, dict):
+                stats["traffic_skipped"] += 1
                 continue
             try:
-                conn.execute("INSERT INTO traffic_log(user_id,ts,up,down) VALUES(?,?,?,?)",
-                             (int(row["user_id"]), int(row["ts"]),
-                              int(row.get("up", 0)), int(row.get("down", 0))))
-                stats["traffic_rows"] += 1
-            except (KeyError, TypeError, ValueError, sqlite3.Error):
-                pass
+                source_id = int(row["user_id"])
+                if source_id <= 0:
+                    raise ValueError("invalid source user ID")
+                entry = (user_ids[source_id], int(row["ts"]),
+                         int(row.get("up", 0)), int(row.get("down", 0)))
+                if mode == "merge":
+                    cur = conn.execute("""INSERT INTO traffic_log(user_id,ts,up,down)
+                                          SELECT ?,?,?,? WHERE NOT EXISTS (
+                                              SELECT 1 FROM traffic_log
+                                              WHERE user_id=? AND ts=? AND up=? AND down=?
+                                          )""", entry + entry)
+                else:
+                    cur = conn.execute("INSERT INTO traffic_log(user_id,ts,up,down) VALUES(?,?,?,?)",
+                                       entry)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                stats["traffic_skipped"] += 1
+                continue
+            stats["traffic_rows"] += cur.rowcount
 
         conn.commit()
     except HTTPException:
@@ -9344,57 +9383,48 @@ async def subscription(token: str, request: Request):
 
     row = maybe_auto_reset(row)
 
-    # ── HWID device registration gate ──
-    # The device cap is based on a stable client-reported HWID, never an IP/UA pair
-    # or a client-name allowlist (both are trivially spoofable). Human browser pages
-    # remain viewable, but limited accounts do not receive subscription payloads
-    # unless the client supplies a stable HWID and has an available registered slot.
-    _ua = (request.headers.get("user-agent") or "")
-    _qp = request.query_params
-    _html_wanted = ("text/html" in (request.headers.get("accept") or "")
-                    and "mozilla" in _ua.lower())
-    _force_page = _qp.get("page") in ("1", "true")
-    if needs_device_gate(row) and device_gate_on() and not _html_wanted and not _force_page:
-        _hwid = hwid_of(request.headers)
-        if not _hwid:
-            audit("sub-hwid-missing", row["name"], _ua[:80] or "no user-agent")
+    ua = request.headers.get("user-agent") or ""
+    agent = ua.lower()
+    accept = request.headers.get("accept") or ""
+    params = request.query_params
+    force_page = params.get("page") in ("1", "true")
+    force_raw = params.get("raw") in ("1", "true")
+
+    # An explicit format wins over client detection and the browser page.
+    fmt = (params.get("format") or "").strip().lower()
+    if not fmt and not force_raw and not force_page:
+        if any(k in agent for k in ("clash", "mihomo", "stash", "flclash", "verge")):
+            fmt = "clash"
+        elif any(k in agent for k in ("sing-box", "singbox", "hiddify", "karing", "happ")):
+            fmt = "singbox"
+    clash = not force_raw and fmt in ("clash", "meta", "yaml", "yml")
+    singbox = not force_raw and fmt in ("singbox", "sing-box", "json")
+    wants_page = force_page or ("text/html" in accept and "mozilla" in agent)
+    page = wants_page and not (force_raw or clash or singbox)
+
+    # Subscription payloads use persistent client-reported HWID registrations.
+    hwid_mode = device_gate_on()
+    if hwid_mode and not page:
+        hwid = hwid_of(request.headers)
+        if not hwid and needs_device_gate(row):
+            audit("sub-hwid-missing", row["name"], ua[:80] or "no user-agent")
             return device_gate_response(row)
-        _ip = request.client.host if request.client else ""
-        _ok, _count = register_hwid_device(row["id"], _hwid,
-                                           int(row["device_limit"] or 0), _ip, _ua,
-                                           headers=request.headers)
-        if not _ok:
-            audit("sub-hwid-limit", row["name"], "registered=%s limit=%s" %
-                  (_count, row["device_limit"]))
-            return device_gate_response(row)
+        if hwid:
+            ip = request.client.host if request.client else ""
+            allowed, occupied = register_hwid_device(row["id"], hwid, row["device_limit"] or 0,
+                                                    ip, ua, headers=request.headers)
+            if not allowed:
+                audit("sub-hwid-limit", row["name"], "registered=%s limit=%s" %
+                      (occupied, row["device_limit"]))
+                return device_gate_response(row)
 
     d = base_domain(request)
-    lines = build_info_lines(row, d)
-    if user_status(row)[0]:
-        lines += [c["uri"] for c in build_configs(row, d, ips)]
+    if clash:
+        return sub_response_clash(row, d, ips, request)
+    if singbox:
+        return sub_response_singbox(row, d, ips, request)
 
-    # browser? serve the subscription page, clients keep the base64 payload
-    ua = (request.headers.get("user-agent") or "").lower()
-    accept = request.headers.get("accept") or ""
-    force_page = request.query_params.get("page") in ("1", "true")
-    force_raw = request.query_params.get("raw") in ("1", "true")
-
-    # ── container formats: Clash.Meta and sing-box ──
-    # An explicit ?format= wins; otherwise the User-Agent decides, so a client
-    # that was given the plain sub URL still gets a file it can parse.
-    fmt = (request.query_params.get("format") or "").strip().lower()
-    if not fmt and not force_raw and not force_page:
-        if any(k in ua for k in ("clash", "mihomo", "stash", "flclash", "verge")):
-            fmt = "clash"
-        elif any(k in ua for k in ("sing-box", "singbox", "hiddify", "karing", "happ")):
-            fmt = "singbox"
-    if not force_raw:
-        if fmt in ("clash", "meta", "yaml", "yml"):
-            return sub_response_clash(row, d, ips, request)
-        if fmt in ("singbox", "sing-box", "json"):
-            return sub_response_singbox(row, d, ips, request)
-
-    if not force_raw and (force_page or ("text/html" in accept and "mozilla" in ua)):
+    if page:
         ok, reason = user_status(row)
         return HTMLResponse(render_sub_page(
             name=row["name"],
@@ -9407,7 +9437,7 @@ async def subscription(token: str, request: Request):
             status="" if ok else reason,
             transport=row["transport"],
             device_limit=row["device_limit"],
-            devices_now=active_devices(row["id"]),
+            devices_now=device_slots_used(row["id"], hwid_mode),
             ip_limit=row["ip_limit"],
             ips_now=active_ips(row["id"]),
             panel_url=("https" + "://") + origin_domain(request) + "/",
@@ -9415,6 +9445,9 @@ async def subscription(token: str, request: Request):
             last_reset=row["last_reset"],
         ))
 
+    lines = build_info_lines(row, d)
+    if user_status(row)[0]:
+        lines += [c["uri"] for c in build_configs(row, d, ips)]
     body = base64.b64encode("\n".join(lines).encode()).decode()
     headers = _sub_headers(row, request)
     headers["content-type"] = "text/plain; charset=utf-8"
@@ -12186,7 +12219,7 @@ async function paintIps(quiet){
    <span style="width:8px;height:8px;border-radius:50%;background:${x.online?'var(--ok)':(x.counted?'var(--info)':'var(--dim)')}"></span>
    <div style="min-width:0;flex:1">
     <div class="font-bold truncate">${esc(x.label||x.ip)}</div>
-    <div class="text-xs dim mono truncate">${esc([x.client,x.client_version&&('v'+x.client_version),x.platform,x.ip,x.proto].filter(Boolean).join(' · '))}${x.hits?' · '+x.hits+'x':''}</div>
+    <div class="text-xs dim mono truncate">${esc([x.client,x.client_version&&('v'+x.client_version),x.platform,x.ip,x.registered?'HWID':x.proto].filter(Boolean).join(' · '))}${!x.registered&&x.hits?' · '+x.hits+'x':''}</div>
    </div>
    <span class="text-xs dim" title="${esc(x.ua||'')}">${dt(x.last_seen)}</span>
    <button class="icon-btn danger" title="${T('delDevice')}" onclick="delDevice(${ipUid},${x.id})">${ICO.del}</button>
@@ -12311,12 +12344,14 @@ function showEdit(id){
 async function saveEdit(id){
  try{
   const u=users.find(x=>x.id===id);
-  const payload={quota_gb:parseFloat(eQ.value||0),expire_days:parseInt(eD.value||0),
+  const payload={
    reset_days:resolveReset(eR.value,eRCustom.value),
    device_limit:parseInt(eV.value||0),ip_limit:parseInt(eIp.value||0),transport:eT.value,enabled:eE.checked,
    obfuscate:eObf.checked,ech:eEch.checked,
    fp:eFp.value||'unsafe',alpn:eFpAlpn.value,
    ech_value:eEchVal.value.trim(),obf_cs:eObfCs.value.trim(),obf_fm:eObfFm.value.trim()};
+  if(eQ.value!==eQ.defaultValue)payload.quota_gb=parseFloat(eQ.value||0);
+  if(eD.value!==eD.defaultValue)payload.expire_days=parseInt(eD.value||0);
   if(eU.value.trim()&&eU.value.trim()!==u.uuid)payload.uuid=eU.value.trim();
   await api('/api/users/'+id,{method:'PATCH',body:JSON.stringify(payload)});
   closeModal();loadUsers();loadStats();
@@ -12439,12 +12474,13 @@ async function doRestore(){
  try{
   const r=await api('/api/restore',{method:'POST',body:JSON.stringify({
     data:BK,mode,restore_password:bkRestorePw.checked})});
+  const skipped=r.users_skipped+r.proxies_skipped+r.clean_ips_skipped+r.traffic_skipped;
   bkMsg.style.color='var(--ok)';
   bkMsg.textContent=`${T('bkDone')} — ${T('bkUsersN')}: +${r.users_added}/~${r.users_updated}`
    +` · ${T('bkCipsN')}: +${r.clean_ips_added}`
    +` · ${T('bkProxN')}: +${r.proxies_added}/~${r.proxies_updated}`
-   +(r.users_skipped||r.proxies_skipped||r.clean_ips_skipped
-     ?` · ${T('bkSkipped')}: ${r.users_skipped+r.proxies_skipped+r.clean_ips_skipped}`:'');
+   +(r.traffic_rows?` · ${T('bkTrafficN')}: +${r.traffic_rows}`:'')
+   +(skipped?` · ${T('bkSkipped')}: ${skipped}`:'');
   BK=null; bkFile.value=''; bkOpts.classList.add('hidden'); bkPreview.innerHTML='';
   loadUsers(); loadCips(); loadStats(); loadBackupInfo(); loadTelegram();
   if(typeof loadProxies==='function') loadProxies();
