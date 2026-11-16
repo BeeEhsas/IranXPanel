@@ -375,6 +375,8 @@ def set_password(password: str):
     set_setting("password_hash", h)
     set_setting("password_salt", s)
     set_setting("password_set_at", str(now()))
+    # Every session issued before this change stops working.
+    set_setting("session_epoch", secrets.token_hex(8))
 
 
 def verify_password(password: str) -> bool:
@@ -395,18 +397,30 @@ PASSWORD_RULE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$")
 # ────────────────────────────── AUTH ──────────────────────────────
 
 def make_token() -> str:
-    return jwt.encode({"sub": ADMIN_USERNAME, "exp": now() + JWT_TTL, "iat": now()},
+    return jwt.encode({"sub": ADMIN_USERNAME, "exp": now() + JWT_TTL, "iat": now(),
+                       "ep": session_epoch()},
                       SECRET_KEY, algorithm=JWT_ALG)
+
+
+def session_epoch() -> str:
+    """Value every session token carries; rotating it revokes every session at once."""
+    v = get_setting("session_epoch")
+    if not v:
+        v = secrets.token_hex(8)
+        set_setting("session_epoch", v)
+    return v
 
 
 def valid_session(token: Optional[str]) -> bool:
     if not token:
         return False
     try:
-        jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
-        return True
+        data = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
     except Exception:
         return False
+    # A password change rotates the epoch, so every session issued before it is dead:
+    # a token that leaked while the old password was in use cannot outlive the fix.
+    return data.get("ep") == session_epoch()
 
 
 def require_admin(session: Optional[str] = Cookie(default=None)):
@@ -420,6 +434,11 @@ _attempts: dict[str, list[float]] = {}
 
 def rate_limited(ip: str, limit: int = 8, window: int = 300) -> bool:
     t = time.time()
+    # The dict is keyed by client IP, so it only ever grows. Drop expired keys once it
+    # gets big instead of letting a scan fill memory.
+    if len(_attempts) > 4096:
+        for k in [k for k, v in _attempts.items() if not v or t - v[-1] > window]:
+            _attempts.pop(k, None)
     hits = [x for x in _attempts.get(ip, []) if t - x < window]
     hits.append(t)
     _attempts[ip] = hits
@@ -644,7 +663,7 @@ def parse_ua(ua: str) -> tuple[str, str]:
 # The six apps below are the ones that do; everything else either sends one fixed UA for
 # every install (v2rayNG, NekoBox …) or nothing at all (Clash, sing-box, browsers, curl),
 # which makes a per-device cap unenforceable. So when a user has a device limit, the
-# subscription link is only handed to these apps (see device_sub_gate()).
+# subscription link is only handed to these apps when the strict gate is on.
 DEVICE_AWARE_CLIENTS = (
     (r"v2box", "V2Box"),
     (r"v2raytun", "v2rayTun"),
@@ -667,12 +686,14 @@ def device_aware_client(ua: str) -> str:
     return ""
 
 
-def hwid_of(headers) -> str:
+def hwid_of(headers, query: Optional[str] = None) -> str:
     """The device identifier the standards-compliant clients send on subscription
     requests (XTLS subscription standard: x-hwid, x-device-os, x-ver-os,
     x-device-model — v2rayTun since 2.3.5, Happ, v2rayA, Securify …)."""
     # Only stable per-install identifiers count. Device model is shared by many
     # phones and is not an identity; accepting it here lets users evade the cap.
+    # `hwid` as a query parameter is accepted too: it is what a client that cannot set
+    # headers falls back to, and what 3x-ui reads, so links issued for it keep working.
     for h in ("x-hwid", "x-device-id", "x-hardware-id"):
         v = ""
         try:
@@ -681,7 +702,8 @@ def hwid_of(headers) -> str:
             v = ""
         if v:
             return v[:120]
-    return ""
+    v = (query or "").strip()
+    return v[:120] if v else ""
 
 
 def device_gate_on() -> bool:
@@ -692,6 +714,17 @@ def device_gate_on() -> bool:
 def device_gate_traffic() -> bool:
     """Also refuse proxied traffic from apps that cannot be identified (default off)."""
     return (get_setting("device_gate_traffic") or "0") == "1"
+
+
+def device_gate_strict() -> bool:
+    """Refuse a limited subscription when the client reports no device id (default off).
+
+    Off is the 3x-ui behaviour: a client that cannot identify itself is still served and
+    is accounted for by IP + User-Agent, so Clash, sing-box, Hiddify and v2rayNG keep
+    working on limited accounts. On restores the old hard gate, which handed the
+    subscription only to the six apps that send x-hwid.
+    """
+    return (get_setting("device_gate_strict") or "0") == "1"
 
 
 def needs_device_gate(row) -> bool:
@@ -789,13 +822,21 @@ def active_devices(uid: int, window: Optional[int] = None) -> int:
     return r["n"] if r else 0
 
 
-def device_slots_used(uid: int, hwid_mode: bool) -> int:
+def device_slots_used(uid: int, hwid_mode: bool = True) -> int:
+    """Slots one account is using.
+
+    Registered HWIDs are permanent; legacy IP+User-Agent rows expire on the device
+    window. Both count against the same limit: counting them in separate buckets let a
+    user fill every HWID slot and then add unlimited devices through an app that
+    reports no HWID at all, which made the cap meaningless.
+
+    `hwid_mode` is kept for callers that still pass it and no longer changes the count.
+    """
     with db() as c:
-        if hwid_mode:
-            return registered_hwid_count(c, uid)
-        return c.execute("""SELECT COUNT(*) FROM devices
-                            WHERE user_id=? AND last_seen>? AND dkey NOT GLOB 'hwid:*'""",
-                         (uid, now() - DEVICE_WINDOW)).fetchone()[0]
+        return (registered_hwid_count(c, uid)
+                + c.execute("""SELECT COUNT(*) FROM devices
+                               WHERE user_id=? AND last_seen>? AND dkey NOT GLOB 'hwid:*'""",
+                            (uid, now() - DEVICE_WINDOW)).fetchone()[0])
 
 
 def live_devices(uid: int) -> int:
@@ -1432,17 +1473,19 @@ def authorize(uid_str: str, ip: str, proto: str, ua: str = ""):
         return None, reason
     if not transport_allowed(row, proto):
         return None, f"{proto} not allowed"
-    # With HWID registration enabled, never fall back to IP+UA for the device
-    # quota: doing so would create fake identities and make the limit inconsistent.
-    # Proxy transports do not carry subscription HTTP headers, so this layer cannot
-    # cryptographically bind a live tunnel to the registered subscription HWID.
-    if not (needs_device_gate(row) and device_gate_on()):
+    # A live tunnel carries no subscription headers, so this layer cannot bind it to a
+    # registered HWID. Two things it can still do:
+    #   * refuse an app that reports no identity at all, when the admin asked for that
+    #     (device_gate_traffic). The check used to sit inside the branch below, which
+    #     made it unreachable in exactly the configuration it was written for.
+    #   * count IP+User-Agent devices for accounts that never registered an HWID.
+    if needs_device_gate(row) and device_gate_on():
+        if device_gate_traffic() and not device_aware_client(ua or ""):
+            return None, "device not identifiable by this app"
+    else:
         dkey = device_key(ip, ua)
         if not device_allowed(row["id"], dkey, row["device_limit"]):
             return None, "device limit"
-        if (needs_device_gate(row) and device_gate_traffic()
-                and not device_aware_client(ua or "")):
-            return None, "device not identifiable by this app"
         touch_device(row["id"], dkey, ip, ua, proto)
     if not ip_allowed(row["id"], ip, row["ip_limit"]):
         return None, "ip limit"
@@ -1917,7 +1960,8 @@ async def lifespan(app: FastAPI):
         await flush_traffic()
 
 
-app = FastAPI(title=PANEL_TITLE, docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title=PANEL_TITLE, docs_url=None, redoc_url=None, openapi_url=None,
+              lifespan=lifespan)
 
 
 # ── XHTTP plumbing shared by every route variant ──
@@ -2790,7 +2834,7 @@ DEVICE_GATE_HEADER = "x-iranx-device-gate"
 DEVICE_GATE_APPS = tuple(name for _rx, name in DEVICE_AWARE_CLIENTS)
 
 
-def device_gate_response(row) -> PlainTextResponse:
+def device_gate_response(row, occupied: Optional[int] = None) -> PlainTextResponse:
     """403 for a client that cannot identify its device on a limited account.
 
     Deliberately a plain-text body: subscription clients show it verbatim, so the user
@@ -2800,12 +2844,20 @@ def device_gate_response(row) -> PlainTextResponse:
         n = int(row["device_limit"] or 0)
     except (KeyError, IndexError, TypeError):
         n = 0
+    plural = "" if n == 1 else "s"
+    if occupied is None:
+        head = ("This account allows %d device%s. To receive the subscription, "
+                "your client must send a stable x-hwid or x-device-id header."
+                % (n, plural))
+    else:
+        head = ("This account allows %d device%s and %d %s already registered. "
+                "Open the subscription on a registered device, or ask the panel "
+                "admin to remove an old one."
+                % (n, plural, occupied, "is" if occupied == 1 else "are"))
     lines = [
         "IRANX · DEVICE ID REQUIRED",
         "",
-        ("This account allows %d device%s. To receive the subscription, "
-         "your client must send a stable x-hwid or x-device-id header."
-         % (n, "" if n == 1 else "s")),
+        head,
         "",
         "A client name, User-Agent, IP address, or phone model is not enough.",
         "Each accepted HWID is registered and consumes one device slot.",
@@ -4307,6 +4359,7 @@ class DeviceGateIn(BaseModel):
     """Subscription device gate: restrict limited accounts to device-aware apps."""
     gate: Optional[bool] = None
     traffic: Optional[bool] = None
+    strict: Optional[bool] = None
 
 
 class CountryIn(BaseModel):
@@ -4625,8 +4678,9 @@ async def user_ips(uid: int, history: int = 0, _=Depends(require_admin)):
              "label": r["device_name"] or device_label(r["client"], r["platform"], r["ip"]),
              "registered": r["dkey"].startswith("hwid:"),
              "online": r["last_seen"] > live_cut,
-             "counted": (r["dkey"].startswith("hwid:") if hwid_mode else
-                         not r["dkey"].startswith("hwid:") and r["last_seen"] > count_cut)}
+             # Both buckets count against the same limit: a reported HWID is permanent,
+             # an IP+User-Agent row lasts as long as its window.
+             "counted": (r["dkey"].startswith("hwid:") or r["last_seen"] > count_cut)}
             for r in rows
         ],
         "ip_rows": [
@@ -4930,7 +4984,7 @@ async def activate_proxy(pid: int, _=Depends(require_admin)):
 @app.get("/api/device-gate")
 async def get_device_gate(_=Depends(require_admin)):
     return {"ok": True, "gate": device_gate_on(), "traffic": device_gate_traffic(),
-            "apps": list(DEVICE_GATE_APPS)}
+            "strict": device_gate_strict(), "apps": list(DEVICE_GATE_APPS)}
 
 
 @app.post("/api/device-gate")
@@ -4939,9 +4993,12 @@ async def set_device_gate(body: DeviceGateIn, _=Depends(require_admin)):
         set_setting("device_gate", "1" if body.gate else "0")
     if body.traffic is not None:
         set_setting("device_gate_traffic", "1" if body.traffic else "0")
-    audit("device-gate", "", "gate=%s traffic=%s" % (device_gate_on(), device_gate_traffic()))
+    if body.strict is not None:
+        set_setting("device_gate_strict", "1" if body.strict else "0")
+    audit("device-gate", "", "gate=%s traffic=%s strict=%s" %
+          (device_gate_on(), device_gate_traffic(), device_gate_strict()))
     return {"ok": True, "gate": device_gate_on(), "traffic": device_gate_traffic(),
-            "apps": list(DEVICE_GATE_APPS)}
+            "strict": device_gate_strict(), "apps": list(DEVICE_GATE_APPS)}
 
 
 @app.post("/api/proxies/mode")
@@ -5341,6 +5398,10 @@ USER_FIELDS = ("id", "name", "uuid", "sub_token", "note", "enabled", "quota_byte
                "obfuscate", "ech", "fp", "alpn", "ech_value", "obf_cs", "obf_fm",
                "reset_days", "last_reset", "created_at")
 CIP_FIELDS = ("address", "remark", "country", "enabled", "added_at")
+# Registered devices are account state, not cache: restoring a backup used to wipe the
+# table, so every user had to re-register every phone afterwards.
+DEVICE_FIELDS = ("user_id", "dkey", "ip", "ua", "client", "platform", "proto",
+                 "first_seen", "last_seen", "hits", "device_name", "client_version")
 # Health columns are deliberately included: a restore then shows the same list state the
 # old panel had, and the next test run refreshes it anyway.
 PROXY_FIELDS = ("kind", "host", "port", "username", "password", "remark", "country",
@@ -5381,6 +5442,8 @@ def build_backup(include_password: bool = True, include_traffic: bool = False,
         users = [dict(r) for r in c.execute("SELECT * FROM users ORDER BY id")]
         cips = [dict(r) for r in c.execute("SELECT * FROM clean_ips ORDER BY id")]
         proxies = [dict(r) for r in c.execute("SELECT * FROM proxies ORDER BY id")]
+        devices = [dict(r) for r in c.execute(
+            "SELECT " + ",".join(DEVICE_FIELDS) + " FROM devices ORDER BY id")]
         settings = {r["key"]: r["value"] for r in c.execute("SELECT * FROM settings")}
         traffic = ([dict(r) for r in c.execute(
             "SELECT user_id, ts, up, down FROM traffic_log ORDER BY id")]
@@ -5403,6 +5466,7 @@ def build_backup(include_password: bool = True, include_traffic: bool = False,
         "env": current_env(),
         "users": [{k: u[k] for k in USER_FIELDS} for u in users],
         "clean_ips": [{k: ci.get(k) for k in CIP_FIELDS} for ci in cips],
+        "devices": devices,
         "proxies": prox_out,
         "settings": settings,
         "traffic_log": traffic,
@@ -5573,6 +5637,7 @@ def apply_backup(payload: dict, mode: str = "merge",
     stats = {"users_added": 0, "users_updated": 0, "users_skipped": skipped_users,
              "clean_ips_added": 0, "clean_ips_skipped": skipped_cips,
              "proxies_added": 0, "proxies_updated": 0, "proxies_skipped": skipped_proxies,
+             "devices_restored": 0,
              "password_restored": False, "traffic_rows": 0, "traffic_skipped": 0,
              "mode": mode}
     user_ids = {}
@@ -5637,6 +5702,38 @@ def apply_backup(payload: dict, mode: str = "merge",
                 user_ids[u["id"]] = cur.lastrowid
             except sqlite3.IntegrityError:
                 stats["users_skipped"] += 1
+
+        # Registered devices travel with the backup. Old user ids are remapped because a
+        # restore into a live database hands out new ones.
+        def _int(v, default=0):
+            try:
+                return max(0, int(v or default))
+            except (TypeError, ValueError):
+                return default
+
+        for dv in payload.get("devices") or []:
+            if not isinstance(dv, dict):
+                continue
+            dkey = str(dv.get("dkey") or "").strip()[:200]
+            owner = user_ids.get(_int(dv.get("user_id"), -1))
+            if not owner or not dkey:
+                continue
+            try:
+                conn.execute(
+                    """INSERT INTO devices(user_id,dkey,ip,ua,client,platform,proto,
+                                           first_seen,last_seen,hits,device_name,
+                                           client_version)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(user_id,dkey) DO UPDATE SET last_seen=excluded.last_seen""",
+                    (owner, dkey, str(dv.get("ip") or "")[:80], str(dv.get("ua") or "")[:300],
+                     str(dv.get("client") or "")[:40], str(dv.get("platform") or "")[:40],
+                     str(dv.get("proto") or "ws")[:16], _int(dv.get("first_seen")),
+                     _int(dv.get("last_seen")), _int(dv.get("hits"), 1),
+                     str(dv.get("device_name") or "")[:120],
+                     str(dv.get("client_version") or "")[:120]))
+                stats["devices_restored"] += 1
+            except sqlite3.Error:
+                continue
 
         for addr, remark, country, enabled, added in cips:
             try:
@@ -5782,7 +5879,8 @@ async def backup_info(_=Depends(require_admin)):
         ci = c.execute("SELECT COUNT(*) n FROM clean_ips").fetchone()["n"]
         px = c.execute("SELECT COUNT(*) n FROM proxies").fetchone()["n"]
         tl = c.execute("SELECT COUNT(*) n FROM traffic_log").fetchone()["n"]
-    return {"users": u, "clean_ips": ci, "proxies": px, "traffic_rows": tl,
+        dv = c.execute("SELECT COUNT(*) n FROM devices").fetchone()["n"]
+    return {"users": u, "clean_ips": ci, "proxies": px, "traffic_rows": tl, "devices": dv,
             "env": current_env(), "format": BACKUP_FORMAT, "version": BACKUP_VERSION}
 
 
@@ -5799,6 +5897,7 @@ async def restore_preview(body: RestoreIn, _=Depends(require_admin)):
         "users": len(payload.get("users", [])),
         "clean_ips": len(payload.get("clean_ips", [])),
         "proxies": len(prox),
+        "devices": len(payload.get("devices") or []),
         "proxies_with_creds": sum(1 for p in prox
                                   if isinstance(p, dict) and p.get("username")),
         "traffic_rows": len(payload.get("traffic_log") or []),
@@ -6494,10 +6593,6 @@ visual language as the admin panel (3x-ui / Sanaei style), and a Persian/English
 language switch. No new Python dependencies (QR codes come from the built-in
 encoder).
 """
-
-import html
-import json
-import time
 
 qr_svg = svg
 
@@ -9402,21 +9497,35 @@ async def subscription(token: str, request: Request):
     wants_page = force_page or ("text/html" in accept and "mozilla" in agent)
     page = wants_page and not (force_raw or clash or singbox)
 
-    # Subscription payloads use persistent client-reported HWID registrations.
-    hwid_mode = device_gate_on()
-    if hwid_mode and not page:
-        hwid = hwid_of(request.headers)
-        if not hwid and needs_device_gate(row):
-            audit("sub-hwid-missing", row["name"], ua[:80] or "no user-agent")
-            return device_gate_response(row)
+    # Device limit. A client that reports an HWID (x-hwid header or ?hwid=) gets a
+    # durable slot on this subscription; one that reports nothing falls back to
+    # IP+User-Agent accounting, so Clash, sing-box, Hiddify and v2rayNG keep working
+    # on limited accounts — the 3x-ui behaviour. The browser page only ever registers
+    # a reported HWID: refusing the portal itself would leave a user with no way to
+    # read their own quota.
+    ok, reason = user_status(row)
+    hwid_mode = needs_device_gate(row) and device_gate_on()
+    if hwid_mode:
+        ip = client_ip(request)
+        hwid = hwid_of(request.headers, params.get("hwid"))
         if hwid:
-            ip = request.client.host if request.client else ""
-            allowed, occupied = register_hwid_device(row["id"], hwid, row["device_limit"] or 0,
-                                                    ip, ua, headers=request.headers)
-            if not allowed:
-                audit("sub-hwid-limit", row["name"], "registered=%s limit=%s" %
-                      (occupied, row["device_limit"]))
+            if ok:                     # an expired or disabled account takes no slot
+                allowed, occupied = register_hwid_device(
+                    row["id"], hwid, row["device_limit"] or 0, ip, ua,
+                    headers=request.headers)
+                if not allowed:
+                    audit("sub-hwid-limit", row["name"], "registered=%s limit=%s" %
+                          (occupied, row["device_limit"]))
+                    return device_gate_response(row, occupied)
+        elif not page:
+            if device_gate_strict():
+                audit("sub-hwid-missing", row["name"], ua[:80] or "no user-agent")
                 return device_gate_response(row)
+            dkey = device_key(ip, ua)
+            if not device_allowed(row["id"], dkey, row["device_limit"]):
+                audit("sub-device-limit", row["name"], ua[:80] or "no user-agent")
+                return device_gate_response(row, device_slots_used(row["id"]))
+            touch_device(row["id"], dkey, ip, ua, "sub")
 
     d = base_domain(request)
     if clash:
@@ -9425,7 +9534,6 @@ async def subscription(token: str, request: Request):
         return sub_response_singbox(row, d, ips, request)
 
     if page:
-        ok, reason = user_status(row)
         return HTMLResponse(render_sub_page(
             name=row["name"],
             sub_link=("https" + "://") + d + "/sub/" + row["sub_token"],
@@ -9446,7 +9554,7 @@ async def subscription(token: str, request: Request):
         ))
 
     lines = build_info_lines(row, d)
-    if user_status(row)[0]:
+    if ok:
         lines += [c["uri"] for c in build_configs(row, d, ips)]
     body = base64.b64encode("\n".join(lines).encode()).decode()
     headers = _sub_headers(row, request)
@@ -10370,10 +10478,12 @@ const I18N={
   unitBytes:'bytes',loadingLbl:'Loading…',noLive:'No live connections',
   phDash:'Live server, user and traffic overview',  phUsers:'Create, edit and monitor accounts',  phClean:'IPs that go into the subscription link',  phFilter:'Blocked and allowed domains',  phProxy:'Proxy pool and auto selection',  phLive:'Connections open right now',  phTgweb:'Build and manage Telegram web proxies',  phSettings:'Appearance, password, backup and server',  phLogs:'Latest panel events',  refreshLbl:'Refresh',  tabBasic:'Basics',  tabLimits:'Limits',  tabSecurity:'Security',  viewAll:'All',  r24:'24h',  cancel:'Cancel',  statHintUsers:'accounts',  statHintOnline:'online now',  statHintDev:'active devices',  statHintBytes:'since start',  statHintCip:'in subscription',  statHintLive:'live sessions',  zeroInfShort:'0 means unlimited.',  moreLbl:'Details',  noResult:'Nothing found',
   devGateTitle:'Device limit',
-  devGateSub:'A device limit only works when the panel can tell devices apart, which needs an app that reports its identity. With a limit above 0, the subscription link is handed out only to the apps below; everything else is refused. Accounts with 0 (unlimited) are never restricted.',
-  devGateOn:'Only device-aware apps may add limited subscriptions',
+  devGateSub:'Above 0, the panel remembers the device id every client reports and hands out one slot per device. A device it has never seen gets the subscription only while a slot is free; a device it already knows always does. Accounts with 0 (unlimited) are never restricted.',
+  devGateOn:'Enforce the device limit on limited subscriptions',
   devGateTraffic:'Also refuse proxy traffic from those apps',
   devGateTrafficHint:'Off by default. Turning it on blocks apps that copy configs by hand instead of using the subscription link.',
+  devGateStrict:'Refuse limited subscriptions from apps that report no device id',
+  devGateStrictHint:'Off by default, which is how 3x-ui behaves: a client that cannot report an HWID still receives the subscription and is counted by IP + User-Agent. Turn it on to hand limited links only to the apps listed below.',
   devGateApps:'Accepted apps',
   devLimitHint:'0 = any app. 1 or more = only V2Box, v2rayTun, Happ, Incy, Shadowrocket and Streisand can add this link, because only they report the device.',
   setupTitle:'Set a password',setupSub:'First run — choose your panel password',
@@ -11176,6 +11286,10 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark"><hea
      <input type="checkbox" id="dgTraffic" style="margin-top:3px">
      <span data-t="devGateTraffic"></span></label>
     <p class="text-xs dim" style="margin:0" data-t="devGateTrafficHint"></p>
+    <label class="flex items-start gap-2 text-sm" style="cursor:pointer">
+     <input type="checkbox" id="dgStrict" style="margin-top:3px">
+     <span data-t="devGateStrict"></span></label>
+    <p class="text-xs dim" style="margin:0" data-t="devGateStrictHint"></p>
     <div>
      <p class="text-xs dim" style="margin:0 0 6px" data-t="devGateApps"></p>
      <div id="dgApps" class="flex flex-wrap gap-2 text-sm"></div>
@@ -11402,22 +11516,25 @@ async function logout(){await fetch('/api/logout',{method:'POST'});location.href
 /* ── device gate (settings card) ── */
 async function loadDeviceGate(){
  const on=document.getElementById('dgOn'), tr=document.getElementById('dgTraffic'),
-       box=document.getElementById('dgApps');
+       st=document.getElementById('dgStrict'), box=document.getElementById('dgApps');
  if(!on)return;
  try{
   const r=await api('/api/device-gate');
   on.checked=!!r.gate; tr.checked=!!r.traffic;
+  if(st) st.checked=!!r.strict;
   if(box) box.innerHTML=(r.apps||[]).map(a=>`<span class="chip teal">${esc(a)}</span>`).join('');
  }catch(e){}
 }
 async function saveDeviceGate(){
- const on=document.getElementById('dgOn'), tr=document.getElementById('dgTraffic');
+ const on=document.getElementById('dgOn'), tr=document.getElementById('dgTraffic'),
+       st=document.getElementById('dgStrict');
  try{ await api('/api/device-gate',{method:'POST',
-   body:JSON.stringify({gate:on.checked,traffic:tr.checked})}); }
+   body:JSON.stringify({gate:on.checked,traffic:tr.checked,
+                        strict:!!(st&&st.checked)})}); }
  catch(e){}
 }
 document.addEventListener('change',e=>{
- if(e.target&&(e.target.id==='dgOn'||e.target.id==='dgTraffic')) saveDeviceGate();
+ if(e.target&&(e.target.id==='dgOn'||e.target.id==='dgTraffic'||e.target.id==='dgStrict')) saveDeviceGate();
 });
 
 function syncSelects(){
