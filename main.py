@@ -559,17 +559,23 @@ def user_status(row) -> tuple[bool, str]:
 def apply_auto_reset(uid: int, reset_days: int, last_reset: int) -> bool:
     """Zero a user's usage counter once its reset cycle has fully elapsed.
 
-    reset_days == 0 means the feature is off for that user. last_reset is the
-    anchor of the current cycle (set when the cycle is chosen or the usage is
-    reset by hand), so a 30-day cycle always starts on the day it was enabled.
+    reset_days == 0 means the feature is off for that user. The cycle anchor is
+    always re-read from the DB rather than trusting the caller's snapshot, so a
+    stale row (from the hourly sweep) can't double-fire and wipe usage that was
+    accrued after the last reset. last_reset is only the initial anchor.
     """
     try:
         reset_days = int(reset_days or 0)
-        last_reset = int(last_reset or 0)
+        int(last_reset or 0)
     except (TypeError, ValueError):
         return False
     if reset_days <= 0:
         return False
+    with db() as c:
+        row = c.execute("SELECT last_reset FROM users WHERE id=?", (uid,)).fetchone()
+    if row is None:
+        return False
+    last_reset = int(row["last_reset"] or 0)
     if not last_reset:                     # safety net: start the first cycle now
         with db() as c:
             c.execute("UPDATE users SET last_reset=? WHERE id=?", (now(), uid))
@@ -2385,7 +2391,6 @@ COUNTRY_WORDS = {
     "lithuania": "LT", "latvia": "LV", "estonia": "EE", "ireland": "IE", "\u0627\u06cc\u0631\u0644\u0646\u062f": "IE",
     "ukraine": "UA", "\u0627\u0648\u06a9\u0631\u0627\u06cc\u0646": "UA", "kazakhstan": "KZ", "\u0642\u0632\u0627\u0642\u0633\u062a\u0627\u0646": "KZ",
     "hongkong": "HK", "hong kong": "HK", "\u0647\u0646\u06af\u200c\u06a9\u0646\u06af": "HK",
-    "cloudflare": "", "cdn": "",
     # Iranian carriers and cities: clean-IP remarks are usually written in Persian
     "\u0627\u06cc\u0631\u0627\u0646\u0633\u0644": "IR", "\u0647\u0645\u0631\u0627\u0647 \u0627\u0648\u0644": "IR",
     "\u0647\u0645\u0631\u0627\u0647\u0627\u0648\u0644": "IR", "\u0631\u0627\u06cc\u062a\u0644": "IR",
@@ -2402,7 +2407,7 @@ COUNTRY_WORDS = {
     "moscow": "RU", "almaty": "KZ", "tbilisi": "GE", "yerevan": "AM", "baku": "AZ",
     "istanbul": "TR", "ankara": "TR", "tel aviv": "IL", "riyadh": "SA", "jeddah": "SA",
     "dubai": "AE", "doha": "QA", "muscat": "OM", "kuwait": "KW", "manama": "BH",
-    "amman": "JO", "beirut": "LB", "cairo": "EG", "casemate": "MA", "tunis": "TN",
+    "amman": "JO", "beirut": "LB", "cairo": "EG", "casablanca": "MA", "tunis": "TN",
     "mumbai": "IN", "delhi": "IN", "karachi": "PK", "dhaka": "BD", "colombo": "LK",
     "kathmandu": "NP", "jakarta": "ID", "kuala lumpur": "MY", "bangkok": "TH",
     "hanoi": "VN", "manila": "PH", "hong kong": "HK", "taipei": "TW", "seoul": "KR",
@@ -2419,13 +2424,12 @@ def flag_of(code: str) -> str:
     """ISO alpha-2 -> flag emoji.
 
     Maps each A-Z letter to its Regional Indicator Symbol (U+1F1E6..U+1F1FF),
-    so "DE" becomes the German flag glyph. Falls back to the bare two-letter
-    code when the input is not a clean alpha-2 (e.g. unknown or empty).
+    so "DE" becomes the German flag glyph. Returns an empty string when the input is not a clean alpha-2 (e.g. unknown or empty).
     """
-    c = re.sub(r"[^A-Za-z]", "", code or "")[:2].upper()
-    if len(c) != 2:
+    c = (code or "").strip()
+    if not re.fullmatch(r"[A-Za-z]{2}", c):
         return ""
-    return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in c)
+    return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in c.upper())
 
 
 def guess_country(text: str) -> str:
