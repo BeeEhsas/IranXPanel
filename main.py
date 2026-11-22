@@ -4425,8 +4425,9 @@ async def api_setup(body: SetupIn, request: Request):
     set_password(body.password)
     audit("setup", client_ip(request))
     resp = JSONResponse({"ok": True})
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     resp.set_cookie("session", make_token(), httponly=True, samesite="lax",
-                    secure=True, max_age=JWT_TTL)
+                    secure=(scheme == "https"), max_age=JWT_TTL)
     return resp
 
 
@@ -4443,8 +4444,9 @@ async def api_login(body: LoginIn, request: Request):
         raise HTTPException(401, "wrong password")
     audit("login_ok", ip)
     resp = JSONResponse({"ok": True})
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     resp.set_cookie("session", make_token(), httponly=True, samesite="lax",
-                    secure=True, max_age=JWT_TTL)
+                    secure=(scheme == "https"), max_age=JWT_TTL)
     return resp
 
 
@@ -9694,6 +9696,8 @@ html[lang="fa"] b,html[lang="fa"] strong{font-weight:600}
 .g3{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}
 .g4{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.dash-split{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:14px}
+.dash-split>.card{min-width:0}
 
 /* ───────── shell: topbar ───────── */
 .appbar{
@@ -10033,7 +10037,7 @@ label>input[type="checkbox"]+span{font-size:12.5px;color:var(--tx2)}
 }
 @media(max-width:900px){
   .g4{grid-template-columns:repeat(2,1fr)}
-  .g3,.g2,.row2{grid-template-columns:1fr}
+  .g3,.g2,.row2,.dash-split{grid-template-columns:1fr}
   .path-pill{display:none}
 }
 @media(max-width:640px){
@@ -10890,7 +10894,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark"><hea
     </div>
    </div>
 
-   <div class="g a" style="display:grid;grid-template-columns:1.6fr 1fr;gap:14px;margin-bottom:14px">
+   <div class="g a dash-split" style="margin-bottom:14px">
     <div class="card">
      <div class="card-head">
       <svg class="ic" viewBox="0 0 24 24" style="width:15px;height:15px;stroke:var(--acid);fill:none;stroke-width:1.8"
@@ -11595,6 +11599,7 @@ window.rerender=()=>{paintStatic();go(PAGE);renderUsers();renderCips();
 
 /* ─── charts / dashboard ─── */
 function paintChart(){
+ if(typeof Chart==='undefined')return;
  const cs=getComputedStyle(document.body);
  const c1=cs.getPropertyValue('--a1').trim()||'#008771';
  const grid=cs.getPropertyValue('--line').trim()||'#2c3950';
@@ -12140,6 +12145,7 @@ async function saveTgweb(id){
 }
 /* while any platform build is in flight, refresh the list every 5 s */
 setInterval(()=>{
+ if(document.hidden)return;
  const busy=(tgwebs||[]).some(u=>u.platform!=='external'
    &&(!u.deploy_state||u.deploy_state==='building'));
  if(busy&&!document.querySelector('[data-pg="tgweb"]').classList.contains('hidden'))
@@ -12327,7 +12333,7 @@ async function showIps(id){
  ipUid=id; ipHistory=false;
  await paintIps();
  clearInterval(ipTimer);
- ipTimer=setInterval(()=>{ if(!modal.classList.contains('hidden')&&ipUid) paintIps(true); },5000);
+ ipTimer=setInterval(()=>{ if(!document.hidden&&!modal.classList.contains('hidden')&&ipUid) paintIps(true); },5000);
 }
 
 async function paintIps(quiet){
@@ -12898,7 +12904,8 @@ paintStatic(); syncSelects(); genSecret(true); tgPickPlatform('render');
 go(PAGE);
 loadStats();loadUsers();loadCips();loadMainCountry();loadProxies();
 loadTgSettings();loadTgweb();loadTgRegions();
-setInterval(()=>{loadStats();if(PAGE==='users')loadUsers()},15000);
+setInterval(()=>{if(document.hidden)return;loadStats();if(PAGE==='users')loadUsers()},30000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){loadStats();if(PAGE==='users')loadUsers()}});
 </script></body></html>"""
 
 LOGO_B64 = (
