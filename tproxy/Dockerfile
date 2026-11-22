@@ -1,4 +1,4 @@
-# IranXPanel — Telegram WEB-proxy endpoint (one container, Render/Railway ready).
+# Telegram WEB-proxy endpoint (one container, Render/Railway ready).
 #
 # What runs inside:
 #   * the official telegramdesktop/tproxy-server relay (the WEB-proxy half Telegram

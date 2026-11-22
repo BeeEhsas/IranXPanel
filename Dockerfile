@@ -1,7 +1,7 @@
-# IranX Panel — container image
-# Build & push once, then any Railway account can deploy it without GitHub:
-#   docker build -t youruser/iranx-panel:latest .
-#   docker push youruser/iranx-panel:latest
+# Container image for the single-file panel.
+# Build and push once, then any Railway account can deploy it without a repo:
+#   docker build -t youruser/webapp:latest .
+#   docker push youruser/webapp:latest
 
 FROM python:3.12-slim
 
@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-# Railway injects $PORT at runtime
+# The hosting platform injects $PORT at runtime
 ENV PORT=8080
 EXPOSE 8080
 

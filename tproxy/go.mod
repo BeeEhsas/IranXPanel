@@ -1,3 +1,3 @@
-module iranxpanel/tproxy-edge
+module webapp/tproxy-edge
 
 go 1.20

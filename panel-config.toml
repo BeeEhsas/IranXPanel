@@ -1,24 +1,23 @@
 # ─────────────────────────────────────────────
-#  IranX Panel — environment variable reference
-#  Set these in Railway → Variables tab
+#  Environment variable reference
+#  Set these in the hosting platform → Variables tab
 # ─────────────────────────────────────────────
-# The panel username is always "admin" and is never asked for.
+# The username is always "admin" and is never asked for.
 # The password is chosen on your first visit to the panel.
 
 [required]
-SECRET_KEY = "long_random_string_here"  # signs the JWT session cookie
+SECRET_KEY = "long_random_string_here"  # signs the session cookie — and seeds the cover key
 DOMAIN     = "your-app.up.railway.app"  # public domain, no https://
 
 [transports]
-WS_PATH    = "ws"   # path for VLESS + WebSocket + TLS
-XHTTP_PATH = "xh"   # path for VLESS + XHTTP + TLS  (must differ from WS_PATH)
+WS_PATH    = "ws"   # path of the first inbound
+XHTTP_PATH = "xh"   # path of the second inbound  (must differ from WS_PATH)
 
-# Uplink shape advertised in generated XHTTP configs. The server always accepts both,
+# Uplink shape advertised in the generated links. The server always accepts both,
 # so changing this never breaks links that are already out there.
 #   stream-up   one long-lived POST carries the whole uplink → 2 requests per connection
 #   packet-up   one POST per upload chunk → hundreds of requests a minute per client
-# Behind a Cloudflare Worker relay, packet-up is what drains the daily request quota.
-# WS is cheaper still: 1 request per connection, however long it lasts.
+# Behind a metered relay, packet-up is what drains the daily request quota.
 XHTTP_MODE = "stream-up"
 
 [optional]
@@ -26,30 +25,42 @@ ADMIN_PASSWORD = ""              # pre-seed the password, skips the setup page
 DB_PATH        = "/tmp/panel.db" # use /data/panel.db with a persistent volume
 DEVICE_WINDOW  = "300"           # seconds an IP counts as an active device
 LIVE_WINDOW    = "60"            # seconds an IP shows as "connected right now"
-SESSION_IDLE   = "90"            # seconds before a DETACHED XHTTP session is dropped
-                                 # (a session with its uplink/downlink still attached is
-                                 #  never reaped, so long-lived stream-up tunnels survive)
-PANEL_TITLE    = "IranX Panel"
+SESSION_IDLE   = "90"            # seconds before a DETACHED session is dropped
+PANEL_TITLE    = "Panel"
+
+[cover]
+# The decoy cover site: while it is up every public path answers with a small
+# random website instead of the panel UI. The proxy inbounds, the subscription
+# links and /healthz keep working; /api/* answers 404 until the cover is lifted.
+# The unlock path is printed at start-up ("Panel unlock path: /xxxxxxxxxxxx").
+COVER_MODE   = "1"     # "0" to serve the panel on every path
+COVER_KEY    = ""      # the unlock path — default: derived from SECRET_KEY
+COVER_REVEAL = "0"     # seconds after boot at which the cover lifts itself
+COVER_BRAND  = ""      # pin the cover site name
+COVER_SEED   = ""      # pin the random seed (same seed → same site)
 
 [relay]
-# If the host's own domain is unreachable from some networks, put a relay in front
-# (e.g. a Cloudflare Worker that proxies to this panel). The panel keeps running on
-# DOMAIN, but every config and subscription link it hands out points at RELAY_DOMAIN.
-# Leave empty when there is no relay.
+# If the host's own domain is unreachable from some networks, put a relay in front.
+# The panel keeps running on DOMAIN, but every config and subscription link it
+# hands out points at RELAY_DOMAIN. Leave empty when there is no relay.
 RELAY_DOMAIN = ""
 
+# A relay is billed per request. WS costs 1 request for the whole life of a
+# tunnel, XHTTP at least 2, and packet-up one per uploaded chunk — so with a
+# relay configured, new accounts default to WS. Set RELAY_LOW_COST = "0" to keep
+# the old "both" default.
+RELAY_LOW_COST = "1"
+
 [keepalive]
-# Only for hosts that idle a service out — Render's free plan sleeps after ~15 minutes.
+# Only for hosts that idle a service out — a free plan may sleep it after ~15 min.
 # The service pings its own public /healthz so the platform sees inbound traffic.
-# READ THIS FIRST: it burns your free instance hours (24/7 is ~730 of Render's 750 per
-# month) and it does NOT protect the database — a redeploy or a platform restart still
-# wipes /tmp. For anything real, use Railway with a volume instead.
-# Requires DOMAIN to be set correctly.
+# READ THIS FIRST: it burns your free instance hours and it does NOT protect the
+# database — a redeploy or a platform restart still wipes /tmp.
 KEEPALIVE         = "0"    # "1" to enable
 KEEPALIVE_MINUTES = "10"   # ping interval; must be under the host's idle timeout
 
 [telegram_backup]
-# Off-site backup: the panel sends a full .ixpbak file to a Telegram chat.
+# Off-site backup: the panel sends a full backup file to a Telegram chat.
 # Prefer setting these in Panel → Settings → Telegram backup (stored in SQLite);
 # these environment variables are a fallback and work without touching the UI.
 #   * Bot token: create a bot with @BotFather

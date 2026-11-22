@@ -1,7 +1,7 @@
 {
-  "name": "iranx-panel",
-  "version": "4.0.0",
-  "description": "IranX Panel for Cloudflare Workers and D1",
+  "name": "webapp",
+  "version": "1.0.0",
+  "description": "Single-file panel with a decoy cover site",
   "type": "module",
   "main": "cloudflare/src/index.js",
   "scripts": {
@@ -10,7 +10,8 @@
     "dev": "wrangler dev --config cloudflare/wrangler.jsonc",
     "deploy": "wrangler deploy --config cloudflare/wrangler.jsonc",
     "build:deployer": "node cloudflare/deployer/build.mjs",
-    "package": "npm run test && npm run build:deployer"
+    "package": "npm run test && npm run build:deployer",
+    "cover": "python3 cover_site.py --out ./site"
   },
   "keywords": [],
   "author": "",

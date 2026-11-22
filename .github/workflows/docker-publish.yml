@@ -1,12 +1,14 @@
-# Publishes IranX Panel as a public container image on GitHub's own registry (GHCR).
+# Publishes the panel as a container image on GitHub's own registry (GHCR).
 #
-# Why: Railway can create a service straight from a public image, and unlike a repo
-# source that needs no GitHub connection on the *user's* Railway account. This is what
-# lets the deployer install the panel for anyone.
+# Why: a hosting platform can create a service straight from a public image, and
+# unlike a repo source that needs no account integration on the *user's* side.
 #
 # Runs entirely on GitHub — nothing to install locally.
 # After the first successful run, make the package public once:
-#   your profile → Packages → iranxpanel → Package settings → Change visibility → Public
+#   your profile → Packages → <package> → Package settings → Change visibility → Public
+#
+# The image name comes from the repository variable CONTAINER_NAME; without it the
+# repository name is used, which is what the deployer Worker points at.
 
 name: Publish container image
 
@@ -22,7 +24,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ vars.CONTAINER_NAME || github.event.repository.name }}
 
 jobs:
   build:
@@ -64,7 +66,7 @@ jobs:
         run: |
           echo "### Image published :rocket:" >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo 'Set this as `PANEL_IMAGE` in your Cloudflare Worker:' >> $GITHUB_STEP_SUMMARY
+          echo 'Set this as the image reference in your deployer:' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo '${{ env.REGISTRY }}/${{ steps.name.outputs.value }}:latest' >> $GITHUB_STEP_SUMMARY

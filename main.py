@@ -1,5 +1,5 @@
 """
-IranX Panel v3  —  VLESS over WebSocket+TLS  and  VLESS over XHTTP+TLS
+Single-file FastAPI panel  —  WebSocket and HTTP transports (v3)
 ----------------------------------------------------------------------
 Single-file FastAPI panel.  Deploy on Railway / Render / any ASGI host.
 
@@ -39,6 +39,8 @@ import base64
 import asyncio
 import hashlib
 import gzip
+import hmac
+import random
 import secrets
 import struct
 import socket
@@ -75,7 +77,7 @@ RELAY_DOMAIN   = os.getenv("RELAY_DOMAIN", "").replace("https://", "").replace("
 DB_PATH        = os.getenv("DB_PATH", "/data/panel.db" if os.path.isdir("/data") else "/tmp/panel.db")
 WS_PATH        = os.getenv("WS_PATH", "ws").strip("/")
 XHTTP_PATH     = os.getenv("XHTTP_PATH", "xh").strip("/")
-PANEL_TITLE    = os.getenv("PANEL_TITLE", "IranX Panel")
+PANEL_TITLE    = os.getenv("PANEL_TITLE", "Panel")
 BOOTSTRAP_PASS = os.getenv("ADMIN_PASSWORD", "")
 
 DEVICE_WINDOW  = int(os.getenv("DEVICE_WINDOW", "300"))   # counts toward the device limit
@@ -104,6 +106,225 @@ if XHTTP_MODE not in XHTTP_MODES:
 
 # Transports whose request count scales with traffic rather than with connections.
 COSTLY_TRANSPORTS = ("xhttp", "both")
+
+# ─────────────────────── COVER SITE (decoy front) ───────────────────────
+# A deployed panel should look like an ordinary small website: while the cover is
+# locked every public path answers with a small random site instead of the admin
+# UI. The proxy inbounds (WS / XHTTP), the subscription links, the flag SVGs and
+# /healthz stay reachable the whole time, so clients are never disturbed.
+#
+#   COVER_MODE=1|0      cover on / off                              (default 1)
+#   COVER_KEY=<secret>  the unlock path segment                      (default: derived from SECRET_KEY)
+#   COVER_REVEAL=<sec>  lift the cover N seconds after boot          (default 0 = only the key lifts it)
+#   COVER_BRAND=<text>  pin the cover site name
+#   COVER_SEED=<text>   pin the random seed (same seed → same site)
+#
+# Unlocking: open  /<COVER_KEY>  once — a long-lived cookie is set and the panel
+# answers normally from then on.
+COVER_MODE   = os.getenv("COVER_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+try:
+    COVER_REVEAL = max(0.0, float(os.getenv("COVER_REVEAL", "0") or 0))
+except ValueError:
+    COVER_REVEAL = 0.0
+COVER_SEED   = os.getenv("COVER_SEED", "").strip() or SECRET_KEY
+COVER_BRAND  = os.getenv("COVER_BRAND", "").strip()
+COVER_START  = time.time()
+COVER_COOKIE = "cv"
+
+# A relay in front (a Cloudflare Worker, say) is billed per request. WS costs one
+# request for the whole life of a tunnel, XHTTP costs at least two and packet-up
+# costs one per uploaded chunk — hundreds a minute per client. With a relay
+# configured, new accounts therefore start on WS unless RELAY_LOW_COST=0.
+RELAY_LOW_COST = (os.getenv("RELAY_LOW_COST", "").strip().lower() != "0") and bool(RELAY_DOMAIN)
+DEFAULT_TRANSPORT = "ws" if RELAY_LOW_COST else "both"
+
+
+def _cover_key() -> str:
+    """The secret path segment that lifts the cover. Derived from SECRET_KEY, so it
+    is stable across restarts as long as SECRET_KEY is set (it is required anyway)."""
+    return os.getenv("COVER_KEY", "").strip() or hashlib.sha256(
+        ("cover|" + SECRET_KEY).encode()).hexdigest()[:12]
+
+
+def _cover_token() -> str:
+    return hmac.new(SECRET_KEY.encode(), b"cover-unlock", hashlib.sha256).hexdigest()
+
+
+# ── the random site ─────────────────────────────────────────────────────────
+
+_COVER_A = ["Lumen", "North", "Cedar", "Atlas", "Kite", "Verde", "Solace", "Harbor",
+            "Ember", "Quill", "Aster", "Nimbus", "Onyx", "Willow", "Copper", "Fable",
+            "Beacon", "Cobalt", "Marlow", "Rowan", "Sable", "Terra", "Vela", "Wren"]
+_COVER_B = ["Atelier", "Studio", "Works", "Collective", "Labs", "Design", "Supply",
+            "Press", "Roasters", "Gallery", "Type Foundry", "Craft", "House"]
+_COVER_TAG = ["Small things, made carefully", "Slow work for everyday use",
+              "A workshop, not a factory", "Objects with a long life",
+              "Quiet design, honest materials", "Made to order, shipped weekly"]
+_COVER_CITY = ["Lisbon", "Porto", "Tbilisi", "Istanbul", "Athens", "Tallinn",
+               "Ljubljana", "Brno", "Bergen", "Taipei", "Melbourne", "Trieste",
+               "Valencia", "Cape Town", "Kyoto", "Utrecht"]
+_COVER_STREET = ["Rua do Norte", "Kastanienallee", "Rue Basse", "Södergatan",
+                 "Kerkstraat", "Via Roma", "Molenweg", "Harju mnt"]
+_COVER_SVC = [
+    ("Brand identity", "Naming, marks and a type system that survives contact with the real world."),
+    ("Web design", "Small, fast pages that finish loading before the visitor changes their mind."),
+    ("Print & packaging", "Posters, cards and boxes, printed locally and delivered flat."),
+    ("Ceramics", "Wheel-thrown pieces fired in small batches; every one is a little different."),
+    ("Coffee & tea", "Single-origin beans, ground to order, dispatched every Tuesday."),
+    ("Repairs", "Fixing what you already own before replacing it. Diagnostics on the house."),
+    ("Photography", "Editorial and product work, on film and digital."),
+    ("Consulting", "Two-hour sessions that end with a written plan instead of a slide deck."),
+]
+_COVER_ABOUT = [
+    "We started in a rented room with a single workbench and have stayed small on purpose. "
+    "Everything that leaves the shop passes through the same pair of hands.",
+    "The work is slow and the queue is short. We take on a limited number of projects each "
+    "season, so nothing leaves half-finished.",
+    "Much of what we make comes back for a second visit, which tells us more than any review.",
+]
+_COVER_CSS = """
+:root{--bg:#fbfaf8;--fg:#1b1b1f;--dim:#6b6b74;--line:#e6e3dd;--card:#fff;--acc:%s;--acc2:%s}
+@media (prefers-color-scheme:dark){:root{--bg:#121316;--fg:#ececed;--dim:#9a9aa4;--line:#26262b;--card:#181a1e;--acc:%s;--acc2:%s}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.wrap{max-width:960px;margin:0 auto;padding:0 22px}
+header{border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:5}
+header .wrap{display:flex;align-items:center;gap:20px;height:62px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.01em;margin-right:auto}
+.mark{width:28px;height:28px;border-radius:8px;background:var(--acc);color:#fff;display:grid;place-items:center;font-size:13px;font-weight:700}
+nav a{color:var(--dim);text-decoration:none;font-size:14.5px;margin-left:18px}
+nav a:hover{color:var(--fg)}
+h1{font-size:clamp(30px,5vw,46px);line-height:1.12;letter-spacing:-.02em;margin:0 0 16px}
+h2{font-size:22px;letter-spacing:-.01em;margin:52px 0 14px}
+p{color:var(--dim);margin:0 0 16px}
+.hero{padding:78px 0 26px}
+.hero p{max-width:56ch}
+.btn{display:inline-block;margin-top:12px;padding:11px 20px;border-radius:10px;background:var(--acc);color:#fff;text-decoration:none;font-size:15px;font-weight:550}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.card h3{margin:0 0 6px;font-size:16px}
+.card p{margin:0;font-size:14.5px}
+.list{list-style:none;padding:0;margin:0}
+.list li{display:flex;gap:12px;padding:11px 0;border-bottom:1px solid var(--line);font-size:15px}
+.list li span{color:var(--dim);min-width:96px;font-size:13.5px}
+footer{border-top:1px solid var(--line);margin-top:64px;padding:24px 0;color:var(--dim);font-size:13.5px}
+.kicker{color:var(--acc2);font-size:13px;letter-spacing:.09em;text-transform:uppercase;font-weight:600}
+@media (max-width:640px){nav a{margin-left:12px;font-size:13.5px}.hero{padding:52px 0 18px}}
+"""
+
+
+def _cover_site() -> dict:
+    """Build a small, self-contained random website: a brand, a palette, a handful of
+    pages and plausible contact details. Everything is inline — no external fonts,
+    no scripts, no third-party requests — so the page stays a few kilobytes."""
+    rnd = random.Random(int(hashlib.sha256(COVER_SEED.encode()).hexdigest()[:16], 16))
+    brand = COVER_BRAND or ("%s %s" % (rnd.choice(_COVER_A), rnd.choice(_COVER_B)))
+    city = rnd.choice(_COVER_CITY)
+    hue = rnd.randint(0, 359)
+    hue2 = (hue + rnd.randint(120, 220)) % 360
+    acc = "hsl(%d 58%% 42%%)" % hue
+    acc2 = "hsl(%d 62%% 46%%)" % hue2
+    css = _COVER_CSS % (acc, acc2, acc, acc2)
+    tag = rnd.choice(_COVER_TAG)
+    about = " ".join(rnd.sample(_COVER_ABOUT, 2))
+    svc = rnd.sample(_COVER_SVC, rnd.randint(3, 5))
+    domain = rnd.choice(_COVER_A).lower() + rnd.choice([".com", ".studio", ".co", ".works"])
+    mail = rnd.choice(_COVER_A).lower() + "@" + domain
+    phone = "+%d %03d %04d %04d" % (rnd.randint(20, 99), rnd.randint(100, 999),
+                                    rnd.randint(1000, 9999), rnd.randint(1000, 9999))
+    street = "%d %s" % (rnd.randint(1, 180), rnd.choice(_COVER_STREET))
+    hours = "%s – %s" % (rnd.choice(["09:00", "10:00", "08:30"]),
+                         rnd.choice(["17:30", "18:00", "19:00", "16:00"]))
+    initial = brand.strip()[0].upper()
+
+    nav_items = [("Home", "/"), ("About", "/about"), ("Services", "/services"),
+                 ("Contact", "/contact")]
+    rnd.shuffle(nav_items)
+    nav_items = nav_items[:rnd.randint(3, 4)]
+    nav_items.sort(key=lambda it: ["/", "/about", "/services", "/contact"].index(it[1]))
+
+    def head(title: str) -> str:
+        links = "".join('<a href="%s">%s</a>' % (h, t) for t, h in nav_items)
+        return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<title>%s — %s</title>'
+                '<link rel="icon" href="/favicon.svg" type="image/svg+xml">'
+                '<meta name="description" content="%s.">'
+                '<style>%s</style></head><body>'
+                '<header><div class="wrap">'
+                '<div class="brand"><div class="mark">%s</div>%s</div>'
+                '<nav>%s</nav></div></header><main class="wrap">'
+                % (_esc_cover(title), _esc_cover(brand), _esc_cover(tag), css,
+                   _esc_cover(initial), _esc_cover(brand), links))
+
+    def foot() -> str:
+        return ('</main><footer><div class="wrap">%s — %s · %s</div></footer>'
+                '</body></html>' % (_esc_cover(brand), _esc_cover(city),
+                                    _esc_cover(str(rnd.randint(2014, 2026)))))
+
+    def svc_cards() -> str:
+        cards = "".join('<div class="card"><h3>%s</h3><p>%s</p></div>' % (_esc_cover(n), _esc_cover(d))
+                        for n, d in svc)
+        return '<div class="grid">%s</div>' % cards
+
+    home = (head(tag) +
+            '<section class="hero"><div class="kicker">%s</div>'
+            '<h1>%s</h1><p>%s</p><a class="btn" href="/contact">Get in touch</a></section>'
+            '<h2>What we do</h2>%s%s' % (_esc_cover(city), _esc_cover(tag),
+                                         _esc_cover(about), svc_cards(), foot()))
+
+    about_page = (head("About") +
+                  '<section class="hero"><div class="kicker">About</div><h1>%s</h1>'
+                  '<p>%s</p><p>%s</p></section><h2>Studio</h2>'
+                  '<ul class="list"><li><span>Based in</span>%s</li>'
+                  '<li><span>Working since</span>%d</li>'
+                  '<li><span>Team</span>Two people and a very patient cat</li>'
+                  '<li><span>Languages</span>English, and enough of the local one</li></ul>%s'
+                  % (_esc_cover(brand), _esc_cover(about), _esc_cover(rnd.choice(_COVER_ABOUT)),
+                     _esc_cover(city), rnd.randint(2014, 2022), foot()))
+
+    services_page = (head("Services") +
+                     '<section class="hero"><div class="kicker">Services</div><h1>%s</h1>'
+                     '<p>%s</p></section>%s<h2>How it works</h2>'
+                     '<ul class="list"><li><span>Step one</span>A short conversation about what you need</li>'
+                     '<li><span>Step two</span>A written proposal with fixed prices</li>'
+                     '<li><span>Step three</span>The work, with photos at every stage</li></ul>%s'
+                     % (_esc_cover(tag), _esc_cover(rnd.choice(_COVER_ABOUT)),
+                        svc_cards(), foot()))
+
+    contact_page = (head("Contact") +
+                    '<section class="hero"><div class="kicker">Contact</div><h1>Say hello</h1>'
+                    '<p>%s</p></section>'
+                    '<ul class="list"><li><span>Email</span>%s</li>'
+                    '<li><span>Phone</span>%s</li><li><span>Studio</span>%s, %s</li>'
+                    '<li><span>Hours</span>%s, Monday to Friday</li></ul>%s'
+                    % (_esc_cover(rnd.choice(_COVER_ABOUT)), _esc_cover(mail),
+                       _esc_cover(phone), _esc_cover(street), _esc_cover(city),
+                       _esc_cover(hours), foot()))
+
+    pages = {"/": home, "/about": about_page, "/services": services_page,
+             "/contact": contact_page, "/404": home}
+    for path in list(pages):
+        if path not in ("/", "/404") and path not in [h for _, h in nav_items]:
+            pages.pop(path)
+
+    icon = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+            '<rect width="64" height="64" rx="16" fill="%s"/>'
+            '<text x="32" y="43" font-family="system-ui,sans-serif" font-size="30" '
+            'font-weight="700" fill="#fff" text-anchor="middle">%s</text></svg>'
+            % (acc, initial))
+    return {"pages": pages, "icon": icon, "brand": brand}
+
+
+def _esc_cover(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+_COVER = _cover_site()
+COVER_PAGES = _COVER["pages"]
+COVER_ICON = _COVER["icon"]
+COVER_BRAND_NAME = _COVER["brand"]
 
 # ────────────────────────────── DATABASE ──────────────────────────────
 
@@ -1320,7 +1541,8 @@ async def probe_proxy(px) -> dict:
     try:
         writer.write(("GET " + IP_CHECK_PATH + " HTTP/1.1\r\n"
                       "Host: " + IP_CHECK_HOST + "\r\n"
-                      "User-Agent: IranXPanel/3\r\n"
+                      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n"
                       "Accept: application/json\r\n"
                       "Connection: close\r\n\r\n").encode())
         await writer.drain()
@@ -1948,6 +2170,21 @@ NOBUF_HEADERS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    if COVER_MODE:
+        print("[cover] public paths answer with a random site (%s). "
+              "Panel unlock path: /%s%s" % (
+                  COVER_BRAND_NAME, _cover_key(),
+                  ("  (auto-reveals %d s after boot)" % int(COVER_REVEAL))
+                  if COVER_REVEAL else ""), flush=True)
+    if RELAY_DOMAIN:
+        print("[relay] %s — new accounts default to %s (%s)" % (
+            RELAY_DOMAIN, DEFAULT_TRANSPORT,
+            "1 request per connection" if DEFAULT_TRANSPORT == "ws"
+            else "XHTTP_MODE=%s" % XHTTP_MODE), flush=True)
+        if XHTTP_MODE == "packet-up":
+            print("[relay] WARNING: XHTTP_MODE=packet-up costs one request per uploaded "
+                  "chunk and drains the relay quota — use stream-up, or RELAY_LOW_COST=0 "
+                  "plus ws, to spend less.", flush=True)
     tgw_adopt_building_rows()   # restart during a build — re-watch the platform rows
     tasks = [
         asyncio.create_task(flusher()),
@@ -2463,7 +2700,8 @@ def _detect_own_country_sync() -> str:
     try:
         req = urllib.request.Request(
             "http://" + IP_CHECK_HOST + IP_CHECK_PATH,
-            headers={"User-Agent": "IranXPanel/4"})
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
         cc = str(data.get("countryCode") or "").upper()
@@ -2710,10 +2948,10 @@ def _clash_yaml(proxies: list[dict]) -> str:
     URLs land in the file exactly as generated — no PyYAML dependency needed.
     """
     names = [p["name"] for p in proxies]
-    group = "\U0001f680 IranX"
+    group = "\U0001f680 Main"
     auto = "\u26a1 Auto"
     lines = [
-        "# IranX Panel — Clash.Meta / mihomo configuration (auto-generated)",
+        "# Clash.Meta / mihomo configuration (auto-generated)",
         "# Keep this subscription URL private: it carries your account.",
         "mixed-port: 7890",
         "allow-lan: false",
@@ -2817,11 +3055,11 @@ def _singbox_config(configs, title: str) -> dict:
         seen[tag] = True
         tags.append(tag)
     if tags:
-        outbounds = ([{"type": "selector", "tag": "IranX",
+        outbounds = ([{"type": "selector", "tag": "Main",
                        "outbounds": tags + ["direct"],
                        "default": tags[0]}]
                      + nodes + [{"type": "direct", "tag": "direct"}])
-        final = "IranX"
+        final = "Main"
     else:
         outbounds = [{"type": "direct", "tag": "direct"}]
         final = "direct"
@@ -2859,7 +3097,7 @@ def device_gate_response(row, occupied: Optional[int] = None) -> PlainTextRespon
                 "admin to remove an old one."
                 % (n, plural, occupied, "is" if occupied == 1 else "are"))
     lines = [
-        "IRANX · DEVICE ID REQUIRED",
+        "DEVICE ID REQUIRED",
         "",
         head,
         "",
@@ -2978,7 +3216,7 @@ def tgweb_out(r) -> dict:
 
 RENDER_API = os.environ.get("TGPW_RENDER_API", "https://api.render.com/v1")
 RAILWAY_API = os.environ.get("TGPW_RAILWAY_API", "https://backboard.railway.app/graphql/v2")
-TGWEB_REPO = "https://github.com/BeeEhsas/IranXPanel"
+TGWEB_REPO = os.environ.get("TGPW_REPO", "https://github.com/BeeEhsas/IranXPanel")
 TGWEB_ROOT = "tproxy"                 # subdirectory of the repo that holds the Dockerfile
 TGW_CARRIERS = ("websocket", "websocket-lanes", "https", "https-lanes")
 TGW_BUILD_TIMEOUT = 900               # seconds a platform build may take before "failed"
@@ -3053,7 +3291,7 @@ def tgw_github_slug(repo_url: str) -> str:
 # signature with a bare HTTP 403 "error code: 1010" — before the API ever sees the
 # token, which made a healthy token look rejected. Every outbound platform call
 # therefore presents an application User-Agent; Render and GitHub accept it too.
-PLATFORM_UA = "IranXPanel/2.0 (+https://github.com/BeeEhsas/IranXPanel)"
+PLATFORM_UA = os.environ.get("TGPW_UA", "panel-deployer/2.0")
 
 
 def _http_probe(url: str) -> int:
@@ -4280,7 +4518,7 @@ class UserIn(BaseModel):
     reset_days: int = 0
     device_limit: int = 1
     ip_limit: int = 0
-    transport: str = "both"
+    transport: str = DEFAULT_TRANSPORT
     note: str = ""
     enabled: bool = True
     obfuscate: bool = False
@@ -5389,7 +5627,9 @@ async def delete_tgweb(pid: int, _=Depends(require_admin)):
 # caught before anything is written. Restores are transactional: either the whole payload
 # lands or the database is left exactly as it was.
 
-BACKUP_FORMAT = "iranx-panel-backup"
+BACKUP_FORMAT = "webpanel-backup"
+# Files written before the rename are still accepted on restore.
+LEGACY_BACKUP_FORMATS = ("iranx-panel-backup",)
 BACKUP_VERSION = 6          # v1 no proxies, v2 no obfuscate, v3 no ech/fp/alpn, v5 no custom ech/obf, v6 no ip_limit
 
 # Runtime settings that live in the environment, not the database. They are recorded for
@@ -5494,8 +5734,8 @@ def parse_backup(raw, force: bool = False) -> dict:
             raise HTTPException(400, "not a valid backup file (JSON could not be parsed)")
     if not isinstance(raw, dict):
         raise HTTPException(400, "not a valid backup file")
-    if raw.get("format") != BACKUP_FORMAT:
-        raise HTTPException(400, "this file is not an IranX Panel backup")
+    if raw.get("format") not in (BACKUP_FORMAT,) + LEGACY_BACKUP_FORMATS:
+        raise HTTPException(400, "this file is not a panel backup")
     ver = raw.get("version")
     if not isinstance(ver, int) or ver > BACKUP_VERSION:
         raise HTTPException(400, f"backup version {ver} is newer than this panel supports")
@@ -5962,7 +6202,7 @@ def _tg_api(token: str, method: str, *, fields: dict | None = None,
         body = urlencode(fields or {}).encode()
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
     else:
-        boundary = "----IranXPanel" + secrets.token_hex(8)
+        boundary = "----panelbackup" + secrets.token_hex(8)
         parts = []
         for k, v in (fields or {}).items():
             parts.append((f'--{boundary}\r\nContent-Disposition: form-data; '
@@ -5990,7 +6230,7 @@ async def tg_send_backup(admin_ip: str = "") -> dict:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     fname = f"iranx-backup-{stamp}.ixpbak"
     p = doc["payload"]
-    caption = (f"🗄 IranX Panel backup · {stamp} UTC\n"
+    caption = (f"🗄 Panel backup · {stamp} UTC\n"
                f"👥 {len(p['users'])} users · 🧹 {len(p['clean_ips'])} clean IPs · "
                f"🔗 {len(p['proxies'])} proxies\n"
                "🔒 Contains the panel password — keep it private.")
@@ -6057,7 +6297,7 @@ async def tg_test(_=Depends(require_admin)):
         res = await asyncio.to_thread(
             _tg_api, token, "sendMessage",
             fields={"chat_id": chat,
-                    "text": "✅ IranX Panel — Telegram backup is wired up. "
+                    "text": "✅ Telegram backup is wired up. "
                             "Backup files will arrive in this chat."})
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}
@@ -6126,7 +6366,9 @@ async def stats(_=Depends(require_admin)):
             "xhttp_mode": XHTTP_MODE,
             "device_window": DEVICE_WINDOW, "ip_window": IP_WINDOW, "live_window": LIVE_WINDOW,
             "keepalive": KEEPALIVE, "keepalive_mins": KEEPALIVE_MINS,
-            "relay_domain": RELAY_DOMAIN}
+            "relay_domain": RELAY_DOMAIN,
+            "relay_low_cost": RELAY_LOW_COST,
+            "default_transport": DEFAULT_TRANSPORT}
 
 
 @app.get("/api/logs")
@@ -6588,7 +6830,7 @@ def svg(text: str, level: str = "M", quiet: int = 3, css_class: str = "qr") -> s
     )
 
 
-"""Subscription landing page for IranX Panel.
+"""Subscription landing page for the panel.
 
 `render_sub_page()` returns one self-contained HTML page for `/sub/{token}`:
 quota, remaining time, QR codes, per-config copy buttons, one-tap import into
@@ -6864,12 +7106,12 @@ _TEMPLATE = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <meta name="color-scheme" content="dark light">
-<title>__TITLE__ &middot; IranX</title>
+<title>__TITLE__ &middot; Subscription</title>
 <link rel="icon" type="image/png" href="__LOGO__">
 __FONTS__
 <style>
 /* ══════════════════════════════════════════════════════════════════
-   IRANX SUBSCRIPTION v4 — RTL-first
+   SUBSCRIPTION v4 — RTL-first
    ══════════════════════════════════════════════════════════════════ */
 :root,[data-theme="gray"]{
   --bg:#08090b; --s1:#0d0f12; --s2:#12151a; --s3:#171b21;
@@ -7129,7 +7371,7 @@ footer{text-align:center;font-size:10px;color:var(--tx3);margin-top:20px;line-he
 
   <div class="top">
     <img class="logo" src="__LOGO__" alt="">
-    <div class="brand"><b id="bTitle">IranX</b><span>SUBSCRIPTION</span></div>
+    <div class="brand"><b id="bTitle">Subscription</b><span>ACCOUNT</span></div>
     <div class="tools">
       <span class="tag" id="trTag" hidden></span>
       <button class="chip" id="themeBtn" type="button"></button>
@@ -7222,7 +7464,7 @@ const esc = (s)=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&
 
 /* ── i18n ── */
 const T = {
-  en:{brand:"IranX · My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
+  en:{brand:"My subscription", remainVol:"Remaining data", remainTime:"Remaining time",
     devices:"Devices", ipAddr:"Allowed IPs", used:"Used", total:"Total", usage:"used",
     copySub:"Copy subscription link", copyAll:"Copy all configs", addTo:"Add to",
     configs:"Configs", downloads:"Download apps", noConfigs:"No active config.",
@@ -7267,7 +7509,7 @@ async function copy(text,msg){
 }
 
 function deepLink(kind){
-  const n = encodeURIComponent(D.name || "IranX");
+  const n = encodeURIComponent(D.name || "Subscription");
   let s = D.subLink;
   if(kind==="clash")   s = D.subLinkClash   || (s + "?format=clash");
   if(kind==="singbox") s = D.subLinkSingbox || (s + "?format=singbox");
@@ -9612,7 +9854,7 @@ async def healthz():
 
 THEME_CSS = r"""
 /* ══════════════════════════════════════════════════════════════════════
-   IRANX PANEL — DESIGN SYSTEM v3  "NEON TERMINAL"
+   DESIGN SYSTEM v3  "NEON TERMINAL"
    رنگ‌های برند از لوگو: سبز #22EF9D · قرمز #E8112D · طلایی #E5B80B
    این فایل همه‌ی کلاس‌های قدیمی (card, stat, inp, btn, g4, urow …) را
    با ظاهر جدید پیاده می‌کند، پس هیچ‌کدام از توابع JS قدیمی نمی‌شکند.
@@ -10717,7 +10959,7 @@ body{min-height:100vh;display:grid;place-items:center;padding:18px;position:rela
     onclick="setTheme(THEMES[(THEMES.indexOf(THEME)+1)%THEMES.length])">
    <svg class="ic" viewBox="0 0 24 24"><path d="M20.5 14.5A8.5 8.5 0 1110 3.7a7 7 0 0010.5 10.8z"/></svg></button>
  </div>
- <img class="brandlogo" src="__LOGO__" alt="IranX">
+ <img class="brandlogo" src="__LOGO__" alt="Panel">
  <h1 id="h1"></h1>
  <p id="sub" class="sub"></p>
  <div class="space-y-2">
@@ -10733,7 +10975,7 @@ body{min-height:100vh;display:grid;place-items:center;padding:18px;position:rela
   <button id="go" class="btn go"></button>
   <p id="err" class="text-sm" style="text-align:center;color:var(--bad);min-height:18px;margin:0"></p>
  </div>
- <div class="foot">IranX · Xray Panel</div>
+ <div class="foot">Panel</div>
 </div>
 <script>
 const MODE="{{MODE}}";
@@ -11581,9 +11823,7 @@ function paintStatic(){
  const _nh=document.getElementById('nDevHint');
  if(_nh) _nh.classList.toggle('on',parseInt(nDev.value||'0',10)>0);
  nDev.addEventListener('input',()=>paintDevHint(nDev,document.getElementById('nDevHint')));
- nTr.options[0].textContent=T('trBoth');
- nTr.options[1].textContent=T('trWs');
- nTr.options[2].textContent=T('trXhttp');
+ Array.prototype.forEach.call(nTr.options,o=>{o.textContent=T(o.value==='both'?'trBoth':o.value==='ws'?'trWs':'trXhttp')});
  fillSelect(nFp,FP_OPTIONS,T('fpLbl'));
  fillAlpn(nAlpn);
  cAddr.placeholder=T('addrPh'); cRem.placeholder=T('remarkPh'); cBulk.placeholder=T('bulkPh');
@@ -13105,8 +13345,120 @@ PANEL_HTML = (PANEL_HTML.replace("__THEME__", THEME_CSS)
                         .replace("__LOGO__", LOGO_URI))
 _TEMPLATE  = _TEMPLATE.replace("__LOGO__", LOGO_URI)
 
+# A relay in front of the panel is billed per request, and WS is the cheap
+# transport — one request for the whole life of a tunnel. When a relay is
+# configured the new-user form therefore starts on WS instead of "both".
+if DEFAULT_TRANSPORT == "ws":
+    PANEL_HTML = PANEL_HTML.replace('<option value="both"></option><option value="ws"></option>',
+                                    '<option value="ws"></option><option value="both"></option>')
+
 
 @app.get("/favicon.ico")
 async def favicon():
     return Response(LOGO_PNG, media_type="image/png",
                     headers={"cache-control": "public, max-age=604800"})
+
+
+# ─────────────────────── COVER GATE (ASGI) ───────────────────────
+# A plain ASGI gate, not @app.middleware: it must not touch the streaming XHTTP
+# responses or the WebSocket upgrade, and it has to answer before routing so the
+# panel pages never reach the browser while the cover is locked.
+
+def _cover_passthrough(scope, path: str) -> bool:
+    """Paths that must keep working while the cover is up: the proxy inbounds,
+    the subscription links, the flag SVGs and the health probe."""
+    if path == "/healthz":
+        return True
+    if path.startswith("/sub/") or path.startswith("/flag/"):
+        return True
+    if path.startswith("/" + XHTTP_PATH):
+        return True
+    if path.startswith("/" + WS_PATH):
+        # only a real WebSocket upgrade is traffic; a plain GET on that path is
+        # a scanner, and it gets the cover page like everybody else
+        for name, value in scope.get("headers", []):
+            if name == b"upgrade" and value.lower() == b"websocket":
+                return True
+        return False
+    return False
+
+
+def _cover_open(scope) -> bool:
+    """True when the cover is lifted: the reveal timer has passed, or the browser
+    already holds the unlock cookie."""
+    if COVER_REVEAL and (time.time() - COVER_START) >= COVER_REVEAL:
+        return True
+    want = _cover_token()
+    for name, value in scope.get("headers", []):
+        if name == b"cookie":
+            if ("%s=%s" % (COVER_COOKIE, want)) in value.decode("latin-1", "ignore"):
+                return True
+    return False
+
+
+async def _cover_reply(send, status: int, body: bytes, ctype: str):
+    await send({"type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", ctype.encode()),
+                            (b"content-length", str(len(body)).encode()),
+                            (b"cache-control", b"public, max-age=300"),
+                            (b"x-content-type-options", b"nosniff")]})
+    await send({"type": "http.response.body", "body": body})
+
+
+async def _cover_unlock(send):
+    """Lift the cover for this browser and send it to the panel."""
+    try:
+        target = "/setup" if not password_is_set() else "/panel"
+    except Exception:
+        target = "/panel"
+    cookie = ("%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
+              % (COVER_COOKIE, _cover_token(), 60 * 60 * 24 * 30)).encode()
+    await send({"type": "http.response.start", "status": 307,
+                "headers": [(b"location", target.encode()),
+                            (b"set-cookie", cookie),
+                            (b"cache-control", b"no-store")]})
+    await send({"type": "http.response.body", "body": b""})
+
+
+class _CoverGate:
+    """Serves the random site on every public path while the cover is locked."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not COVER_MODE:
+            await self.inner(scope, receive, send)
+            return
+        if _cover_open(scope):
+            await self.inner(scope, receive, send)
+            return
+        path = scope.get("path", "") or "/"
+        key = _cover_key()
+        if path == "/" + key or path.startswith("/" + key + "/"):
+            await _cover_unlock(send)
+            return
+        if path.startswith("/api/"):
+            # a JSON 404 here would give the shape away — answer like the rest of
+            # the site until the cover is lifted
+            page = COVER_PAGES.get("/") or ""
+            await _cover_reply(send, 200, page.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/favicon.svg":
+            await _cover_reply(send, 200, COVER_ICON.encode(), "image/svg+xml")
+            return
+        if path == "/favicon.ico":
+            await _cover_reply(send, 200, COVER_ICON.encode(), "image/svg+xml")
+            return
+        if path == "/robots.txt":
+            await _cover_reply(send, 200, b"User-agent: *\nAllow: /\n", "text/plain; charset=utf-8")
+            return
+        if _cover_passthrough(scope, path):
+            await self.inner(scope, receive, send)
+            return
+        page = COVER_PAGES.get(path) or COVER_PAGES.get("/404") or COVER_PAGES.get("/")
+        await _cover_reply(send, 200, page.encode("utf-8"), "text/html; charset=utf-8")
+
+
+app = _CoverGate(app)

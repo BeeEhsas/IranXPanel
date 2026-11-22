@@ -1,4 +1,4 @@
-// IranXPanel WEB-proxy L7 edge — the container's public front for tproxy-server.
+// WEB-proxy L7 edge — the container's public front for tproxy-server.
 //
 // Why this exists (replaces the previous socat L4 pipe): the relay is pinned
 // upstream and requires, on every authenticated request, BOTH
