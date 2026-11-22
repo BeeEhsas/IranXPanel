@@ -8,7 +8,8 @@
 #   your profile → Packages → <package> → Package settings → Change visibility → Public
 #
 # The image name comes from the repository variable CONTAINER_NAME; without it the
-# repository name is used, which is what the deployer Worker points at.
+# full owner/repository path is used, which is what the deployer Worker points at
+# (ghcr.io/<owner>/<repo>).
 
 name: Publish container image
 
@@ -24,7 +25,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ vars.CONTAINER_NAME || github.event.repository.name }}
+  IMAGE_NAME: ${{ vars.CONTAINER_NAME || github.repository }}
 
 jobs:
   build:
