@@ -62,33 +62,47 @@ from pydantic import BaseModel
 
 # ────────────────────────────── CONFIG ──────────────────────────────
 
+# Every setting has a short, meaningless name and a descriptive legacy name. The
+# short one wins. A hosting platform can read the variable names of a service, and
+# names like XHTTP_PATH or RELAY_DOMAIN give away what the service is; SITE_HOST,
+# P1, P2, RELAY and the rest say nothing. The legacy names still work, so an older
+# deployment keeps running after an upgrade.
+def _env(*names, default=""):
+    """First non-empty value among the given environment variables."""
+    for name in names:
+        v = os.getenv(name)
+        if v is not None and v != "":
+            return v
+    return default
+
+
 ADMIN_USERNAME = "admin"
-SECRET_KEY     = os.getenv("SECRET_KEY", secrets.token_hex(32))
-DOMAIN         = os.getenv("DOMAIN", "")
+SECRET_KEY     = _env("SIGN_KEY", "SECRET_KEY", default=secrets.token_hex(32))
+DOMAIN         = _env("SITE_HOST", "DOMAIN")
 
 # When the host's own domain is unreachable from some networks, a relay (e.g. a
 # Cloudflare Worker) can sit in front. The panel still runs on DOMAIN, but every config
 # and subscription link it hands out points at RELAY_DOMAIN instead.
-RELAY_DOMAIN   = os.getenv("RELAY_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
+RELAY_DOMAIN   = _env("RELAY", "RELAY_DOMAIN").replace("https://", "").replace("http://", "").strip("/")
 # On Railway the deployer mounts a persistent volume at /data; prefer it automatically
 # so the database survives redeploys even without an explicit DB_PATH (Railway wipes
 # everything outside a volume on every deploy). /tmp stays the default on hosts that
 # have no volume.
-DB_PATH        = os.getenv("DB_PATH", "/data/panel.db" if os.path.isdir("/data") else "/tmp/panel.db")
-WS_PATH        = os.getenv("WS_PATH", "ws").strip("/")
-XHTTP_PATH     = os.getenv("XHTTP_PATH", "xh").strip("/")
-PANEL_TITLE    = os.getenv("PANEL_TITLE", "Panel")
-BOOTSTRAP_PASS = os.getenv("ADMIN_PASSWORD", "")
+DB_PATH        = _env("DB", "DB_PATH", default="/data/panel.db" if os.path.isdir("/data") else "/tmp/panel.db")
+WS_PATH        = _env("P1", "WS_PATH", default="ws").strip("/")
+XHTTP_PATH     = _env("P2", "XHTTP_PATH", default="xh").strip("/")
+PANEL_TITLE    = _env("TITLE", "PANEL_TITLE", default="Panel")
+BOOTSTRAP_PASS = _env("ADMIN", "ADMIN_PASSWORD")
 
-DEVICE_WINDOW  = int(os.getenv("DEVICE_WINDOW", "300"))   # counts toward the device limit
-IP_WINDOW      = int(os.getenv("IP_WINDOW", "300"))       # counts toward the IP limit
-LIVE_WINDOW    = int(os.getenv("LIVE_WINDOW", "60"))      # shown as "connected right now"
-SESSION_IDLE   = int(os.getenv("SESSION_IDLE", "90"))     # xhttp session reaper
+DEVICE_WINDOW  = int(_env("DEV_WIN", "DEVICE_WINDOW", default="300"))   # counts toward the device limit
+IP_WINDOW      = int(_env("IP_WIN", "IP_WINDOW", default="300"))       # counts toward the IP limit
+LIVE_WINDOW    = int(_env("LIVE_WIN", "LIVE_WINDOW", default="60"))     # shown as "connected right now"
+SESSION_IDLE   = int(_env("IDLE", "SESSION_IDLE", default="90"))        # xhttp session reaper
 
 # Self-ping, for hosts that idle a service out (Render's free plan does after ~15 min).
 # Read the caveats in the README before switching this on.
-KEEPALIVE       = os.getenv("KEEPALIVE", "").strip().lower() in ("1", "true", "yes", "on")
-KEEPALIVE_MINS  = max(1, int(os.getenv("KEEPALIVE_MINUTES", "10")))
+KEEPALIVE       = _env("PING", "KEEPALIVE").strip().lower() in ("1", "true", "yes", "on")
+KEEPALIVE_MINS  = max(1, int(_env("PING_MIN", "KEEPALIVE_MINUTES", default="10")))
 
 JWT_ALG, JWT_TTL, GB = "HS256", 60 * 60 * 12, 1024 ** 3
 TRANSPORTS = ("ws", "xhttp", "both")
@@ -100,7 +114,7 @@ TRANSPORTS = ("ws", "xhttp", "both")
 # The server accepts both shapes no matter what this is set to, so existing configs
 # keep working; this only decides what new links tell clients to use.
 XHTTP_MODES = ("stream-up", "packet-up")
-XHTTP_MODE = os.getenv("XHTTP_MODE", "stream-up").strip().lower()
+XHTTP_MODE = _env("MODE", "XHTTP_MODE", default="stream-up").strip().lower()
 if XHTTP_MODE not in XHTTP_MODES:
     XHTTP_MODE = "stream-up"
 
@@ -121,13 +135,13 @@ COSTLY_TRANSPORTS = ("xhttp", "both")
 #
 # Unlocking: open  /<COVER_KEY>  once — a long-lived cookie is set and the panel
 # answers normally from then on.
-COVER_MODE   = os.getenv("COVER_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+COVER_MODE   = _env("COVER", "COVER_MODE", default="1").strip().lower() in ("1", "true", "yes", "on")
 try:
-    COVER_REVEAL = max(0.0, float(os.getenv("COVER_REVEAL", "0") or 0))
+    COVER_REVEAL = max(0.0, float(_env("WAIT", "COVER_REVEAL", default="0") or 0))
 except ValueError:
     COVER_REVEAL = 0.0
-COVER_SEED   = os.getenv("COVER_SEED", "").strip() or SECRET_KEY
-COVER_BRAND  = os.getenv("COVER_BRAND", "").strip()
+COVER_SEED   = _env("SEED", "COVER_SEED").strip() or SECRET_KEY
+COVER_BRAND  = _env("NAME", "COVER_BRAND").strip()
 COVER_START  = time.time()
 COVER_COOKIE = "cv"
 
@@ -135,14 +149,14 @@ COVER_COOKIE = "cv"
 # request for the whole life of a tunnel, XHTTP costs at least two and packet-up
 # costs one per uploaded chunk — hundreds a minute per client. With a relay
 # configured, new accounts therefore start on WS unless RELAY_LOW_COST=0.
-RELAY_LOW_COST = (os.getenv("RELAY_LOW_COST", "").strip().lower() != "0") and bool(RELAY_DOMAIN)
+RELAY_LOW_COST = (_env("LOW_COST", "RELAY_LOW_COST").strip().lower() != "0") and bool(RELAY_DOMAIN)
 DEFAULT_TRANSPORT = "ws" if RELAY_LOW_COST else "both"
 
 
 def _cover_key() -> str:
     """The secret path segment that lifts the cover. Derived from SECRET_KEY, so it
     is stable across restarts as long as SECRET_KEY is set (it is required anyway)."""
-    return os.getenv("COVER_KEY", "").strip() or hashlib.sha256(
+    return _env("OPEN", "COVER_KEY").strip() or hashlib.sha256(
         ("cover|" + SECRET_KEY).encode()).hexdigest()[:12]
 
 
@@ -5637,7 +5651,10 @@ BACKUP_VERSION = 6          # v1 no proxies, v2 no obfuscate, v3 no ech/fp/alpn,
 # cannot rewrite its own platform variables.
 ENV_KEYS = ("DOMAIN", "RELAY_DOMAIN", "WS_PATH", "XHTTP_PATH", "XHTTP_MODE",
             "DEVICE_WINDOW", "IP_WINDOW", "LIVE_WINDOW", "SESSION_IDLE", "PANEL_TITLE",
-            "KEEPALIVE", "KEEPALIVE_MINUTES")
+            "KEEPALIVE", "KEEPALIVE_MINUTES",
+            "SITE_HOST", "RELAY", "P1", "P2", "MODE", "TITLE", "ADMIN", "DB",
+            "COVER", "OPEN", "WAIT", "DEV_WIN", "IP_WIN", "LIVE_WIN", "IDLE",
+            "PING", "PING_MIN")
 
 USER_FIELDS = ("id", "name", "uuid", "sub_token", "note", "enabled", "quota_bytes",
                "used_bytes", "expire_at", "device_limit", "ip_limit", "transport",
