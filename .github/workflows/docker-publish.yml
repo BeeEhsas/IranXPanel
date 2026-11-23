@@ -27,7 +27,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ vars.CONTAINER_NAME || 'webapp' }}
+  IMAGE_NAME: ${{ vars.CONTAINER_NAME || format('{0}/webapp', github.repository_owner) }}
   LEGACY_IMAGE_NAME: ${{ github.repository }}
 
 jobs:
